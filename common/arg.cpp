@@ -2813,6 +2813,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_SLOTS"));
     add_opt(common_arg(
+        {"--moe-cache-live-resize"},
+        "allow local live resizing of the expert cache (default: disabled)",
+        [](common_params & params) {
+            params.moe_cache_live_resize = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_LIVE_RESIZE"));
+    add_opt(common_arg(
+        {"--moe-cache-policy"}, "static|hybrid",
+        "expert cache policy; static is the default, hybrid enables a profile-pinned set and bounded LRU tail",
+        [](common_params & params, const std::string & value) {
+            if (value != "static" && value != "hybrid") {
+                throw std::invalid_argument("moe cache policy must be static or hybrid");
+            }
+            params.moe_cache_policy = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_POLICY"));
+    add_opt(common_arg(
+        {"--moe-cache-pinned-percent"}, "N",
+        "percentage of hybrid cache slots pinned to the profile ranking (default: 50)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 100) {
+                throw std::invalid_argument("moe cache pinned percent must be between 0 and 100");
+            }
+            params.moe_cache_pinned_percent = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PINNED_PERCENT"));
+    add_opt(common_arg(
+        {"--moe-cache-inserts-per-layer-token"}, "N",
+        "maximum hybrid LRU insertions per MoE layer per decode token (default: 1)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("moe cache insert cap must be at least 1");
+            }
+            params.moe_cache_inserts_per_layer_token = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_INSERTS_PER_LAYER_TOKEN"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

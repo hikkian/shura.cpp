@@ -311,22 +311,33 @@ std::vector<unsigned char> completion_token_output::str_to_bytes(const std::stri
 //
 json server_task_result_cmpl_final::to_json() {
     GGML_ASSERT(is_updated && "update() must be called before to_json()");
+    json result;
     switch (res_type) {
         case TASK_RESPONSE_TYPE_NONE:
-            return to_json_non_oaicompat();
+            result = to_json_non_oaicompat();
+            break;
         case TASK_RESPONSE_TYPE_OAI_CMPL:
-            return to_json_oaicompat();
+            result = to_json_oaicompat();
+            break;
         case TASK_RESPONSE_TYPE_OAI_CHAT:
-            return stream ? to_json_oaicompat_chat_stream() : to_json_oaicompat_chat();
+            result = stream ? to_json_oaicompat_chat_stream() : to_json_oaicompat_chat();
+            break;
         case TASK_RESPONSE_TYPE_OAI_RESP:
-            return stream ? to_json_oaicompat_resp_stream() : to_json_oaicompat_resp();
+            result = stream ? to_json_oaicompat_resp_stream() : to_json_oaicompat_resp();
+            break;
         case TASK_RESPONSE_TYPE_OAI_ASR:
-            return to_json_oaicompat_asr();
+            result = to_json_oaicompat_asr();
+            break;
         case TASK_RESPONSE_TYPE_ANTHROPIC:
-            return stream ? to_json_anthropic_stream() : to_json_anthropic();
+            result = stream ? to_json_anthropic_stream() : to_json_anthropic();
+            break;
         default:
             GGML_ASSERT(false && "Invalid task_response_type");
     }
+    if (!moe_cache_stats.is_null() && result.is_object()) {
+        result["moe_cache"] = moe_cache_stats;
+    }
+    return result;
 }
 
 json server_task_result_cmpl_final::to_json_non_oaicompat() {

@@ -312,6 +312,18 @@ extern "C" {
         };
     };
 
+    // Runtime counters for the opt-in hybrid expert-cache policy. The default
+    // static policy reports enabled=false and leaves existing responses unchanged.
+    struct llama_moe_cache_stats {
+        bool enabled;
+        uint64_t tokens;
+        uint64_t hits;
+        uint64_t misses;
+        uint64_t insertions;
+        uint64_t copies;
+        uint64_t copied_bytes;
+    };
+
     struct llama_model_tensor_buft_override {
         const char * pattern;
         ggml_backend_buffer_type_t buft;
@@ -350,6 +362,10 @@ extern "C" {
         // MoE expert cache: keep the hottest routed experts per layer resident in GPU memory
         const char * moe_cache_profile; // routing profile CSV from llama-moe-trace (NULL = disabled)
         int32_t      moe_cache_slots;   // experts cached per layer (0 = disabled)
+        bool         moe_cache_live_resize; // allow the local server to resize the expert cache
+        const char * moe_cache_policy; // static (default) or opt-in hybrid pinned + LRU tail
+        int32_t      moe_cache_pinned_percent; // percent of cache slots pinned to profile ranking
+        int32_t      moe_cache_inserts_per_layer_token; // hybrid LRU insertion cap
         // target for a draft head that declares nextn_shared_target_tensors; must outlive this model
         const struct llama_model * model_shared;
 
@@ -597,6 +613,11 @@ extern "C" {
     DEPRECATED(LLAMA_API int32_t llama_n_vocab    (const struct llama_vocab * vocab), "use llama_vocab_n_tokens instead");
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
+    // Caller must serialize this with inference; the server does so at decode boundaries.
+    LLAMA_API bool llama_model_moe_cache_resize(const struct llama_model * model, int32_t n_slots,
+            int32_t * old_slots, int32_t * new_slots, size_t * released_bytes, size_t * allocated_bytes);
+    LLAMA_API bool llama_model_get_moe_cache_stats(const struct llama_model * model,
+            struct llama_moe_cache_stats * stats);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 

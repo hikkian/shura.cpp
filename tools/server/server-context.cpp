@@ -2414,6 +2414,35 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
+        llama_moe_cache_stats moe_cache_stats = {};
+        if (params_base.moe_cache_policy == "hybrid" &&
+                llama_model_get_moe_cache_stats(llama_get_model(ctx_tgt), &moe_cache_stats)) {
+            const uint64_t routes = moe_cache_stats.hits + moe_cache_stats.misses;
+            const double hit_rate = routes > 0 ? double(moe_cache_stats.hits) / double(routes) : 0.0;
+            const double copies_per_token = moe_cache_stats.tokens > 0
+                    ? double(moe_cache_stats.copies) / double(moe_cache_stats.tokens) : 0.0;
+            const double copied_bytes_per_token = moe_cache_stats.tokens > 0
+                    ? double(moe_cache_stats.copied_bytes) / double(moe_cache_stats.tokens) : 0.0;
+            res->moe_cache_stats = json {
+                {"policy", "hybrid"},
+                {"tokens", moe_cache_stats.tokens},
+                {"hits", moe_cache_stats.hits},
+                {"misses", moe_cache_stats.misses},
+                {"hit_rate", hit_rate},
+                {"insertions", moe_cache_stats.insertions},
+                {"copies", moe_cache_stats.copies},
+                {"copies_per_token", copies_per_token},
+                {"copied_bytes", moe_cache_stats.copied_bytes},
+                {"copied_bytes_per_token", copied_bytes_per_token},
+            };
+            LOG_INF("hybrid moe cache: hits=%llu misses=%llu insertions=%llu copies=%llu copies/token=%.3f copied_bytes/token=%.1f\n",
+                    (unsigned long long) moe_cache_stats.hits,
+                    (unsigned long long) moe_cache_stats.misses,
+                    (unsigned long long) moe_cache_stats.insertions,
+                    (unsigned long long) moe_cache_stats.copies,
+                    copies_per_token, copied_bytes_per_token);
+        }
+
         queue_results.send(std::move(res));
     }
 
@@ -3088,6 +3117,34 @@ private:
                         res->message = "unknown control action";
                     }
 
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_MOE_CACHE_RESIZE:
+                {
+                    auto res = std::make_unique<server_task_result_moe_cache_resize>();
+                    res->id = task.id;
+                    // Expert-cache buffers are referenced by the active decode path.
+                    // Refuse a resize while any slot is processing; otherwise a concurrent
+                    // unmap can invalidate tensors still in use by the CPU/GPU workers.
+                    const bool has_active_request = std::any_of(slots.begin(), slots.end(),
+                            [](const server_slot & slot) { return slot.is_processing(); });
+                    if (has_active_request) {
+                        res->old_slots = -1;
+                        res->new_slots = -1;
+                        res->message = "resize requires an idle request boundary";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    size_t released_bytes = 0;
+                    size_t allocated_bytes = 0;
+                    res->success = llama_model_moe_cache_resize(
+                            llama_get_model(ctx_tgt), task.moe_cache_slots,
+                            &res->old_slots, &res->new_slots, &released_bytes, &allocated_bytes);
+                    res->released_bytes = released_bytes;
+                    res->allocated_bytes = allocated_bytes;
+                    if (!res->success) {
+                        res->message = "resize failed; the current cache remains active";
+                    }
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
@@ -5937,6 +5994,63 @@ void server_routes::init_routes() {
             return res;
         }
         res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_moe_cache_resize = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!params.moe_cache_live_resize) {
+            res->error(format_error_response("live expert cache resize is disabled", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception &) {
+            res->error(format_error_response("invalid JSON body", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!body.contains("slots") || !body["slots"].is_number_integer()) {
+            res->error(format_error_response("slots must be an integer", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        int64_t target_value = 0;
+        try {
+            target_value = body["slots"].get<int64_t>();
+        } catch (const std::exception &) {
+            res->error(format_error_response("slots is out of range", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (target_value > INT32_MAX) {
+            res->error(format_error_response("slots is out of range", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const int32_t target = (int32_t) target_value;
+        if (target < 0) {
+            res->error(format_error_response("slots must not be negative", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        server_task task(SERVER_TASK_TYPE_MOE_CACHE_RESIZE);
+        task.id = res->rd.get_new_id();
+        task.moe_cache_slots = target;
+        res->rd.post_task(std::move(task));
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        auto * resize = dynamic_cast<server_task_result_moe_cache_resize *>(result.get());
+        GGML_ASSERT(resize != nullptr);
+        const json result_json = resize->to_json();
+        if (!resize->success) {
+            res->status = 500;
+            res->data = result_json.dump();
+        } else {
+            res->ok(result_json);
+        }
         return res;
     };
 

@@ -9,6 +9,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -361,6 +362,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_hot   = nullptr;
     struct ggml_tensor * moe_map_hot       = nullptr; // i32[n_expert]: pack slot or -1
     struct ggml_tensor * moe_map_cold      = nullptr; // i32[n_expert]: global id or -1
+    bool moe_cache_hybrid = false; // capture routed ids for the opt-in bounded LRU tail
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
     struct ggml_tensor * ffn_down_exps_b   = nullptr;
@@ -992,6 +994,13 @@ struct llama_model_base : public llama_model {
     // GGML_MOE_CACHE_PROFILE + GGML_MOE_CACHE_SLOTS: build GPU-resident hot
     // expert packs for CPU-offloaded MoE layers (see llama_layer::*_exps_hot)
     void init_moe_expert_cache();
+    bool resize_moe_expert_cache(int32_t n_slots, int32_t & old_slots,
+            int32_t & new_slots, size_t & released_bytes, size_t & allocated_bytes);
+    bool moe_expert_cache_requires_serialization() const;
+    uint64_t moe_expert_cache_generation() const;
+    std::mutex & moe_expert_cache_mutex() const;
+    bool update_moe_expert_cache_locked(ggml_backend_sched_t sched, const llm_graph_result & graph);
+    bool get_moe_expert_cache_stats(llama_moe_cache_stats & stats) const;
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;

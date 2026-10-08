@@ -978,6 +978,13 @@ public:
     std::vector<llm_graph_fused_node> fused_nodes;
 
     std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
+    struct moe_cache_route {
+        int32_t layer;
+        int32_t n_expert_used;
+        int32_t n_tokens;
+        ggml_tensor * ids_flat;
+    };
+    std::vector<moe_cache_route> moe_cache_routes;
 
     ggml_context_ptr ctx_compute;
 

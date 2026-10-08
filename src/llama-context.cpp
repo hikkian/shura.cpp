@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -1524,6 +1525,20 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    auto * model_base = dynamic_cast<llama_model_base *>(const_cast<llama_model *>(&model));
+    std::unique_lock<std::mutex> moe_cache_lock;
+    if (model_base != nullptr && model_base->moe_expert_cache_requires_serialization()) {
+        // A resize or hybrid slot update may rewrite/free pack storage. Hold the
+        // model cache lock from scheduler invalidation through graph sync/update.
+        moe_cache_lock = std::unique_lock<std::mutex>(model_base->moe_expert_cache_mutex());
+        const uint64_t generation = model_base->moe_expert_cache_generation();
+        if (generation != moe_cache_generation) {
+            sched_need_reserve = true;
+            sched_reserve();
+            moe_cache_generation = generation;
+        }
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1588,9 +1603,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
+        if (moe_cache_lock.owns_lock()) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (moe_cache_lock.owns_lock()) {
+        // Do not release the cache lock while any graph might still read pack tensors.
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    if (moe_cache_lock.owns_lock() && !res->moe_cache_routes.empty()) {
+        if (model_base != nullptr) {
+            model_base->update_moe_expert_cache_locked(sched.get(), *res);
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;

@@ -131,6 +131,18 @@ static bool server_prepare_params(common_params & params, server_role_type role_
         }
     }
 
+    if (params.moe_cache_live_resize) {
+        if (role_type == SERVER_ROLE_ROUTER || (params.hostname != "127.0.0.1" &&
+                params.hostname != "localhost" && params.hostname != "::1")) {
+            SRV_ERR("%s\n", "--moe-cache-live-resize requires a single-model server bound to loopback");
+            return false;
+        }
+        if (params.moe_cache_profile.empty() || params.moe_cache_slots <= 0) {
+            SRV_ERR("%s\n", "--moe-cache-live-resize requires --moe-cache-profile and a positive --moe-cache-slots value");
+            return false;
+        }
+    }
+
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
     // or with -c 0 for max context
     const bool ctx_pool_auto_sized = params.kv_unified_per_slot > 0 &&
@@ -181,6 +193,9 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
+    if (params.moe_cache_live_resize) {
+        ctx_http.post("/moe-cache/slots",     ex_wrapper(routes.post_moe_cache_resize));
+    }
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));

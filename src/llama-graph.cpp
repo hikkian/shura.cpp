@@ -1408,6 +1408,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    moe_cache_routes.clear();
 
     params = {};
 
@@ -2328,6 +2329,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f);
     if (use_moe_packs) {
         ggml_tensor * ids_flat = ggml_cont_1d(ctx0, selected_experts, n_expert_used*n_tokens); // topk ids are a strided view
+        if (moe_cache->moe_cache_hybrid && n_tokens <= 8) {
+            res->moe_cache_routes.push_back({il, int32_t(n_expert_used), int32_t(n_tokens), ids_flat});
+        }
         ids_hot  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_hot,  ids_flat), n_expert_used, n_tokens);
         ids_cold = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_cold, ids_flat), n_expert_used, n_tokens);
         cb(ids_hot,  "ffn_moe_ids_hot",  il);

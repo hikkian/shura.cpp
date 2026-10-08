@@ -245,6 +245,37 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");
 
+    {
+        common_params live_resize_params;
+        assert(!live_resize_params.moe_cache_live_resize);
+        assert(!llama_model_default_params().moe_cache_live_resize);
+        argv = {"binary_name", "--moe-cache-live-resize"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), live_resize_params, LLAMA_EXAMPLE_SERVER));
+        assert(live_resize_params.moe_cache_live_resize);
+        const llama_model_params model_params = common_model_params_to_llama(live_resize_params);
+        assert(model_params.moe_cache_live_resize);
+    }
+
+    {
+        common_params cache_policy_params;
+        assert(cache_policy_params.moe_cache_policy == "static");
+        assert(cache_policy_params.moe_cache_pinned_percent == 50);
+        assert(cache_policy_params.moe_cache_inserts_per_layer_token == 1);
+        const llama_model_params defaults = llama_model_default_params();
+        assert(std::string(defaults.moe_cache_policy) == "static");
+        assert(defaults.moe_cache_pinned_percent == 50);
+        assert(defaults.moe_cache_inserts_per_layer_token == 1);
+        argv = {"binary_name", "--moe-cache-policy", "hybrid", "--moe-cache-pinned-percent", "75",
+                "--moe-cache-inserts-per-layer-token", "1"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_policy_params, LLAMA_EXAMPLE_SERVER));
+        assert(cache_policy_params.moe_cache_policy == "hybrid");
+        assert(cache_policy_params.moe_cache_pinned_percent == 75);
+        assert(cache_policy_params.moe_cache_inserts_per_layer_token == 1);
+        const llama_model_params hybrid_params = common_model_params_to_llama(cache_policy_params);
+        assert(std::string(hybrid_params.moe_cache_policy) == "hybrid");
+        assert(hybrid_params.moe_cache_pinned_percent == 75);
+    }
+
     argv = {"binary_name", "-t", "1234"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.cpuparams.n_threads == 1234);
