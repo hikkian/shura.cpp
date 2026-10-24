@@ -594,6 +594,23 @@ struct common_params {
     std::string moe_cache_profile = ""; // MoE expert cache routing profile CSV (empty = disabled)
     int32_t     moe_cache_slots   = 0;  // MoE expert cache slots per layer (0 = disabled)
     bool        moe_cache_live_resize = false;
+    // VRAMLOGIC1: VRAM governor (owns the expert cache; keeps the card above a free-VRAM reserve)
+    bool        vram_governor = false;
+    int32_t     vram_reserve_mib = 1536;
+    int32_t     vram_hysteresis_mib = 256;
+    int32_t     vram_grow_seconds = 30;
+    int32_t     vram_pause_floor_mib = 768;
+    int32_t     vram_pause_after_seconds = 2;
+    int32_t     vram_min_chunks = 0;
+    int32_t     vram_poll_ms = 200;
+    int32_t     moe_cache_chunk_slots = 4;
+    bool        vram_test_hooks = false;
+    std::string vram_sysfs_card = "auto";
+    std::string vram_warmup_shapes = "prefill_ub,decode_draft,vision";
+    std::string vram_pause_dir = "";
+    // RAMGUARD1f
+    int32_t     host_pinned_max_mib = 0;      // pinned host buffers beyond this (after warm-up) fall back to pageable memory; 0 = no limit
+    bool        drop_file_cache = false;      // posix_fadvise(DONTNEED) on the model files once the weights are loaded
     bool        moe_cache_pinned_source = false;
     std::string moe_cache_policy = "static"; // static (default), hybrid, or opt-in two-channel
     int32_t     moe_cache_pinned_percent = 50; // hybrid profile-pinned share

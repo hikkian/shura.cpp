@@ -39,6 +39,9 @@ struct llama_file {
 
     size_t read_alignment() const;
     bool has_direct_io() const;
+
+    // RAMGUARD1f: ask the kernel to drop this file's pages from the page cache (posix_fadvise DONTNEED; Linux only)
+    void drop_cache();
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

@@ -175,6 +175,8 @@ struct llama_file::impl {
         return true;
     }
 
+    void drop_cache() {}
+
     ~impl() {
         if (fp && owns_fp) {
             std::fclose(fp);
@@ -387,6 +389,15 @@ struct llama_file::impl {
         return fd != -1 && alignment > 1;
     }
 
+    void drop_cache() {
+#ifdef __linux__
+        int f = fd != -1 ? fd : (fp ? fileno(fp) : -1);
+        if (f != -1) {
+            (void) posix_fadvise(f, 0, 0, POSIX_FADV_DONTNEED);
+        }
+#endif
+    }
+
     ~impl() {
         if (fd != -1) {
             close(fd);
@@ -421,6 +432,7 @@ size_t llama_file::size() const { return pimpl->size; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+void llama_file::drop_cache() { pimpl->drop_cache(); }
 
 int llama_file::file_id() const {
 #ifdef _WIN32

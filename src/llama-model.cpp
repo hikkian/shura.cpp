@@ -28,6 +28,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <climits>
@@ -1311,6 +1312,7 @@ struct llama_model::impl {
     int32_t moe_cache_inserts_per_layer_token = 1;
     std::map<int, llama_moe_cache_hybrid_policy> moe_cache_hybrid_layers;
     mutable std::mutex moe_cache_mutex;
+    std::atomic<int> moe_cache_resize_waiters{0};
     mutable std::mutex moe_cache_stats_mutex;
     llama_moe_cache_stats moe_cache_stats = {};
 
@@ -2793,8 +2795,39 @@ bool llama_model_base::moe_expert_cache_requires_serialization() const {
     return params.moe_cache_live_resize || pimpl->moe_cache_hybrid || pimpl->moe_cache_two_channel;
 }
 
+void llama_model_base::reset_moe_expert_cache_learning() {
+    std::lock_guard<std::mutex> cache_lock(pimpl->moe_cache_mutex);
+    for (auto & [il, runtime] : pimpl->moe_channels) {
+        runtime.policy.reset_timing();
+    }
+}
+
+bool llama_model_base::moe_expert_cache_info(int32_t & slots, size_t & slot_bytes, int32_t & max_slots) const {
+    // lock-free on purpose: the governor polls this while a decode holds the cache lock for a whole ubatch.
+    // The rankings and the tensor shapes never change after load; the slot count is a single int.
+    slots = __atomic_load_n(&pimpl->moe_cache_slots, __ATOMIC_RELAXED);
+    slot_bytes = 0;
+    max_slots = 0;
+    if (pimpl->moe_cache_rankings.empty()) {
+        return false;
+    }
+    int64_t max_s = INT32_MAX;
+    for (const auto & [il, _] : pimpl->moe_cache_rankings) {
+        const auto & l = layers[il];
+        const ggml_tensor * g = moe_cache_gate(l);
+        slot_bytes += g->nb[2] + (l.ffn_up_exps ? l.ffn_up_exps->nb[2] : 0) + l.ffn_down_exps->nb[2];
+        max_s = std::min<int64_t>(max_s, g->ne[2]);
+    }
+    max_slots = (int32_t) max_s;
+    return true;
+}
+
 uint64_t llama_model_base::moe_expert_cache_generation() const {
     return pimpl->moe_cache_generation;
+}
+
+bool llama_model_base::moe_expert_cache_resize_pending() const {
+    return pimpl->moe_cache_resize_waiters.load() > 0;
 }
 
 std::mutex & llama_model_base::moe_expert_cache_mutex() const {
@@ -3165,6 +3198,11 @@ bool llama_model_base::get_moe_expert_cache_stats(llama_moe_cache_stats & stats)
 
 bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_slots,
         int32_t & new_slots, size_t & released_bytes, size_t & allocated_bytes) {
+    struct waiter_guard {
+        std::atomic<int> & n;
+        explicit waiter_guard(std::atomic<int> & n) : n(n) { ++n; }
+        ~waiter_guard() { --n; }
+    } waiting(pimpl->moe_cache_resize_waiters);
     std::lock_guard<std::mutex> cache_lock(pimpl->moe_cache_mutex);
     old_slots = pimpl->moe_cache_slots;
     new_slots = old_slots;
@@ -4582,6 +4620,30 @@ bool llama_model_moe_cache_resize(const llama_model * model, int32_t n_slots,
     if (new_slots) { *new_slots = new_count; }
     if (released_bytes) { *released_bytes = freed; }
     if (allocated_bytes) { *allocated_bytes = used; }
+    return ok;
+}
+
+void llama_model_moe_cache_reset_learning(const llama_model * model) {
+    auto * base = model ? dynamic_cast<llama_model_base *>(const_cast<llama_model *>(model)) : nullptr;
+    if (base != nullptr) {
+        base->reset_moe_expert_cache_learning();
+    }
+}
+
+bool llama_model_moe_cache_info(const llama_model * model, int32_t * slots, size_t * slot_bytes, int32_t * max_slots) {
+    if (slots) { *slots = 0; }
+    if (slot_bytes) { *slot_bytes = 0; }
+    if (max_slots) { *max_slots = 0; }
+    auto * base = model ? dynamic_cast<llama_model_base *>(const_cast<llama_model *>(model)) : nullptr;
+    if (base == nullptr) {
+        return false;
+    }
+    int32_t s = 0, m = 0;
+    size_t b = 0;
+    const bool ok = base->moe_expert_cache_info(s, b, m);
+    if (slots) { *slots = s; }
+    if (slot_bytes) { *slot_bytes = b; }
+    if (max_slots) { *max_slots = m; }
     return ok;
 }
 

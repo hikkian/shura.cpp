@@ -211,6 +211,9 @@ public:
         }
     }
 
+    // VRAMLOGIC1: forget the timings learned so far (the governor's warm-up runs random tokens)
+    void reset_timing() { timing = {}; }
+
     const plan & latest() const { return last; }
     const std::vector<int32_t> & slots() const { return slot_to_expert; }
     const costs & estimate(int tokens) const { return timing.at(tokens); }

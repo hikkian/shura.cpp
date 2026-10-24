@@ -132,15 +132,22 @@ static bool server_prepare_params(common_params & params, server_role_type role_
     }
 
     if (params.moe_cache_live_resize) {
-        if (role_type == SERVER_ROLE_ROUTER || (params.hostname != "127.0.0.1" &&
-                params.hostname != "localhost" && params.hostname != "::1")) {
+        bool loopback_only = !params.hostnames.empty();
+        for (const auto & host : params.hostnames) {
+            loopback_only = loopback_only && (host == "127.0.0.1" || host == "localhost" || host == "::1");
+        }
+        if (role_type == SERVER_ROLE_ROUTER || !loopback_only) {
             SRV_ERR("%s\n", "--moe-cache-live-resize requires a single-model server bound to loopback");
             return false;
         }
-        if (params.moe_cache_profile.empty() || params.moe_cache_slots <= 0) {
+        if (params.moe_cache_profile.empty() || (params.moe_cache_slots <= 0 && !params.vram_governor)) {
             SRV_ERR("%s\n", "--moe-cache-live-resize requires --moe-cache-profile and a positive --moe-cache-slots value");
             return false;
         }
+    }
+
+    if (params.drop_file_cache) {
+        setenv("LLAMA_DROP_FILE_CACHE", "1", 1); // read by the model loader
     }
 
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
@@ -179,7 +186,7 @@ static bool server_prepare_params(common_params & params, server_role_type role_
 }
 
 // the API of every server; a router points the handlers in routes at its proxies before calling this
-static void server_register_routes(server_http_context & ctx_http, server_routes & routes) {
+static void server_register_routes(server_http_context & ctx_http, server_routes & routes, const common_params & params) {
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
@@ -195,6 +202,16 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
     if (params.moe_cache_live_resize) {
         ctx_http.post("/moe-cache/slots",     ex_wrapper(routes.post_moe_cache_resize));
+    }
+    if (params.vram_governor) {
+        ctx_http.get ("/vram",                ex_wrapper(routes.get_vram));
+        ctx_http.get ("/vram/policy",         ex_wrapper(routes.get_vram_policy));
+        ctx_http.post("/vram/policy",         ex_wrapper(routes.post_vram_policy));
+        ctx_http.post("/vram/pause",          ex_wrapper(routes.post_vram_pause));
+        if (params.vram_test_hooks) {
+            ctx_http.post("/moe-cache/chunks", ex_wrapper(routes.post_moe_cache_chunks));
+            ctx_http.post("/vram/simulate",    ex_wrapper(routes.post_vram_simulate));
+        }
     }
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
@@ -508,7 +525,7 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
     ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
 
-    server_register_routes(ctx_http, routes);
+    server_register_routes(ctx_http, routes, params);
     server_register_stream_routes(ctx_http,
         models_routes->router_stream_get,
         models_routes->router_streams_lookup,
@@ -610,7 +627,7 @@ static int server_run_instance(common_params & params, server_role & role, commo
         return 1;
     }
 
-    server_register_routes(ctx_http, routes);
+    server_register_routes(ctx_http, routes, params);
     server_register_stream_routes(ctx_http,
         server_stream_make_get_handler(),
         server_stream_make_lookup_handler(),

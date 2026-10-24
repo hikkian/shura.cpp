@@ -10,6 +10,8 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-vram.h"
+#include "../../src/llama-ext.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -30,6 +32,8 @@
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <sstream>
+#include <set>
 #include <utility>
 #include <fstream>
 
@@ -1034,6 +1038,58 @@ public:
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
+    // VRAMLOGIC1: VRAM governor (owns the expert cache); null unless --vram-governor
+    std::unique_ptr<server_vram> vram;
+    std::atomic<int> busy_flag{0};
+    std::atomic<int> big_prefill_flag{0};
+    std::atomic<int64_t> ckpt_bytes{0};
+
+    void start_vram() {
+        if (!params_base.vram_governor || ctx_tgt == nullptr) {
+            return;
+        }
+        auto fixed = [this]() {
+            server_vram::fixed_parts fp;
+            auto gpu_sum = [](const llama_context * c, int32_t & model, int32_t & context, int32_t & compute) {
+                if (c == nullptr) { return; }
+                for (const auto & [buft, data] : llama_get_memory_breakdown(c)) {
+                    if (ggml_backend_buft_is_host(buft)) { continue; }
+                    model   += (int32_t) (data.model   / (1024 * 1024));
+                    context += (int32_t) (data.context / (1024 * 1024));
+                    compute += (int32_t) (data.compute / (1024 * 1024));
+                }
+            };
+            int32_t m = 0, k = 0, c = 0;
+            gpu_sum(ctx_tgt, m, k, c);
+            int32_t dm = 0, dk = 0, dc = 0;
+            if (ctx_dft != nullptr && ctx_dft != ctx_tgt) { gpu_sum(ctx_dft, dm, dk, dc); }
+            fp.weights = m; fp.kv = k; fp.sched = c; fp.draft = dk + dc; (void) dm; // the MTP draft context shares the weights
+            return fp;
+        };
+        vram = std::make_unique<server_vram>(params_base, llama_get_model(ctx_tgt),
+                [this]() { return busy_flag.load() != 0; }, fixed);
+        if (!vram->available()) {
+            vram.reset();
+            return;
+        }
+        vram->set_host_callback([this]() {
+            server_vram::host_parts hp;
+            hp.checkpoints_mib = (int32_t) (ckpt_bytes.load() / (1024 * 1024));
+            hp.prompt_cache_mib = prompt_cache ? (int32_t) (prompt_cache->size() / (1024 * 1024)) : 0;
+            return hp;
+        });
+        vram->set_big_prefill_callback([this]() { return big_prefill_flag.load() != 0; });
+        vram->set_pause_callback([this](const std::string & reason, const std::string & checkpoint) {
+            server_task task(SERVER_TASK_TYPE_VRAM_PAUSE);
+            task.id = queue_tasks.get_new_id();
+            task.vram_reason = reason;
+            task.slot_action.filename = checkpoint;
+            task.slot_action.filepath = params_base.slot_save_path + checkpoint;
+            queue_tasks.post(std::move(task), /*front=*/ true);
+        });
+        vram->start();
+    }
+
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
@@ -1118,6 +1174,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        vram.reset(); // stops the governor thread before the model goes away
         spec.reset();
         spec_init.reset();
 
@@ -1613,7 +1670,11 @@ private:
         params = params_base;
 
         if (!is_resume) {
-            return init();
+            const bool ok = init();
+            if (ok) {
+                start_vram();
+            }
+            return ok;
         }
 
         if (callback_state) {
@@ -3200,6 +3261,74 @@ private:
 
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_VRAM_PAUSE:
+                {
+                    // Save every slot that holds tokens, tell the clients of running requests, and exit with code 75.
+                    // The gateway restarts the server in a smaller layout and restores the checkpoint.
+                    SRV_WRN("vram pause (%s): saving slots to %s\n", task.vram_reason.c_str(), task.slot_action.filepath.c_str());
+                    const int64_t t_start = ggml_time_us();
+                    for (auto & slot : slots) {
+                        if (slot.prompt.tokens.size() == 0) {
+                            continue;
+                        }
+                        std::string filename = task.slot_action.filename;
+                        std::string filepath = task.slot_action.filepath;
+                        if (slots.size() > 1) {
+                            filename += "." + std::to_string(slot.id);
+                            filepath += "." + std::to_string(slot.id);
+                        }
+                        bool saved = false;
+                        size_t nwrite = 0;
+                        try {
+                            std::vector<char> packed = slot.prompt.tokens.serialize();
+                            nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot.id,
+                                    reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                            size_t nwrite_ckpt = 0;
+                            saved = nwrite > 0 && save_slot_checkpoints(filepath, slot, nwrite_ckpt);
+                        } catch (const std::exception & err) {
+                            SRV_ERR("vram pause: saving slot %d failed: %s\n", slot.id, err.what());
+                        }
+                        // sidecar for byte-exact continuation: the exact token ids of the slot and the request parameters
+                        if (saved) {
+                            try {
+                                json side = {
+                                    {"slot", slot.id}, {"reason", task.vram_reason},
+                                    {"n_past", (int64_t) slot.prompt.tokens.size()},
+                                    {"tokens", slot.prompt.tokens.get_text_tokens()},
+                                    {"multimodal", slot.prompt.tokens.size() != slot.prompt.tokens.get_text_tokens().size()},
+                                    {"processing", slot.is_processing()},
+                                    {"generated_tokens", (int64_t) slot.stats.n_gen},
+                                };
+                                if (slot.is_processing() && slot.task) {
+                                    side["params"] = slot.task->params.to_json();
+                                    json preserved = json::array();
+                                    for (const auto t : slot.task->params.sampling.preserved_tokens) { preserved.push_back((int64_t) t); }
+                                    side["preserved_tokens"] = preserved;
+                                    side["n_predict"] = slot.task->params.n_predict;
+                                    side["n_predict_left"] = slot.task->params.n_predict < 0 ? -1
+                                            : std::max<int64_t>(0, (int64_t) slot.task->params.n_predict - (int64_t) slot.stats.n_gen);
+                                }
+                                std::ofstream f(filepath + ".tokens.json");
+                                f << side.dump();
+                            } catch (const std::exception & err) {
+                                SRV_ERR("vram pause: writing the sidecar of slot %d failed: %s\n", slot.id, err.what());
+                            }
+                        }
+                        if (slot.is_processing() && slot.task) {
+                            json info = {
+                                {"checkpoint", saved ? filename : ""}, {"slot", slot.id}, {"reason", task.vram_reason},
+                                {"n_past", (int64_t) slot.prompt.tokens.size()}, {"generated_tokens", (int64_t) slot.stats.n_gen},
+                                {"saved", saved}, {"tokens_file", saved ? filename + ".tokens.json" : ""},
+                            };
+                            send_error(slot.task->id, info.dump(), ERROR_TYPE_VRAM_PAUSE);
+                        }
+                    }
+                    SRV_WRN("vram pause: slots saved in %.0f ms, exiting with code 75\n", (ggml_time_us() - t_start) / 1000.0);
+                    // let the HTTP threads flush the error frames
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    fflush(nullptr);
+                    std::_Exit(75);
+                } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
                     const int id_slot = task.slot_action.id_slot;
@@ -3537,6 +3666,24 @@ private:
                     all_idle = false;
                     break;
                 }
+            }
+
+            busy_flag.store(all_idle ? 0 : 1);
+            {
+                bool big = false;
+                for (auto & slot : slots) {
+                    if (slot.is_processing() && (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) && slot.task &&
+                            slot.task->n_tokens() - slot.prompt.n_tokens() >= 4096) {
+                        big = true;
+                        break;
+                    }
+                }
+                big_prefill_flag.store(big ? 1 : 0);
+                int64_t cb = 0;
+                for (auto & slot : slots) {
+                    for (const auto & ckpt : slot.prompt.checkpoints) { cb += (int64_t) ckpt.size(); }
+                }
+                ckpt_bytes.store(cb);
             }
 
             if (all_idle) {
@@ -5299,6 +5446,52 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
         }
 
+        // VRAMLOGIC1 resume: continue a request that was paused by the VRAM governor. The prompt is the exact token
+        // list saved at the pause (prompt + generated), the slot was restored by the caller, the HTTP-side parser starts
+        // from the generated text, and n_predict is what was left.
+        std::string resume_base_text;
+        std::vector<std::string> resume_tool_call_ids;
+        int64_t resume_n_predict_left = -2;
+        if (data.contains("resume") && data["resume"].is_object()) {
+            if (inputs.size() != 1) {
+                throw std::runtime_error("resume requires a single prompt");
+            }
+            const std::string name = json_value(data["resume"], "tokens_file", std::string());
+            if (name.empty() || name.find('/') != std::string::npos || name.find("..") != std::string::npos || params.slot_save_path.empty()) {
+                throw std::runtime_error("resume.tokens_file must be a plain file name inside --slot-save-path");
+            }
+            std::ifstream f(params.slot_save_path + name);
+            if (!f) {
+                throw std::runtime_error("resume.tokens_file not found");
+            }
+            std::stringstream side_text;
+            side_text << f.rdbuf();
+            const json side = json::parse(side_text.str());
+            if (side.value("multimodal", false) || !side.contains("tokens") || !side["tokens"].is_array()) {
+                throw std::runtime_error("this pause cannot be continued exactly (multimodal slot or no tokens)");
+            }
+            llama_tokens toks = side["tokens"].get<llama_tokens>();
+            const int64_t n_past = side.value("n_past", (int64_t) toks.size());
+            const int64_t n_gen  = side.value("generated_tokens", (int64_t) 0);
+            if ((int64_t) toks.size() != n_past || n_gen < 0 || n_gen > n_past) {
+                throw std::runtime_error("resume file is inconsistent");
+            }
+            // text generated before the pause: the same pieces the slot appended to its generated text
+            const json preserved = side.value("preserved_tokens", json::array());
+            std::set<llama_token> keep;
+            for (const auto & t : preserved) { if (t.is_number_integer()) { keep.insert((llama_token) t.get<int64_t>()); } }
+            for (int64_t i = n_past - n_gen; i < n_past; i++) {
+                resume_base_text += common_token_to_piece(ctx_server.vocab, toks[i], params.special || keep.count(toks[i]) > 0);
+            }
+            inputs[0] = server_tokens(toks, ctx_server.mctx != nullptr);
+            resume_n_predict_left = side.value("n_predict_left", (int64_t) -1);
+            if (data["resume"].contains("tool_call_ids") && data["resume"]["tool_call_ids"].is_array()) {
+                for (const auto & id : data["resume"]["tool_call_ids"]) { resume_tool_call_ids.push_back(id.get<std::string>()); }
+            }
+            SRV_INF("resume: %lld tokens (%lld generated before the pause), %lld left to predict\n",
+                    (long long) n_past, (long long) n_gen, (long long) resume_n_predict_left);
+        }
+
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
         for (size_t i = 0; i < inputs.size(); i++) {
@@ -5314,6 +5507,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.apply_chat_session(chat_session);
+            if (resume_n_predict_left > -2) {
+                if (resume_n_predict_left >= 0) {
+                    task.params.n_predict = (int32_t) resume_n_predict_left;
+                }
+                task.resume_base_text = resume_base_text;
+                task.resume_tool_call_ids = resume_tool_call_ids;
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -5999,6 +6199,127 @@ void server_routes::init_routes() {
             return res;
         }
         res->ok(result->to_json());
+        return res;
+    };
+
+    // VRAMLOGIC1 endpoints (see reports/vramlogic1/API.md)
+    this->get_vram = [this](const server_http_req &) {
+        auto res = create_response();
+        if (!ctx_server.vram) {
+            res->error(format_error_response("VRAM governor is not running", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        res->ok(ctx_server.vram->status());
+        return res;
+    };
+    this->get_vram_policy = [this](const server_http_req &) {
+        auto res = create_response();
+        if (!ctx_server.vram) {
+            res->error(format_error_response("VRAM governor is not running", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        res->ok(ctx_server.vram->policy_json());
+        return res;
+    };
+    this->post_vram_policy = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!ctx_server.vram) {
+            res->error(format_error_response("VRAM governor is not running", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception &) {
+            res->error(format_error_response("invalid JSON body", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::string err;
+        if (!ctx_server.vram->set_policy(body, err)) {
+            res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok(ctx_server.vram->policy_json());
+        return res;
+    };
+    this->post_vram_pause = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!ctx_server.vram) {
+            res->error(format_error_response("VRAM governor is not running", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        json body = json::object();
+        if (!req.body.empty()) {
+            try {
+                body = json::parse(req.body);
+            } catch (const std::exception &) {
+                res->error(format_error_response("invalid JSON body", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        std::string checkpoint = body.value("checkpoint", std::string("vram-pause.bin"));
+        if (checkpoint.empty() || checkpoint.find('/') != std::string::npos || checkpoint.find("..") != std::string::npos) {
+            res->error(format_error_response("checkpoint must be a plain file name", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("the server runs without --slot-save-path", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (!ctx_server.vram->request_pause(body.value("reason", std::string("gateway")), checkpoint)) {
+            res->error(format_error_response("a pause is already in progress", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        res->status = 202;
+        res->data = json{{"state", "PAUSING"}}.dump();
+        return res;
+    };
+    this->post_moe_cache_chunks = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!ctx_server.vram || !ctx_server.vram->test_hooks()) {
+            res->error(format_error_response("test hooks are not enabled", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception &) {
+            res->error(format_error_response("invalid JSON body", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!body.contains("chunks") || !body["chunks"].is_number_integer()) {
+            res->error(format_error_response("chunks must be an integer", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::string err;
+        const json out = ctx_server.vram->set_chunks_manual((int32_t) body["chunks"].get<int64_t>(), err);
+        if (!err.empty()) {
+            res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok(out);
+        return res;
+    };
+    this->post_vram_simulate = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!ctx_server.vram || !ctx_server.vram->test_hooks()) {
+            res->error(format_error_response("test hooks are not enabled", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception &) {
+            res->error(format_error_response("invalid JSON body", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!body.contains("free_delta_mib") || !body["free_delta_mib"].is_number_integer() ||
+                !body.contains("seconds") || !body["seconds"].is_number()) {
+            res->error(format_error_response("free_delta_mib (integer) and seconds (number) are required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        ctx_server.vram->simulate((int32_t) body["free_delta_mib"].get<int64_t>(), body["seconds"].get<double>());
+        res->ok(json{{"ok", true}});
         return res;
     };
 

@@ -531,6 +531,7 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, const
     for (auto & task : tasks) {
         task.index = index++;
         states.push_back(task_result_state(session));
+        states.back().seed_resume(task.resume_base_text, task.resume_tool_call_ids);
         // for child tasks
         for (auto & child_task : task.child_tasks) {
             child_task.index = index++;

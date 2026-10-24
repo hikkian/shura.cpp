@@ -66,6 +66,7 @@ enum error_type {
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
     ERROR_TYPE_EXCEED_CONTEXT_SIZE, // custom error
+    ERROR_TYPE_VRAM_PAUSE, // custom error: the VRAM governor paused the server (VRAMLOGIC1)
 };
 
 // thin wrapper around common_grammar_trigger with (de)serialization functions

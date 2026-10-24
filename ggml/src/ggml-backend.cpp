@@ -1975,6 +1975,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 }
 
 static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, ggml_backend_t split_backend) {
+    GGML_LOG_WARN("%s: expert prefetch disabled for this scheduler (slot allocation failed)\n", __func__);
     sched->prefetch_experts = false;
     if (sched->prefetch_backend) {
         ggml_backend_synchronize(split_backend);

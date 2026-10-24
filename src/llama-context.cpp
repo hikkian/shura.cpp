@@ -18,6 +18,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#include <thread>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -1534,6 +1536,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (model_base != nullptr && model_base->moe_expert_cache_requires_serialization()) {
         // A resize or hybrid slot update may rewrite/free pack storage. Hold the
         // model cache lock from scheduler invalidation through graph sync/update.
+        // let a pending resize (the VRAM governor) take the lock between two ubatches
+        for (int i = 0; i < 20000 && model_base->moe_expert_cache_resize_pending(); i++) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
         moe_cache_lock = std::unique_lock<std::mutex>(model_base->moe_expert_cache_mutex());
         const uint64_t generation = model_base->moe_expert_cache_generation();
         if (generation != moe_cache_generation) {

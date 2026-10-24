@@ -998,12 +998,17 @@ struct llama_model_base : public llama_model {
     bool resize_moe_expert_cache(int32_t n_slots, int32_t & old_slots,
             int32_t & new_slots, size_t & released_bytes, size_t & allocated_bytes);
     bool moe_expert_cache_requires_serialization() const;
+    void reset_moe_expert_cache_learning();
+    // VRAMLOGIC1: current slot count, bytes of VRAM per slot across all cached layers, largest valid slot count
+    bool moe_expert_cache_info(int32_t & slots, size_t & slot_bytes, int32_t & max_slots) const;
     bool moe_expert_cache_two_channel_enabled() const;
     bool moe_expert_cache_split(ggml_backend_sched_t sched, ggml_backend_t backend,
             ggml_cgraph * graph, bool before, int64_t elapsed_us);
     bool finish_moe_expert_cache_channels(bool success);
     uint64_t moe_expert_cache_generation() const;
     std::mutex & moe_expert_cache_mutex() const;
+    // VRAMLOGIC1: true while a resize waits for the cache lock; decode must not take the lock again meanwhile (fair hand-off)
+    bool moe_expert_cache_resize_pending() const;
     bool update_moe_expert_cache_locked(ggml_backend_sched_t sched, const llm_graph_result & graph);
     bool get_moe_expert_cache_stats(llama_moe_cache_stats & stats) const;
 

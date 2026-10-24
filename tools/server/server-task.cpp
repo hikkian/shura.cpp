@@ -156,6 +156,23 @@ task_result_state::task_result_state(common_chat_session session)
     , oai_resp_message_id("msg_" + random_string()) {
 }
 
+void task_result_state::seed_resume(const std::string & base_text, const std::vector<std::string> & tool_call_ids) {
+    if (base_text.empty()) {
+        return;
+    }
+    generated_tool_call_ids = tool_call_ids;
+    auto base = chat_session.feed(common_chat_input(base_text));
+    if (!base.empty()) {
+        base.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+        chat_msg = base;
+        for (size_t i = 0; i < chat_msg.tool_calls.size(); i++) {
+            if (!chat_msg.tool_calls[i].name.empty()) {
+                sent_tool_call_names.insert(i);
+            }
+        }
+    }
+}
+
 common_chat_msg task_result_state::update_chat_msg(
         const common_chat_input & added,
         bool is_partial,

@@ -120,6 +120,12 @@ struct server_routes {
     server_http_context::handler_t post_chat_completions_tok;
     server_http_context::handler_t post_control;
     server_http_context::handler_t post_moe_cache_resize;
+    server_http_context::handler_t get_vram;
+    server_http_context::handler_t get_vram_policy;
+    server_http_context::handler_t post_vram_policy;
+    server_http_context::handler_t post_vram_pause;
+    server_http_context::handler_t post_moe_cache_chunks;
+    server_http_context::handler_t post_vram_simulate;
     server_http_context::handler_t post_responses_oai;
     server_http_context::handler_t post_responses_tok_oai;
     server_http_context::handler_t post_transcriptions_oai;

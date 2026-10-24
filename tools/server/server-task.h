@@ -32,6 +32,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
     SERVER_TASK_TYPE_MOE_CACHE_RESIZE,
+    SERVER_TASK_TYPE_VRAM_PAUSE,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -139,6 +140,10 @@ struct task_result_state {
 
     task_result_state(common_chat_session session = {});
 
+    // VRAMLOGIC1 "resume": start the parser from the text generated before a pause, so only the deltas
+    // beyond it reach the client; the tool call ids are the ones the client already got
+    void seed_resume(const std::string & base_text, const std::vector<std::string> & tool_call_ids);
+
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
         const common_chat_input & added,
@@ -184,6 +189,9 @@ struct server_task {
         std::string filepath;
     };
     slot_action slot_action;
+
+    // used by SERVER_TASK_TYPE_VRAM_PAUSE
+    std::string vram_reason;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -312,6 +320,11 @@ struct server_task {
 
         child_tasks.push_back(std::move(copy));
     }
+
+    // VRAMLOGIC1 "resume": the text generated before a pause. The HTTP-side state starts from it, so only
+    // the deltas beyond it reach the client. The tool call ids are the ones the client already got.
+    std::string resume_base_text;
+    std::vector<std::string> resume_tool_call_ids;
 
     bool is_parent() const {
         return child_tasks.size() > 0;

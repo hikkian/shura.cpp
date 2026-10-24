@@ -621,6 +621,11 @@ extern "C" {
     // Caller must serialize this with inference; the server does so at decode boundaries.
     LLAMA_API bool llama_model_moe_cache_resize(const struct llama_model * model, int32_t n_slots,
             int32_t * old_slots, int32_t * new_slots, size_t * released_bytes, size_t * allocated_bytes);
+    // VRAMLOGIC1: expert cache geometry; false when the model has no expert cache rankings
+    // VRAMLOGIC1: forget what the two-channel cache learned (called after the governor's warm-up)
+    LLAMA_API void llama_model_moe_cache_reset_learning(const struct llama_model * model);
+    LLAMA_API bool llama_model_moe_cache_info(const struct llama_model * model,
+            int32_t * slots, size_t * slot_bytes, int32_t * max_slots);
     LLAMA_API bool llama_model_get_moe_cache_stats(const struct llama_model * model,
             struct llama_moe_cache_stats * stats);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);

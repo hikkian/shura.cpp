@@ -1954,6 +1954,12 @@ bool llama_model_loader::load_all_data(
                 }
             }
         }
+        // RAMGUARD1f: the weights are on the device (or in pinned copies) now; do not leave a second copy in the page cache
+        if (getenv("LLAMA_DROP_FILE_CACHE") != nullptr) {
+            for (auto & f : files) {
+                f->drop_cache();
+            }
+        }
         if (progress_callback) {
             // Even though the model is done loading, we still honor
             // cancellation since we need to free allocations.
