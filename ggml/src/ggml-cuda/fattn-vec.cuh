@@ -643,7 +643,7 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 
 #if defined(GGML_USE_HIP)
     // GQA-packed decode path (opt-in): one block handles all Q heads of one KV head, K/V rows are read and unpacked once.
-    if constexpr (D == 256 && type_K == GGML_TYPE_Q8_0 && (type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_TURBO4_0)) {
+    if constexpr ((D == 256 || D == 512) && type_K == GGML_TYPE_Q8_0 && (type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_TURBO4_0)) {
         static const bool gqa_vec_enabled = []() { const char * e = getenv("GGML_HIP_FA_GQA_VEC"); return e && e[0] == '1'; }();
         const ggml_tensor * K = dst->src[1];
         const int gqa_ratio = Q->ne[2] / K->ne[2];
@@ -745,6 +745,8 @@ extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F16, GGML_TYPE_TURBO2_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_TURBO2_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_TURBO2_0);

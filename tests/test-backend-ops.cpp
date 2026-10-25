@@ -12189,6 +12189,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (int nb : { 75, 1024, }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
                 }
+    // Gemma 4 global layers: head size 512, 2 KV heads with 8 Q heads per KV head, quantized KV, decode-sized batches (GEMMAFA1c).
+    // The head-size loop above tests quantized KV only for head sizes 64 and 72.
+    for (const auto & kv_types : std::initializer_list<std::pair<ggml_type, ggml_type>>{
+            {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0}}) {
+        for (int kv : { 113, 512, 1024, }) {
+            for (int nb : { 1, 2, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kv_types.first, kv_types.second));
             }
         }
     }

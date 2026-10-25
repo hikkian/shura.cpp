@@ -597,6 +597,10 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(TURBO4_0, TURBO3_0)
     FATTN_VEC_CASES_ALL_D(TURBO4_0, TURBO4_0)
 
+    // Gemma 4 global layers: head size 512 (only the q8_0 K pairs)
+    FATTN_VEC_CASE(512, Q8_0, Q8_0)
+    FATTN_VEC_CASE(512, Q8_0, TURBO4_0)
+
     return nullptr;
 }
 
@@ -755,7 +759,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+#if defined(GGML_USE_HIP)
+    // Head 512 (Gemma global layers): the vector kernel is allowed on HIP for q8_0 K and q8_0/turbo4 V at decode batch sizes.
+    const bool head512_vec_ok = Q->ne[0] == 512 && K->type == GGML_TYPE_Q8_0 && (V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_TURBO4_0) && Q->ne[1] <= 2;
+#else
+    const bool head512_vec_ok = false;
+#endif // GGML_USE_HIP
+    const bool can_use_vector_kernel = (Q->ne[0] <= 256 || head512_vec_ok) && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
