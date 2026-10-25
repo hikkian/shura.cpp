@@ -1,0 +1,162 @@
+# Hook points of the fork in upstream files (see docs/SHURA.md). After a rebase, `scripts/shura-touchpoints.py` checks that
+# every `probe` string is still present in its file; a missing one means upstream moved the code and the hook has to be re-placed.
+# feature = which part of the fork depends on it.
+
+[[hook]]
+feature = "turbo-kv"
+file = "ggml/include/ggml.h"
+probe = "GGML_OP_TURBO_WHT"
+note = "op enum entry; GGML_OP_COUNT assertions in ggml.c are bumped by one"
+
+[[hook]]
+feature = "turbo-kv"
+file = "ggml/include/ggml.h"
+probe = "GGML_TYPE_TURBO4_0"
+
+[[hook]]
+feature = "turbo-kv"
+file = "ggml/src/ggml.c"
+probe = "ggml_turbo_wht"
+
+[[hook]]
+feature = "turbo-kv"
+file = "ggml/src/ggml.c"
+probe = 'static_assert(GGML_OP_COUNT == 103'
+
+[[hook]]
+feature = "turbo-kv"
+file = "ggml/src/ggml-cpu/ggml-cpu.c"
+probe = "GGML_TYPE_TURBO4_0"
+
+[[hook]]
+feature = "turbo-kv"
+file = "ggml/src/CMakeLists.txt"
+probe = "ggml-turbo-quant.c"
+
+[[hook]]
+feature = "turbo-kv"
+file = "ggml/cmake/common.cmake"
+probe = "turbo4_0"
+note = "FA_TYPES list for the generated flash-attention vec instances"
+
+[[hook]]
+feature = "turbo-kv"
+file = "ggml/CMakeLists.txt"
+probe = "q8_0-turbo4_0"
+note = "default GGML_CUDA_FA_QUANTS contains the turbo combinations"
+
+[[hook]]
+feature = "turbo-kv"
+file = "ggml/src/ggml-cuda/fattn.cu"
+probe = "FATTN_VEC_CASE(512, Q8_0, TURBO4_0)"
+note = "vec-case table of ggml_cuda_get_fattn_vec_case"
+
+[[hook]]
+feature = "turbo-kv"
+file = "ggml/src/ggml-cuda/fattn-mma-f16.cuh"
+probe = "flash_attn_ext_turbo4_load_tile"
+note = "uses upstream's swizzle<stride>() and swz; keep in step with ggml_cuda_fattn_mma_get_swizzled"
+
+[[hook]]
+feature = "turbo-kv"
+file = "src/llama-graph.cpp"
+probe = "ggml_turbo_wht(ctx0, q"
+note = "pre-rotation of the queries in build_attn (all overloads)"
+
+[[hook]]
+feature = "scheduler-prefetch"
+file = "ggml/src/ggml-backend.cpp"
+probe = "ggml_backend_sched_prefetch_init"
+note = "prefetch branch inside the host-weight copy loop of ggml_backend_sched_compute_splits"
+
+[[hook]]
+feature = "scheduler-prefetch"
+file = "ggml/src/ggml-backend.cpp"
+probe = "cpu_async"
+
+[[hook]]
+feature = "scheduler-prefetch"
+file = "src/llama-context.cpp"
+probe = "ggml_backend_sched_set_async_cpu"
+note = "inside sched_new()"
+
+[[hook]]
+feature = "expert-cache"
+file = "src/llama-graph.cpp"
+probe = "use_moe_packs"
+note = "pack path of build_moe_ffn next to upstream's slots code; both overloads take `const llama_layer * moe_cache`"
+
+[[hook]]
+feature = "expert-cache"
+file = "src/llama-graph.h"
+probe = "const llama_layer * moe_cache"
+
+[[hook]]
+feature = "expert-cache"
+file = "src/llama-model.cpp"
+probe = "init_moe_expert_cache"
+
+[[hook]]
+feature = "expert-cache"
+file = "src/models/qwen35moe.cpp"
+probe = "&model.layers[il]"
+note = "last argument of build_moe_ffn; also gemma4, laguna, deepseek2"
+
+[[hook]]
+feature = "expert-cache"
+file = "ggml/src/ggml-cuda/mmvq.cu"
+probe = "-1"
+note = "ids == -1 skip merged with upstream's shared_expert"
+
+[[hook]]
+feature = "expert-cache"
+file = "ggml/src/ggml-cuda/mmid.cu"
+probe = "ids"
+
+[[hook]]
+feature = "expert-cache"
+file = "src/llama-model-loader.cpp"
+probe = "moe_cache_pinned_buft"
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server.cpp"
+probe = "vram_governor"
+note = "server_prepare_params validation and the /vram routes in server_register_routes"
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server-context.cpp"
+probe = "vram pause"
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server-queue.cpp"
+probe = "seed_resume"
+note = "resume: the HTTP-side parser starts from the text generated before the pause"
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server-task.cpp"
+probe = "seed_resume"
+
+[[hook]]
+feature = "governor"
+file = "common/arg.cpp"
+probe = "--vram-governor"
+
+[[hook]]
+feature = "governor"
+file = "src/llama-mmap.cpp"
+probe = "O_DIRECT"
+note = "--load-mode dio"
+
+[[hook]]
+feature = "llama-bench"
+file = "tools/llama-bench/llama-bench.cpp"
+probe = "sched_async_cpu"
+
+[[hook]]
+feature = "qwen4exp"
+file = "conversion/base.py"
+probe = "mtp_shared_embd"
