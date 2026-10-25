@@ -42,6 +42,7 @@ public:
 
     json status();                                       // GET /vram
     json policy_json();                                  // GET /vram/policy
+    json journal_json(uint64_t since_id, size_t limit);  // GET /vram/journal (MEMV2)
     bool set_policy(const json & body, std::string & err); // POST /vram/policy
     json set_chunks_manual(int32_t chunks, std::string & err); // POST /moe-cache/chunks (test hooks)
     void simulate(int32_t free_delta_mib, double seconds); // POST /vram/simulate (test hooks)
@@ -98,6 +99,7 @@ private:
     int32_t last_free_mib_ = 0;
     int32_t window_min_free_ = INT32_MAX;
     int32_t proc_vram_mib_ = 0;
+    double  human_need_ = -1;       // MEMV2: what the gateway last said about the desk, 0..1 (-1 = never said), informational
     uint64_t last_resize_ms_ = 0;
     double   uptime0_s_ = 0;
 

@@ -122,6 +122,7 @@ struct server_routes {
     server_http_context::handler_t post_moe_cache_resize;
     server_http_context::handler_t get_vram;
     server_http_context::handler_t get_vram_policy;
+    server_http_context::handler_t get_vram_journal;
     server_http_context::handler_t post_vram_policy;
     server_http_context::handler_t post_vram_pause;
     server_http_context::handler_t post_moe_cache_chunks;

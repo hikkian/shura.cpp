@@ -293,6 +293,9 @@ bool server_vram::request_pause(const std::string & reason, const std::string & 
     {
         std::lock_guard<std::mutex> lk(mu_);
         core_.set_state(vram_state::PAUSING, reason);
+        if (reason != "pause_floor" && reason != "short_stall") { // the governor's own pauses were journaled in step()
+            core_.note_pause(reason, mono_s(), last_free_mib_);
+        }
     }
     // marker for the gateway: why the process is about to exit with code 75 and what the card looked like
     if (!marker_dir_.empty()) {
@@ -315,7 +318,7 @@ server_vram::json server_vram::policy_locked() const {
         {"reserve_mib", p.reserve_mib}, {"hysteresis_mib", p.hysteresis_mib}, {"grow_seconds", p.grow_seconds},
         {"pause_floor_mib", p.pause_floor_mib}, {"pause_after_seconds", p.pause_after_seconds}, {"min_chunks", p.min_chunks},
         {"max_chunks", p.max_chunks < 0 ? json(nullptr) : json(p.max_chunks)},
-        {"prefill_yield", p.prefill_yield}, {"poll_ms", p.poll_ms},
+        {"prefill_yield", p.prefill_yield}, {"poll_ms", p.poll_ms}, {"sleep_level", p.sleep_level},
     };
 }
 
@@ -341,14 +344,26 @@ bool server_vram::set_policy(const json & body, std::string & err) {
         return true;
     };
     static const std::set<std::string> known = {"reserve_mib", "hysteresis_mib", "grow_seconds", "pause_floor_mib",
-        "min_chunks", "max_chunks", "prefill_yield", "poll_ms", "pause_after_seconds"};
+        "min_chunks", "max_chunks", "prefill_yield", "poll_ms", "pause_after_seconds", "sleep_level", "human_need", "note"};
     for (auto it = body.begin(); it != body.end(); ++it) {
         if (!known.count(it.key())) { err = "unknown field " + it.key(); return false; }
     }
     if (!num("reserve_mib", 256, 4096, p.reserve_mib) || !num("hysteresis_mib", 0, 1024, p.hysteresis_mib) ||
         !num("grow_seconds", 0, 600, p.grow_seconds) || !num("pause_floor_mib", 0, 2048, p.pause_floor_mib) ||
-        !num("min_chunks", 0, 64, p.min_chunks) || !num("pause_after_seconds", 0, 600, p.pause_after_seconds) || !num("poll_ms", 50, 1000, p.poll_ms)) {
+        !num("min_chunks", 0, 64, p.min_chunks) || !num("pause_after_seconds", 0, 600, p.pause_after_seconds) || !num("poll_ms", 50, 1000, p.poll_ms) ||
+        !num("sleep_level", 0, 1, p.sleep_level)) {
         return false;
+    }
+    double human_need = -2;
+    if (body.contains("human_need")) {
+        const auto & v = body["human_need"];
+        if (!v.is_number() || v.get<double>() < 0.0 || v.get<double>() > 1.0) { err = "human_need must be a number 0..1"; return false; }
+        human_need = v.get<double>();
+    }
+    std::string note;
+    if (body.contains("note")) {
+        if (!body["note"].is_string() || body["note"].get<std::string>().size() > 200) { err = "note must be a string up to 200 characters"; return false; }
+        note = body["note"].get<std::string>();
     }
     if (body.contains("max_chunks")) {
         const auto & v = body["max_chunks"];
@@ -366,8 +381,30 @@ bool server_vram::set_policy(const json & body, std::string & err) {
         p.prefill_yield = body["prefill_yield"].get<bool>();
     }
     std::lock_guard<std::mutex> lk(mu_);
+    core_.note_policy(core_.policy, p, note, mono_s());
     core_.policy = p;
+    if (human_need > -1) { human_need_ = human_need; }
     return true;
+}
+
+server_vram::json server_vram::journal_json(uint64_t since_id, size_t limit) {
+    std::lock_guard<std::mutex> lk(mu_);
+    json events = json::array();
+    const double mono_now = mono_s(), wall_now = vram_journal::wall_now();
+    for (const auto & e : core_.journal.since(since_id, limit)) {
+        events.push_back({
+            {"id", e.id}, {"t", std::round((wall_now - (mono_now - e.mono_s)) * 1000.0) / 1000.0}, {"kind", e.kind}, {"reason", e.reason},
+            {"state", e.state}, {"chunks_before", e.chunks_before}, {"chunks_after", e.chunks_after}, {"mib", e.mib},
+            {"free_mib", e.free_mib}, {"recovered_s", e.recovered_s < 0 ? json(nullptr) : json(std::round(e.recovered_s * 100.0) / 100.0)},
+            {"note", e.note},
+        });
+    }
+    const auto & t = core_.journal.totals;
+    return {{"events", events}, {"last_id", core_.journal.last_id()},
+            {"totals", {{"yields", t.yields}, {"yielded_mib", t.yielded_mib}, {"recovered", t.recovered},
+                        {"recovered_mean_s", t.recovered ? std::round(t.recovered_sum_s / double(t.recovered) * 100.0) / 100.0 : 0.0},
+                        {"recovered_max_s", std::round(t.recovered_max_s * 100.0) / 100.0}, {"pauses", t.pauses}, {"sleeps", t.sleeps}}},
+            {"human_need", human_need_ < 0 ? json(nullptr) : json(human_need_)}, {"uptime_s", std::round((mono_now - uptime0_s_) * 10.0) / 10.0}};
 }
 
 server_vram::json server_vram::set_chunks_manual(int32_t chunks, std::string & err) {
@@ -449,6 +486,9 @@ server_vram::json server_vram::status() {
                    {"target_chunks", geom_.chunks}, {"max_chunks", core_.policy.max_chunks < 0 ? json(nullptr) : json(core_.policy.max_chunks)},
                    {"last_resize_ms", last_resize_ms_}}},
         {"policy", policy_locked()},
+        {"journal", {{"last_id", core_.journal.last_id()}, {"yields", core_.journal.totals.yields}, {"yielded_mib", core_.journal.totals.yielded_mib},
+                     {"recovered_max_s", std::round(core_.journal.totals.recovered_max_s * 100.0) / 100.0}}},
+        {"human_need", human_need_ < 0 ? json(nullptr) : json(human_need_)},
         {"counters", {{"trims", core_.trims}, {"chunks_dropped", core_.chunks_dropped}, {"grows", core_.grows},
                       {"chunks_grown", core_.chunks_grown}, {"pauses", core_.pauses},
                       {"pool_overflow", pool_overflows},

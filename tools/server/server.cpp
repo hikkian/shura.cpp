@@ -206,6 +206,7 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     if (params.vram_governor) {
         ctx_http.get ("/vram",                ex_wrapper(routes.get_vram));
         ctx_http.get ("/vram/policy",         ex_wrapper(routes.get_vram_policy));
+        ctx_http.get ("/vram/journal",        ex_wrapper(routes.get_vram_journal));
         ctx_http.post("/vram/policy",         ex_wrapper(routes.post_vram_policy));
         ctx_http.post("/vram/pause",          ex_wrapper(routes.post_vram_pause));
         if (params.vram_test_hooks) {

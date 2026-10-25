@@ -9,8 +9,11 @@
 // for a pause with a checkpoint (the gateway then restarts the server in a smaller layout).
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <string>
+#include <vector>
 
 struct vram_policy {
     int32_t reserve_mib     = 1536;
@@ -23,6 +26,7 @@ struct vram_policy {
     int32_t max_chunks      = -1;     // -1 = unlimited (JSON null); 0 = cache fully released ("game")
     bool    prefill_yield   = false;
     int32_t poll_ms         = 200;
+    int32_t sleep_level     = 0;      // MEMV2: 0 = awake, 1 = light sleep (the cache is released, the model stays in VRAM)
 };
 
 enum class vram_state {
@@ -71,11 +75,87 @@ struct vram_action {
     std::string reason;
 };
 
+
+// MEMV2: journal of the concessions the server made to the desk (what it gave back, when, why, how long the card stayed short).
+// In memory only (a ring of the last events plus running totals), never written to disk.
+struct vram_journal_event {
+    uint64_t id = 0;
+    double   wall_s = 0;          // unix time
+    double   mono_s = 0;          // the governor's monotonic clock
+    std::string kind;             // trim | grow | prefill_yield | pause | policy | sleep | wake
+    std::string reason;
+    std::string state;            // governor state after the event
+    int32_t  chunks_before = 0, chunks_after = 0;
+    int32_t  mib = 0;             // VRAM given back (negative) or taken (positive) by the cache change
+    int32_t  free_mib = 0;        // card free VRAM when it was decided
+    double   recovered_s = -1;    // trim: how long free VRAM stayed below the reserve (-1 = not recovered yet / not applicable)
+    std::string note;             // policy events: what the caller said (the gateway's reason, e.g. "game")
+};
+
+struct vram_journal_totals {
+    uint64_t yields = 0;          // trims that were a concession (short on VRAM or the policy cap, not prefill yield)
+    uint64_t yielded_mib = 0;
+    uint64_t recovered = 0;       // yields after which free VRAM got back to the reserve
+    double   recovered_sum_s = 0;
+    double   recovered_max_s = 0;
+    uint64_t pauses = 0;
+    uint64_t sleeps = 0;
+};
+
+class vram_journal {
+public:
+    size_t capacity = 512;
+    vram_journal_totals totals;
+
+    static double wall_now() {
+        return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    vram_journal_event & add(vram_journal_event ev, double mono_s) {
+        ev.id = next_id_++;
+        ev.mono_s = mono_s;
+        if (ev.wall_s <= 0) { ev.wall_s = wall_now(); }
+        events_.push_back(std::move(ev));
+        while (events_.size() > capacity) { events_.pop_front(); }
+        return events_.back();
+    }
+
+    // free VRAM is back at the reserve: close the open concessions made since the shortfall began
+    void mark_recovered(double shortfall_since_mono_s, double now_mono_s) {
+        const double took = now_mono_s - shortfall_since_mono_s;
+        for (auto it = events_.rbegin(); it != events_.rend() && it->mono_s >= shortfall_since_mono_s - 1e-6; ++it) {
+            if (it->kind == "trim" && it->recovered_s < 0) {
+                it->recovered_s = std::max(0.0, took);
+                ++totals.recovered;
+                totals.recovered_sum_s += it->recovered_s;
+                totals.recovered_max_s = std::max(totals.recovered_max_s, it->recovered_s);
+            }
+        }
+    }
+
+    std::vector<vram_journal_event> since(uint64_t after_id, size_t limit) const {
+        std::vector<vram_journal_event> out;
+        for (const auto & e : events_) {
+            if (e.id > after_id) { out.push_back(e); }
+        }
+        if (limit > 0 && out.size() > limit) { out.erase(out.begin(), out.end() - limit); }
+        return out;
+    }
+
+    uint64_t last_id() const { return next_id_ - 1; }
+    size_t size() const { return events_.size(); }
+
+private:
+    std::deque<vram_journal_event> events_;
+    uint64_t next_id_ = 1;
+};
+
 class vram_governor_core {
 public:
     vram_policy policy;
     vram_state  state = vram_state::WARMUP;
     std::string last_reason;
+    vram_journal journal;
 
     // counters
     uint64_t trims = 0, chunks_dropped = 0, grows = 0, chunks_grown = 0, pauses = 0;
@@ -88,6 +168,8 @@ public:
         vram_action act;
         const int32_t cap = effective_max(g);
         const int32_t floor_chunks = std::min(policy.min_chunks, cap);
+        last_free_mib_ = in.free_mib;
+        last_chunk_mib_ = g.chunk_mib;
         track_below(in);
 
         if (state == vram_state::PAUSING || state == vram_state::PAUSED) {
@@ -155,6 +237,7 @@ public:
                 state = vram_state::PAUSING;
                 ++pauses;
                 last_reason = act.reason;
+                note_pause(act.reason, in.now_s, in.free_mib);
             }
             return act;
         }
@@ -193,8 +276,55 @@ public:
             ++grows;
             chunks_grown += uint64_t(after - before);
         }
+        if (after != before) {
+            vram_journal_event ev;
+            const bool yield = act.reason == "prefill_yield";
+            ev.kind = after < before ? (yield ? "prefill_yield" : "trim") : "grow";
+            ev.reason = act.reason;
+            ev.state = vram_state_name(state);
+            ev.chunks_before = before;
+            ev.chunks_after = after;
+            ev.mib = (after - before) * last_chunk_mib_;
+            ev.free_mib = last_free_mib_;
+            if (ev.kind == "trim") {
+                ++journal.totals.yields;
+                journal.totals.yielded_mib += uint64_t(before - after) * uint64_t(std::max(0, last_chunk_mib_));
+            }
+            journal.add(std::move(ev), now_s);
+        }
         if (act.chunks < before && act.reason != "prefill_yield") {
             calm_since_ = now_s; // a trim restarts the calm period (hysteresis against flapping)
+        }
+    }
+
+    // MEMV2: journal entries for things that are not cache resizes
+    void note_pause(const std::string & why, double now_s, int32_t free_mib) {
+        vram_journal_event ev;
+        ev.kind = "pause";
+        ev.reason = why;
+        ev.state = vram_state_name(state);
+        ev.free_mib = free_mib;
+        ++journal.totals.pauses;
+        journal.add(std::move(ev), now_s);
+    }
+
+    // a new policy was applied; `note` is the caller's reason (the gateway says what it saw on the desk)
+    void note_policy(const vram_policy & before, const vram_policy & after, const std::string & note, double now_s) {
+        vram_journal_event ev;
+        ev.state = vram_state_name(state);
+        ev.free_mib = last_free_mib_;
+        ev.note = note;
+        if (after.sleep_level != before.sleep_level) {
+            ev.kind = after.sleep_level > before.sleep_level ? "sleep" : "wake";
+            ev.reason = "sleep_l" + std::to_string(after.sleep_level);
+            if (after.sleep_level > before.sleep_level) { ++journal.totals.sleeps; }
+            journal.add(ev, now_s);
+        }
+        if (after.reserve_mib != before.reserve_mib || after.max_chunks != before.max_chunks || after.prefill_yield != before.prefill_yield ||
+                after.min_chunks != before.min_chunks) {
+            ev.kind = "policy";
+            ev.reason = "reserve=" + std::to_string(after.reserve_mib) + " max_chunks=" + std::to_string(after.max_chunks);
+            journal.add(ev, now_s);
         }
     }
 
@@ -213,8 +343,11 @@ private:
     bool    refill_now_ = false;
     bool    below_       = false;
     double  below_since_ = 0;
+    int32_t last_free_mib_  = 0;
+    int32_t last_chunk_mib_ = 0;
 
     int32_t effective_max(const vram_cache_geometry & g) const {
+        if (policy.sleep_level >= 1) { return 0; }
         const int32_t m = policy.max_chunks < 0 ? g.max_chunks : std::min(policy.max_chunks, g.max_chunks);
         return std::max(0, m);
     }
@@ -238,6 +371,9 @@ private:
             }
             below_reserve_max_s = std::max(below_reserve_max_s, in.now_s - below_since_);
         } else {
+            if (below_) {
+                journal.mark_recovered(below_since_, in.now_s);
+            }
             below_ = false;
         }
     }

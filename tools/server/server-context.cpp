@@ -6221,6 +6221,24 @@ void server_routes::init_routes() {
         res->ok(ctx_server.vram->policy_json());
         return res;
     };
+    this->get_vram_journal = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!ctx_server.vram) {
+            res->error(format_error_response("VRAM governor is not running", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        uint64_t since = 0;
+        size_t limit = 200;
+        try {
+            if (!req.get_param("since").empty()) { since = std::stoull(req.get_param("since")); }
+            if (!req.get_param("limit").empty()) { limit = std::min<size_t>(512, std::stoull(req.get_param("limit"))); }
+        } catch (const std::exception &) {
+            res->error(format_error_response("since and limit must be numbers", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok(ctx_server.vram->journal_json(since, limit));
+        return res;
+    };
     this->post_vram_policy = [this](const server_http_req & req) {
         auto res = create_response();
         if (!ctx_server.vram) {
