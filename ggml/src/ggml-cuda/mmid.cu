@@ -49,7 +49,7 @@ static __global__ void mm_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                nex_prev += expert_used >= 0 && expert_used < expert; // id -1 (skipped slot) occupies no compact position
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -75,7 +75,7 @@ static __global__ void mm_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            nex_prev += expert_used >= 0 && expert_used < expert; // id -1 (skipped slot) occupies no compact position
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -145,6 +145,35 @@ static void launch_mm_ids_helper(
     GGML_ASSERT(nbytes_shared <= smpbo);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
+}
+
+// Zero the dst rows of (token, slot) pairs whose expert id is -1 ("expert not owned by
+// this pack", hot/cold expert split). The matrix multiplication kernels skip these slots
+// entirely, so without this the corresponding dst rows would contain garbage. With zeros
+// the outputs of multiple expert packs can be merged additively.
+static __global__ void mm_ids_zero_skipped_rows(
+        const int32_t * __restrict__ ids, float * __restrict__ dst, const int64_t ne0,
+        const int n_tokens, const int si1, const int64_t s_slot, const int64_t s_token) {
+    const int iex = blockIdx.y;
+    for (int it = blockIdx.z; it < n_tokens; it += gridDim.z) {
+        if (ids[it*si1 + iex] >= 0) {
+            continue;
+        }
+        float * dst_row = dst + it*s_token + iex*s_slot;
+        for (int64_t i = blockIdx.x*int64_t(blockDim.x) + threadIdx.x; i < ne0; i += int64_t(gridDim.x)*blockDim.x) {
+            dst_row[i] = 0.0f;
+        }
+    }
+}
+
+void ggml_cuda_launch_mm_ids_zero_skipped_rows(
+        const int32_t * ids, float * dst, const int64_t ne0, const int n_tokens, const int n_expert_used,
+        const int si1, const int64_t s_slot, const int64_t s_token, cudaStream_t stream) {
+    constexpr int block_size = 256;
+    const int blocks_x = (ne0 + block_size - 1) / block_size;
+    const dim3 num_blocks(blocks_x, n_expert_used, n_tokens < 65535 ? n_tokens : 65535);
+    const dim3 block_dims(block_size, 1, 1);
+    mm_ids_zero_skipped_rows<<<num_blocks, block_dims, 0, stream>>>(ids, dst, ne0, n_tokens, si1, s_slot, s_token);
 }
 
 void ggml_cuda_launch_mm_ids_helper(

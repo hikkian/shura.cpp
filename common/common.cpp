@@ -1695,6 +1695,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
+    if (!params.moe_cache_profile.empty()) {
+        mparams.moe_cache_profile = params.moe_cache_profile.c_str();
+    }
+    mparams.moe_cache_slots = params.moe_cache_slots;
+
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {
@@ -1747,6 +1752,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
+    cparams.sched_async_cpu   = params.sched_async_cpu;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 

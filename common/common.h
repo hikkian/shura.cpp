@@ -586,9 +586,13 @@ struct common_params {
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
+    bool sched_async_cpu   = true;  // run CPU graph splits on a worker thread (overlaps independent GPU splits)
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
+
+    std::string moe_cache_profile = ""; // MoE expert cache routing profile CSV (empty = disabled)
+    int32_t     moe_cache_slots   = 0;  // MoE expert cache slots per layer (0 = disabled)
 
     bool single_turn       = false; // single turn chat conversation
 

@@ -311,6 +311,9 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TURBO2_0,
+    GGML_TYPE_TURBO3_0,
+    GGML_TYPE_TURBO4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2796,13 +2799,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-cache-profile"}, "FNAME",
+        "routing profile CSV (from llama-moe-trace) used to pick which experts to cache in GPU memory",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_profile = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PROFILE"));
+    add_opt(common_arg(
+        {"--moe-cache-slots"}, "N",
+        "number of routed experts per layer to keep resident in GPU memory (default: 0 = disabled)",
+        [](common_params & params, int value) {
+            params.moe_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_SLOTS"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
         [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
-            }
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
@@ -2971,6 +2985,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("whether to offload host tensor operations to device (default: %s)", params.no_op_offload ? "false" : "true"),
         [](common_params & params, bool value) {
             params.no_op_offload = !value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--sched-async-cpu"},
+        {"--no-sched-async-cpu"},
+        string_format("whether to run CPU graph splits on a worker thread so independent GPU splits overlap them (default: %s)", params.sched_async_cpu ? "true" : "false"),
+        [](common_params & params, bool value) {
+            params.sched_async_cpu = value;
         }
     ));
     add_opt(common_arg(

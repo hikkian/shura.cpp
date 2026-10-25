@@ -211,6 +211,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.sched_async_cpu         = params.sched_async_cpu;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -724,6 +725,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
+    ggml_backend_sched_set_async_cpu(sched.get(), cparams.sched_async_cpu);
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
@@ -4026,6 +4028,7 @@ llama_context_params llama_context_default_params() {
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
+        /*.sched_async_cpu             =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,

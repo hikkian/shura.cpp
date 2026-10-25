@@ -2164,7 +2164,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         const llama_layer * moe_cache) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2187,7 +2188,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in,
         post_exp_norm,
-        post_exp_norm_eps
+        post_exp_norm_eps,
+        moe_cache
     );
 }
 
@@ -2217,7 +2219,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         const llama_layer * moe_cache) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2314,6 +2317,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // MoE expert cache: split routed ids into hot-pack ids and cold ids.
+    // scope: plain fused-SILU gated FFN (no clamp, no expert biases/scales,
+    // no pre-FFN weighting) — the dual chains below reproduce exactly that
+    ggml_tensor * ids_hot  = nullptr;
+    ggml_tensor * ids_cold = nullptr;
+    const bool use_moe_packs = moe_cache && moe_cache->moe_map_hot && !gate_up_exps &&
+        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        type_op == LLM_FFN_SILU && gate_exps && !up_exps_b && !gate_exps_b && !weight_before_ffn &&
+        (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f);
+    if (use_moe_packs) {
+        ggml_tensor * ids_flat = ggml_cont_1d(ctx0, selected_experts, n_expert_used*n_tokens); // topk ids are a strided view
+        ids_hot  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_hot,  ids_flat), n_expert_used, n_tokens);
+        ids_cold = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_cold, ids_flat), n_expert_used, n_tokens);
+        cb(ids_hot,  "ffn_moe_ids_hot",  il);
+        cb(ids_cold, "ffn_moe_ids_cold", il);
+    }
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -2377,7 +2397,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    if (gate_up_exps) {
+    if (use_moe_packs) {
+        // MoE expert cache: one complete FFN chain per residency side. Each
+        // chain is unbroken so the scheduler never splices CPU ops between GPU
+        // ops (that migrates the hot pack weights to CPU every layer). Skipped
+        // (-1) rows are zero and swiglu(0,0) = 0, so the two chain outputs are
+        // disjoint and one add reconstructs the exact single-tensor result.
+        auto build_pack_chain = [&](ggml_tensor * w_gate, ggml_tensor * w_up, ggml_tensor * w_down, ggml_tensor * ids) {
+            ggml_tensor * gate = ggml_mul_mat_id(ctx0, w_gate, cur, ids);
+            gate->op_params[0] = 1; // ids may contain -1
+            ggml_tensor * up_p = ggml_mul_mat_id(ctx0, w_up, cur, ids);
+            up_p->op_params[0] = 1;
+            ggml_tensor * act = ggml_swiglu_split(ctx0, gate, up_p);
+            ggml_tensor * down = ggml_mul_mat_id(ctx0, w_down, act, ids);
+            down->op_params[0] = 1;
+            return down;
+        };
+
+        // cold chain is built first so its nodes precede the hot chain in the
+        // graph: the scheduler then emits [cold split, hot split] and, with
+        // async CPU splits, computes the cold chain on a worker while the
+        // hot chain (which has no CPU inputs) runs concurrently on the GPU.
+        // pinning the merge to CPU keeps it out of the hot split so the hot
+        // split stays free of cross-backend inputs.
+        ggml_tensor * cold = build_pack_chain(gate_exps, up_exps, down_exps, ids_cold);
+        cb(cold, "ffn_moe_down_cold", il);
+
+        ggml_tensor * hot = build_pack_chain(moe_cache->ffn_gate_exps_hot, moe_cache->ffn_up_exps_hot, moe_cache->ffn_down_exps_hot, ids_hot);
+        cb(hot, "ffn_moe_down_hot", il);
+
+        experts = ggml_add(ctx0, cold, hot);
+        cb(experts, "ffn_moe_down", il);
+        // decode-size batches only: for large (prefill) batches the CPU merge
+        // and its per-layer activation copies cost more than the overlap hides
+        if (cparams.sched_async_cpu && n_tokens <= 8) {
+            ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
+        }
+    } else if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
@@ -2447,70 +2503,67 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                             cb(gate_act, "ffn_moe_silu_clamped", il);
                             cur = ggml_mul(ctx0, gate_act, up);
                         }
-                        cb(cur, "ffn_moe_swiglu_limited", il);
-                        break;
                     }
                 }
-            }
 
-            if (has_gate) {
-                cur = ggml_swiglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_swiglu", il);
-            } else {
-                cur = ggml_silu(ctx0, cur);
-                cb(cur, "ffn_moe_silu", il);
-            } break;
-        case LLM_FFN_SITU:
-            {
-                // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
-                GGML_ASSERT(has_gate);
-                const float beta = hparams.situ_beta;
-                const float lb   = hparams.situ_linear_beta;
+                if (has_gate) {
+                    cur = ggml_swiglu_split(ctx0, cur, up);
+                    cb(cur, "ffn_moe_swiglu", il);
+                } else {
+                    cur = ggml_silu(ctx0, cur);
+                    cb(cur, "ffn_moe_silu", il);
+                } break;
+            case LLM_FFN_SITU:
+                {
+                    // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
+                    GGML_ASSERT(has_gate);
+                    const float beta = hparams.situ_beta;
+                    const float lb   = hparams.situ_linear_beta;
 
-                ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                if (lb > 0.0f) {
-                    up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
-                }
-                cur = ggml_mul(ctx0, act, up);
-                cb(cur, "ffn_moe_situ", il);
-            } break;
-        case LLM_FFN_GELU:
-            if (has_gate) {
-                cur = ggml_geglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_geglu", il);
-            } else {
-                cur = ggml_gelu(ctx0, cur);
-                cb(cur, "ffn_moe_gelu", il);
-            } break;
-        case LLM_FFN_SWIGLU_OAI_MOE:
-            {
-                // TODO: move to hparams?
-                constexpr float alpha = 1.702f;
-                constexpr float limit = 7.0f;
-                cur = ggml_swiglu_oai(ctx0, cur, up, alpha, limit);
-                cb(cur, "ffn_moe_swiglu_oai", il);
-            } break;
-        case LLM_FFN_RELU:
-            if (has_gate) {
-                cur = ggml_reglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_reglu", il);
-            } else {
-                cur = ggml_relu(ctx0, cur);
-                cb(cur, "ffn_moe_relu", il);
-            } break;
-        case LLM_FFN_RELU_SQR:
-            if (has_gate) {
-                // TODO: add support for gated squared relu
-                GGML_ABORT("fatal error: gated squared relu not implemented");
-            } else {
-                cur = ggml_relu(ctx0, cur);
-                cur = ggml_sqr(ctx0, cur);
-                cb(cur, "ffn_moe_relu_sqr", il);
-            } break;
-        default:
-            GGML_ABORT("fatal error");
-    }
+                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
+                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
+                    if (lb > 0.0f) {
+                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
+                    }
+                    cur = ggml_mul(ctx0, act, up);
+                    cb(cur, "ffn_moe_situ", il);
+                } break;
+            case LLM_FFN_GELU:
+                if (has_gate) {
+                    cur = ggml_geglu_split(ctx0, cur, up);
+                    cb(cur, "ffn_moe_geglu", il);
+                } else {
+                    cur = ggml_gelu(ctx0, cur);
+                    cb(cur, "ffn_moe_gelu", il);
+                } break;
+            case LLM_FFN_SWIGLU_OAI_MOE:
+                {
+                    // TODO: move to hparams?
+                    constexpr float alpha = 1.702f;
+                    constexpr float limit = 7.0f;
+                    cur = ggml_swiglu_oai(ctx0, cur, up, alpha, limit);
+                    cb(cur, "ffn_moe_swiglu_oai", il);
+                } break;
+            case LLM_FFN_RELU:
+                if (has_gate) {
+                    cur = ggml_reglu_split(ctx0, cur, up);
+                    cb(cur, "ffn_moe_reglu", il);
+                } else {
+                    cur = ggml_relu(ctx0, cur);
+                    cb(cur, "ffn_moe_relu", il);
+                } break;
+            case LLM_FFN_RELU_SQR:
+                if (has_gate) {
+                    // TODO: add support for gated squared relu
+                    GGML_ABORT("fatal error: gated squared relu not implemented");
+                } else {
+                    cur = ggml_relu(ctx0, cur);
+                    cur = ggml_sqr(ctx0, cur);
+                    cb(cur, "ffn_moe_relu_sqr", il);
+                } break;
+            default:
+                GGML_ABORT("fatal error");
+        }
 
     {
         // TODO: this graph-level rescaling should only be applied when the corresponding backend does not support
@@ -2533,8 +2586,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    if (down_exps_s) {
-        cb(experts, "ffn_moe_down_scaled", il);
+        if (down_exps_s) {
+            cb(experts, "ffn_moe_down_scaled", il);
+        }
     }
 
     if (down_exps_b) {
@@ -3007,6 +3061,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
+        // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
+        // Group size must come from K (which determines the WHT rotation), not V.
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+            const ggml_tensor * group_src = k_is_turbo ? k : v;
+            const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+            if (cur->ne[0] % turbo_group == 0) {
+                if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+                cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group, nullptr);  // 1 = inverse
+            }
+        }
+
         if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
@@ -3072,6 +3138,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
+
+        // TurboQuant: inverse WHT on attention output (non-FA path)
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+            const ggml_tensor * group_src = k_is_turbo ? k : v;
+            const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+            if (kqv->ne[0] % turbo_group == 0) {
+                if (!ggml_is_contiguous(kqv)) { kqv = ggml_cont(ctx0, kqv); }
+                kqv = ggml_turbo_wht(ctx0, kqv, 1, turbo_group, nullptr);
+            }
+        }
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
@@ -3165,6 +3242,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (kq_b) {
         kq_b = ggml_pad(ctx0, kq_b, n_kv_pad, 0, 0, 0);
+    }
+
+    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation matching the K rotation
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);  // 0 = forward, 0 = auto group size
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
@@ -3275,6 +3358,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
+    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation matching the K rotation
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);  // 0 = forward, 0 = auto group size
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -3365,6 +3454,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation matching the K rotation
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);  // 0 = forward, 0 = auto group size
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -3478,6 +3573,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
+    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation matching the K rotation
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);  // 0 = forward, 0 = auto group size
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -3564,6 +3665,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+
+    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation matching the K rotation
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);  // 0 = forward, 0 = auto group size
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -3694,6 +3801,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
+
+    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation matching the K rotation
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);  // 0 = forward, 0 = auto group size
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);

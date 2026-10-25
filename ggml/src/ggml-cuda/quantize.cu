@@ -138,6 +138,9 @@ static __global__ void quantize_mmq_nvfp4(
         const int64_t i2  = blockIdx.y % ne2;
         const int64_t i3  = blockIdx.y / ne2;
         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        if (i01 < 0) {
+            return; // compact slot unused (hot/cold expert split)
+        }
         base_idx = i3 * s03 + i2 * s02 + i01 * s01;
     }
     const float * __restrict__  x_row = x + base_idx;
@@ -182,6 +185,9 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
                 for (int slot = 0; slot < n_expert_used; ++slot) {
                     const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+                    if (i < 0) {
+                        continue; // slot skipped (hot/cold expert split)
+                    }
                     scale[i] = warp_amax[0];
                 }
             } else {
@@ -308,6 +314,9 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
             for (int slot = 0; slot < n_expert_used; ++slot) {
                 const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+                if (i < 0) {
+                    continue; // slot skipped (hot/cold expert split)
+                }
                 block_fp4_mmq * yb = y + (k_block * ne1 + i);
                 uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
                 yqs[2 * sub + 0] = q0;
@@ -375,6 +384,9 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
         const int64_t i2  = blockIdx.z % ne2;
         const int64_t i3  = blockIdx.z / ne2;
         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        if (i01 < 0) {
+            return; // compact slot unused (hot/cold expert split)
+        }
         base_pos = i3 * s03 + i2 * s02 + i01 * s01;
     }
 
@@ -427,6 +439,9 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 #pragma unroll
         for (int slot = 0; slot < n_expert_used; ++slot) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) {
+                continue; // slot skipped (hot/cold expert split)
+            }
             block_fp4_mmq * yb = y + (k_block * ne1 + i);
             char2 * yqs2 = (char2 *) yb->qs;
             if (lane_in_group == 0) {
@@ -478,6 +493,9 @@ static __global__ void quantize_mmq_q8_1(
         const int64_t i2  = blockIdx.z % ne2;
         const int64_t i3  = blockIdx.z / ne2;
         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        if (i01 < 0) {
+            return; // compact slot unused (hot/cold expert split)
+        }
         base_idx = i3*s03 + i2*s02 + i01*s01;
     }
 
@@ -526,6 +544,9 @@ static __global__ void quantize_mmq_q8_1(
         int64_t ib;
         if constexpr (scatter) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) {
+                continue; // slot skipped (hot/cold expert split)
+            }
             ib = k_block*ne1 + i;
         } else {
             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel

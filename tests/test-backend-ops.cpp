@@ -5693,6 +5693,11 @@ struct test_mul_mat_id : public test_case {
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
+        if (skip) {
+            // announce that ids may contain -1 so backends route around
+            // kernels without skip support (mirrors llama's pack nodes)
+            out->op_params[0] = 1;
+        }
 
         return out;
     }
@@ -11082,6 +11087,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
+    // hot/cold expert-pack split: ids may be -1 ("expert not owned by this pack") and the
+    // op must emit zero rows for those slots — cover mmvq (n=1), mmq (n=64), mmf (f16) and
+    // the general fallback across quantized/float types
+    for (ggml_type ta : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 16, 8, false, 256, 1, 256, 0, false, /*skip=*/true));
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 16, 8, false, 256, 4, 256, 0, false, /*skip=*/true));
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 16, 8, false, 256, 64, 256, 0, false, /*skip=*/true));
+    }
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

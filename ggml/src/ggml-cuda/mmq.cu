@@ -291,11 +291,22 @@ void ggml_cuda_mul_mat_q(
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+        // sentinel-fill: compact slots belonging to skipped ids (-1, hot/cold expert
+        // split) are never written by mm_ids_helper; quantize kernels skip on i < 0
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
+        // ids_dst tail likewise: unwritten compact slots must hold a safe row index,
+        // not pool garbage — tile-padded reads in the mm kernel touch them
+        CUDA_CHECK(cudaMemsetAsync(ids_dst.get(), 0, ne_get_rows*sizeof(int32_t), stream));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        CUDA_CHECK(cudaGetLastError());
+
+        // slots with expert id -1 (hot/cold expert split) are never scattered to; zero their dst rows
+        ggml_cuda_launch_mm_ids_zero_skipped_rows((const int32_t *) ids->data, (float *) dst->data,
+            dst->ne[0], ne12, n_expert_used, si1, dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
