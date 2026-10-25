@@ -1,3 +1,5 @@
+#include "../src/llama-moe-cache-two-channel-policy.h"
+#include <random>
 // This file defines tests for various GGML ops and backends.
 // For the forward pass it asserts that the results of multiple backends computing the same GGML ops are consistent.
 // For the backward pass it asserts that the gradients from backpropagation are consistent
@@ -11201,6 +11203,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 16, 8, false, 256, 64, 256, 0, false, /*skip=*/true));
     }
 
+    // Cache banks include four transient slots; cover decode and MTP verification shapes.
+    for (ggml_type type : {GGML_TYPE_Q3_K, GGML_TYPE_IQ3_XXS}) {
+        for (int capacity : {14, 24}) {
+            for (int tokens : {1, 2, 3, 4, 8}) {
+                for (bool empty : {false, true}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, capacity, 8, true, 512, tokens, 2048, true, empty));
+                    test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, capacity, 8, false, 2048, tokens, 512, true, empty));
+                }
+            }
+        }
+    }
+
     // PREFILLPROF4: MMQ minimal cases without -1 (control for the concentrated-routing hang check)
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 8, false, 256, 4, 256, false));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 8, false, 256, 64, 256, false));
@@ -13657,7 +13671,87 @@ static void usage(char ** argv) {
     printf("  %s perf -o 'MUL_MAT.*'\n", argv[0]);
 }
 
+static bool test_moe_channel_policy() {
+    for (uint64_t seed = 0; seed < 256; ++seed) {
+        std::mt19937_64 rng(seed);
+        const int experts = 1 + rng() % 256;
+        std::vector<int32_t> ranking(experts);
+        std::iota(ranking.begin(), ranking.end(), 0);
+        std::shuffle(ranking.begin(), ranking.end(), rng);
+        llama_moe_channel_policy policy;
+        const int initial_slots = seed % 3 == 0 ? 0 : seed % 3 == 1 ? experts : rng() % (experts + 1);
+        if (!policy.initialize(experts, initial_slots, seed % 11 == 0 ? std::vector<int32_t>{} : ranking)) return false;
+        std::vector<int32_t> weights(policy.capacity(), -1);
+        for (size_t slot = 0; slot < policy.slots().size(); ++slot) weights[slot] = policy.slots()[slot];
+        for (int step = 0; step < 128; ++step) {
+            auto check = [&](bool ok, const char * property) {
+                if (!ok) fprintf(stderr, "channel-policy seed=%llu step=%d E=%d: %s\n",
+                        (unsigned long long) seed, step, experts, property);
+                return ok;
+            };
+            if (step > 0 && step % 13 == 0) {
+                const int slots = step % 26 == 0 ? 0 : rng() % (experts + 1);
+                auto order = policy.preview_resize(slots);
+                if (!check(int(order.size()) == slots && policy.commit_resize(order), "resize")) return false;
+                weights.assign(policy.capacity(), -1);
+                for (size_t slot = 0; slot < order.size(); ++slot) weights[slot] = order[slot];
+            }
+            const int tokens = 1 + rng() % 8;
+            const int used = 1 + rng() % std::min(8, experts);
+            std::vector<int32_t> ids;
+            std::vector<uint8_t> was_cached(experts, 0);
+            for (int32_t expert : policy.slots()) if (expert >= 0) was_cached[expert] = 1;
+            for (int token = 0; token < tokens; ++token) {
+                std::shuffle(ranking.begin(), ranking.end(), rng);
+                for (int k = 0; k < used; ++k) {
+                    ids.push_back(step % 17 == 0 ? seed % experts : ranking[k]);
+                }
+            }
+            if (!check(policy.make_plan(ids, tokens, used), "valid plan")) return false;
+            const auto & plan = policy.latest();
+            std::vector<uint8_t> used_slots(weights.size(), 0), copied(experts, 0);
+            for (const auto & entry : plan.uploads) {
+                if (!check(entry.expert >= 0 && entry.expert < experts && entry.slot >= 0 &&
+                        entry.slot < int(weights.size()), "upload bounds")) return false;
+                if (!check(!used_slots[entry.slot] && !copied[entry.expert], "single upload per slot/expert")) return false;
+                used_slots[entry.slot] = copied[entry.expert] = 1;
+                weights[entry.slot] = entry.expert;
+            }
+            int cpu = 0, hits = 0, uploaded = 0;
+            for (int32_t expert : ids) {
+                const int slot = plan.slot_map[expert];
+                if (slot < 0) {
+                    ++cpu;
+                    if (!check(!was_cached[expert], "active hit cannot be evicted")) return false;
+                } else {
+                    if (!check(slot < int(weights.size()) && weights[slot] == expert, "GPU slot owns selected expert")) return false;
+                    if (was_cached[expert]) ++hits;
+                    else {
+                        ++uploaded;
+                        if (!check(copied[expert], "a miss must be copied before GPU use")) return false;
+                    }
+                }
+            }
+            if (!check(plan.cpu == cpu && plan.hits == hits && plan.uploaded == uploaded &&
+                    cpu + hits + uploaded == int(ids.size()), "disjoint exhaustive partition")) return false;
+            for (size_t slot = 0; slot < policy.slots().size(); ++slot) {
+                if (policy.slots()[slot] >= 0 && !check(weights[slot] == policy.slots()[slot], "persistent weights")) return false;
+            }
+            if (policy.slots().empty() && !check(plan.uploads.empty() && cpu == int(ids.size()), "zero cache")) return false;
+            policy.observe(15.0 + plan.cpu_unique * (10 + rng() % 200),
+                           25.0 + plan.uploads.size() * (15 + rng() % 100));
+            const auto saved_slots = policy.slots();
+            if (!check(!policy.make_plan(ids, 0, used) && policy.slots() == saved_slots, "invalid shape is transactional")) return false;
+        }
+    }
+    fprintf(stdout, "channel-policy: 32768 generated route/resize sequences OK (CPU only)\n");
+    return true;
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--moe-channel-policy-test") == 0) {
+        return test_moe_channel_policy() ? 0 : 1;
+    }
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;

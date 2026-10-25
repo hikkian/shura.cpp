@@ -2415,7 +2415,7 @@ private:
         res->generation_params = slot.task->params; // copy the parameters
 
         llama_moe_cache_stats moe_cache_stats = {};
-        if (params_base.moe_cache_policy == "hybrid" &&
+        if ((params_base.moe_cache_policy == "hybrid" || params_base.moe_cache_policy == "two-channel") &&
                 llama_model_get_moe_cache_stats(llama_get_model(ctx_tgt), &moe_cache_stats)) {
             const uint64_t routes = moe_cache_stats.hits + moe_cache_stats.misses;
             const double hit_rate = routes > 0 ? double(moe_cache_stats.hits) / double(routes) : 0.0;
@@ -2424,7 +2424,11 @@ private:
             const double copied_bytes_per_token = moe_cache_stats.tokens > 0
                     ? double(moe_cache_stats.copied_bytes) / double(moe_cache_stats.tokens) : 0.0;
             res->moe_cache_stats = json {
-                {"policy", "hybrid"},
+                {"policy", params_base.moe_cache_policy},
+                {"uploaded", moe_cache_stats.uploaded},
+                {"cpu", moe_cache_stats.cpu},
+                {"cpu_channel_us", moe_cache_stats.cpu_channel_us},
+                {"gpu_channel_us", moe_cache_stats.gpu_channel_us},
                 {"tokens", moe_cache_stats.tokens},
                 {"hits", moe_cache_stats.hits},
                 {"misses", moe_cache_stats.misses},
@@ -2435,7 +2439,8 @@ private:
                 {"copied_bytes", moe_cache_stats.copied_bytes},
                 {"copied_bytes_per_token", copied_bytes_per_token},
             };
-            LOG_INF("hybrid moe cache: hits=%llu misses=%llu insertions=%llu copies=%llu copies/token=%.3f copied_bytes/token=%.1f\n",
+            LOG_INF("%s moe cache: hits=%llu misses=%llu insertions=%llu copies=%llu copies/token=%.3f copied_bytes/token=%.1f\n",
+                    params_base.moe_cache_policy.c_str(),
                     (unsigned long long) moe_cache_stats.hits,
                     (unsigned long long) moe_cache_stats.misses,
                     (unsigned long long) moe_cache_stats.insertions,

@@ -1608,6 +1608,22 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
 
+    const char * trace = getenv("GGML_MOE_CACHE_TRACE");
+    const char * prefix = "ffn_moe_down_cold-";
+    if (params->ith == 0 && trace && trace[0] == '1' && strncmp(dst->name, prefix, strlen(prefix)) == 0) {
+        int64_t cpu = 0;
+        int64_t hits = 0;
+        for (int64_t token = 0; token < ids->ne[1]; ++token) {
+            for (int64_t slot = 0; slot < ids->ne[0]; ++slot) {
+                const int32_t id = *(const int32_t *) ((const char *) ids->data + token*ids->nb[1] + slot*ids->nb[0]);
+                if (id < 0) ++hits;
+                else ++cpu;
+            }
+        }
+        fprintf(stderr, "moe_cache_layer layer=%s hits=%lld uploaded=0 cpu=%lld tokens=%lld\n",
+                dst->name + strlen(prefix), (long long) hits, (long long) cpu, (long long) ids->ne[1]);
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;

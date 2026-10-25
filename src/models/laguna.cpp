@@ -291,7 +291,7 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
                     il,
                     nullptr, nullptr,
                     nullptr, nullptr, nullptr,
-                    nullptr, &model.layers[il]);
+                    nullptr, nullptr, 1e-5f, &model.layers[il]);
             cb(moe_out, "ffn_moe_out", il);
 
             // Always-on shared expert, summed in parallel.

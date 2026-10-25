@@ -357,11 +357,12 @@ struct llama_layer {
     // MoE expert cache (hot/cold split): GPU-resident packs of the S most
     // frequently routed experts of a CPU-offloaded layer + id remap tables.
     // Cold side reuses the original ffn_*_exps tensors with hot ids masked to -1.
-    struct ggml_tensor * ffn_gate_exps_hot = nullptr;
+    struct ggml_tensor * ffn_gate_exps_hot = nullptr; // gate_up pack when the source is merged
     struct ggml_tensor * ffn_down_exps_hot = nullptr;
     struct ggml_tensor * ffn_up_exps_hot   = nullptr;
     struct ggml_tensor * moe_map_hot       = nullptr; // i32[n_expert]: pack slot or -1
     struct ggml_tensor * moe_map_cold      = nullptr; // i32[n_expert]: global id or -1
+    bool moe_cache_two_channel = false;
     bool moe_cache_hybrid = false; // capture routed ids for the opt-in bounded LRU tail
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
@@ -997,6 +998,10 @@ struct llama_model_base : public llama_model {
     bool resize_moe_expert_cache(int32_t n_slots, int32_t & old_slots,
             int32_t & new_slots, size_t & released_bytes, size_t & allocated_bytes);
     bool moe_expert_cache_requires_serialization() const;
+    bool moe_expert_cache_two_channel_enabled() const;
+    bool moe_expert_cache_split(ggml_backend_sched_t sched, ggml_backend_t backend,
+            ggml_cgraph * graph, bool before, int64_t elapsed_us);
+    bool finish_moe_expert_cache_channels(bool success);
     uint64_t moe_expert_cache_generation() const;
     std::mutex & moe_expert_cache_mutex() const;
     bool update_moe_expert_cache_locked(ggml_backend_sched_t sched, const llm_graph_result & graph);

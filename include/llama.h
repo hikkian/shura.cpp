@@ -312,7 +312,7 @@ extern "C" {
         };
     };
 
-    // Runtime counters for the opt-in hybrid expert-cache policy. The default
+    // Runtime counters for the opt-in hybrid and two-channel expert-cache policies. The default
     // static policy reports enabled=false and leaves existing responses unchanged.
     struct llama_moe_cache_stats {
         bool enabled;
@@ -322,6 +322,10 @@ extern "C" {
         uint64_t insertions;
         uint64_t copies;
         uint64_t copied_bytes;
+        uint64_t uploaded;
+        uint64_t cpu;
+        uint64_t cpu_channel_us;
+        uint64_t gpu_channel_us;
     };
 
     struct llama_model_tensor_buft_override {
@@ -363,6 +367,7 @@ extern "C" {
         const char * moe_cache_profile; // routing profile CSV from llama-moe-trace (NULL = disabled)
         int32_t      moe_cache_slots;   // experts cached per layer (0 = disabled)
         bool         moe_cache_live_resize; // allow the local server to resize the expert cache
+        bool         moe_cache_pinned_source; // opt-in GPU host buffers for CPU experts (qwen35moe)
         const char * moe_cache_policy; // static (default) or opt-in hybrid pinned + LRU tail
         int32_t      moe_cache_pinned_percent; // percent of cache slots pinned to profile ranking
         int32_t      moe_cache_inserts_per_layer_token; // hybrid LRU insertion cap

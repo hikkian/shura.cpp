@@ -1338,9 +1338,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        // avoid using a host buffer when using mmap
+        const bool expert_weight = tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
+                                   tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS ||
+                                   tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
+                                   tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS;
+        const bool pinned_source = moe_cache_pinned_buft && expert_weight &&
+                                   tn.suffix && strcmp(tn.suffix, "weight") == 0 &&
+                                   ggml_backend_buft_is_host(buft);
+        if (pinned_source) {
+            buft = moe_cache_pinned_buft;
+        }
+
+        // Pinned expert sources must remain real allocations, not mmap views.
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if (use_mmap && !pinned_source && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");

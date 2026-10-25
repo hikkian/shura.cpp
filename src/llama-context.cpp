@@ -1605,10 +1605,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const bool channel_cache = model_base && model_base->moe_expert_cache_two_channel_enabled();
+    ggml_backend_sched_set_split_callback(sched.get(), channel_cache ?
+            +[](ggml_backend_sched_t scheduler, ggml_backend_t backend, ggml_cgraph * graph,
+                bool before, int64_t elapsed_us, void * data) {
+                return static_cast<llama_model_base *>(data)->moe_expert_cache_split(
+                        scheduler, backend, graph, before, elapsed_us);
+            } : nullptr, model_base);
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         if (moe_cache_lock.owns_lock()) {
             ggml_backend_sched_synchronize(sched.get());
+            if (channel_cache) model_base->finish_moe_expert_cache_channels(false);
         }
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1618,6 +1626,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (moe_cache_lock.owns_lock()) {
         // Do not release the cache lock while any graph might still read pack tensors.
         ggml_backend_sched_synchronize(sched.get());
+    }
+    if (channel_cache && !model_base->finish_moe_expert_cache_channels(true)) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
     }
     if (moe_cache_lock.owns_lock() && !res->moe_cache_routes.empty()) {
         if (model_base != nullptr) {

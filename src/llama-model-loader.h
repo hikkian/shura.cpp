@@ -81,6 +81,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    ggml_backend_buffer_type_t moe_cache_pinned_buft = nullptr;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand

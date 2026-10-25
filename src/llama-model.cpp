@@ -1,5 +1,6 @@
 #include "llama-model.h"
 #include "llama-moe-cache-policy.h"
+#include "llama-moe-cache-two-channel-policy.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1260,6 +1261,21 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     return buft_list;
 }
 
+struct llama_moe_channel_runtime {
+    llama_moe_channel_policy policy;
+    ggml_backend_event_ptr begin;
+    ggml_backend_event_ptr end;
+    std::vector<int32_t> ids;
+    bool active = false;
+    bool gpu_ended = false;
+    bool cpu_ready = false;
+    int64_t start_us = 0;
+    double cpu_us = 0;
+    double cpu_compute_us = 0;
+    double observed_cpu_us = 0;
+    double observed_gpu_us = 0;
+};
+
 struct llama_model::impl {
     impl() = default;
     ~impl() = default;
@@ -1286,6 +1302,10 @@ struct llama_model::impl {
     int32_t moe_cache_slots = 0;
     uint64_t moe_cache_generation = 0;
     bool moe_cache_hybrid = false;
+    bool moe_cache_two_channel = false;
+    std::map<int, llama_moe_channel_runtime> moe_channels;
+    ggml_backend_event_t (*moe_event_new_timed)(ggml_backend_dev_t) = nullptr;
+    bool (*moe_event_elapsed)(ggml_backend_event_t, ggml_backend_event_t, float *) = nullptr;
     int32_t moe_cache_pinned_percent = 50;
     int32_t moe_cache_inserts_per_layer_token = 1;
     std::map<int, llama_moe_cache_hybrid_policy> moe_cache_hybrid_layers;
@@ -1646,6 +1666,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, load_mode_name);
+
+    if (params.moe_cache_pinned_source) {
+        if ((arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_GEMMA4) || devices.size() != 1 || devices.front().is_meta || params.no_host) {
+            throw std::runtime_error("pinned expert sources require qwen35moe or gemma4, one GPU, and host buffers");
+        }
+        ml.moe_cache_pinned_buft = ggml_backend_dev_host_buffer_type(devices.front().dev);
+        if (!ml.moe_cache_pinned_buft) {
+            throw std::runtime_error("the GPU backend has no pinned host buffer type");
+        }
+        LLAMA_LOG_INFO("%s: CPU expert source buffer: %s (pinned, opt-in)\n",
+                __func__, ggml_backend_buft_name(ml.moe_cache_pinned_buft));
+    }
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
@@ -2013,6 +2045,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         buf_ptrs.reserve(bufs.size());
 
         for (auto & buf : bufs) {
+            if (!ml.no_alloc && ml.moe_cache_pinned_buft == buft && ggml_backend_buffer_get_type(buf.get()) != buft) {
+                throw std::runtime_error("pinned expert allocation fell back to pageable memory");
+            }
             // indicate that this buffer contains weights
             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -2411,13 +2446,22 @@ void llama_model_base::load_tensors_hadamard() {
             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
 }
 
+static ggml_tensor * moe_cache_gate(const llama_layer & layer) {
+    return layer.ffn_gate_up_exps ? layer.ffn_gate_up_exps : layer.ffn_gate_exps;
+}
+
 void llama_model_base::init_moe_expert_cache() {
     // flags take precedence; env vars kept as a fallback
     const char * profile_path = params.moe_cache_profile;
     int n_slots = params.moe_cache_slots;
     const char * cache_policy = params.moe_cache_policy ? params.moe_cache_policy : "static";
     const bool hybrid = strcmp(cache_policy, "hybrid") == 0;
-    if (strcmp(cache_policy, "static") != 0 && !hybrid) {
+    const bool two_channel = strcmp(cache_policy, "two-channel") == 0;
+    if (two_channel && ((arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_GEMMA4) || devices.size() != 1 || devices.front().is_meta ||
+            hparams.n_expert_used() > 8)) {
+        throw std::runtime_error("two-channel expert cache requires qwen35moe or gemma4 and one GPU");
+    }
+    if (strcmp(cache_policy, "static") != 0 && !hybrid && !two_channel) {
         LLAMA_LOG_WARN("%s: unknown expert cache policy '%s'; cache disabled\n", __func__, cache_policy);
         return;
     }
@@ -2427,10 +2471,11 @@ void llama_model_base::init_moe_expert_cache() {
         return;
     }
     pimpl->moe_cache_hybrid = hybrid;
+    pimpl->moe_cache_two_channel = two_channel;
     pimpl->moe_cache_pinned_percent = params.moe_cache_pinned_percent;
     pimpl->moe_cache_inserts_per_layer_token = params.moe_cache_inserts_per_layer_token;
     pimpl->moe_cache_stats = {};
-    pimpl->moe_cache_stats.enabled = hybrid;
+    pimpl->moe_cache_stats.enabled = hybrid || two_channel;
     if (profile_path == nullptr || profile_path[0] == '\0') {
         profile_path = getenv("GGML_MOE_CACHE_PROFILE");
     }
@@ -2496,13 +2541,23 @@ void llama_model_base::init_moe_expert_cache() {
         return;
     }
     ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    if (two_channel) {
+        auto reg = ggml_backend_dev_backend_reg(dev);
+        pimpl->moe_event_new_timed = (ggml_backend_event_t (*)(ggml_backend_dev_t))
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_event_new_timed");
+        pimpl->moe_event_elapsed = (bool (*)(ggml_backend_event_t, ggml_backend_event_t, float *))
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_event_elapsed");
+        if (!pimpl->moe_event_new_timed || !pimpl->moe_event_elapsed) {
+            throw std::runtime_error("two-channel expert cache requires nonblocking GPU timing events");
+        }
+    }
 
     // candidate layers: routed experts resident in host memory
     std::vector<int> pack_layers;
     for (int il = 0; il < (int) layers.size(); il++) {
         const auto & l = layers[il];
-        if (l.ffn_gate_exps && l.ffn_up_exps && l.ffn_down_exps && freq.count(il) &&
-            l.ffn_gate_exps->buffer && ggml_backend_buft_is_host(ggml_backend_buffer_get_type(l.ffn_gate_exps->buffer))) {
+        if (moe_cache_gate(l) && (l.ffn_gate_up_exps || l.ffn_up_exps) && l.ffn_down_exps && freq.count(il) &&
+            moe_cache_gate(l)->buffer && ggml_backend_buft_is_host(ggml_backend_buffer_get_type(moe_cache_gate(l)->buffer))) {
             pack_layers.push_back(il);
         }
     }
@@ -2513,11 +2568,11 @@ void llama_model_base::init_moe_expert_cache() {
     }
 
     if (n_slots == 0) {
-        if (params.moe_cache_live_resize || hybrid) {
+        if (params.moe_cache_live_resize || hybrid || two_channel) {
             for (int il : pack_layers) {
                 std::vector<std::pair<int64_t, int32_t>> ranked;
                 for (const auto & [expert, count] : freq[il]) {
-                    if (expert < layers[il].ffn_gate_exps->ne[2]) {
+                    if (expert < moe_cache_gate(layers[il])->ne[2]) {
                         ranked.push_back({-count, expert});
                     }
                 }
@@ -2553,18 +2608,19 @@ void llama_model_base::init_moe_expert_cache() {
 
     for (int il : pack_layers) {
         auto & l = layers[il];
-        const ggml_tensor * g = l.ffn_gate_exps;
+        const ggml_tensor * g = moe_cache_gate(l);
         const ggml_tensor * u = l.ffn_up_exps;
         const ggml_tensor * d = l.ffn_down_exps;
         const int64_t n_expert = g->ne[2];
         const int64_t S = std::min<int64_t>(n_slots, n_expert);
-        l.ffn_gate_exps_hot = ggml_new_tensor_3d(ctx, g->type, g->ne[0], g->ne[1], S);
-        l.ffn_up_exps_hot   = ggml_new_tensor_3d(ctx, u->type, u->ne[0], u->ne[1], S);
-        l.ffn_down_exps_hot = ggml_new_tensor_3d(ctx, d->type, d->ne[0], d->ne[1], S);
+        const int64_t capacity = S + (two_channel ? llama_moe_channel_policy::transient_slots : 0);
+        l.ffn_gate_exps_hot = ggml_new_tensor_3d(ctx, g->type, g->ne[0], g->ne[1], capacity);
+        l.ffn_up_exps_hot   = u ? ggml_new_tensor_3d(ctx, u->type, u->ne[0], u->ne[1], capacity) : nullptr;
+        l.ffn_down_exps_hot = ggml_new_tensor_3d(ctx, d->type, d->ne[0], d->ne[1], capacity);
         l.moe_map_hot       = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         l.moe_map_cold      = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
-        ggml_format_name(l.ffn_gate_exps_hot, "blk.%d.ffn_gate_exps_hot", il);
-        ggml_format_name(l.ffn_up_exps_hot,   "blk.%d.ffn_up_exps_hot",   il);
+        ggml_format_name(l.ffn_gate_exps_hot, l.ffn_gate_up_exps ? "blk.%d.ffn_gate_up_exps_hot" : "blk.%d.ffn_gate_exps_hot", il);
+        if (l.ffn_up_exps_hot) ggml_format_name(l.ffn_up_exps_hot, "blk.%d.ffn_up_exps_hot", il);
         ggml_format_name(l.ffn_down_exps_hot, "blk.%d.ffn_down_exps_hot", il);
         ggml_format_name(l.moe_map_hot,  "blk.%d.moe_map_hot",  il);
         ggml_format_name(l.moe_map_cold, "blk.%d.moe_map_cold", il);
@@ -2587,14 +2643,18 @@ void llama_model_base::init_moe_expert_cache() {
     // matmuls (and a per-layer weight copy) onto the CPU
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
+    const char * probe_env = getenv("GGML_MOE_CACHE_COPY_PROBE");
+    const int probe_copies = probe_env ? std::max(0, std::min(1000, atoi(probe_env))) : 0;
+    ggml_backend_ptr probe_backend{probe_copies > 0 ? ggml_backend_dev_init(dev, nullptr) : nullptr};
+
     // fill packs (expert dim is outermost: one contiguous slab per expert)
     std::vector<uint8_t> slab;
     std::vector<int32_t> map_hot, map_cold;
     size_t total_bytes = 0;
     for (int il : pack_layers) {
         auto & l = layers[il];
-        const int64_t n_expert = l.ffn_gate_exps->ne[2];
-        const int64_t S = l.ffn_gate_exps_hot->ne[2];
+        const int64_t n_expert = moe_cache_gate(l)->ne[2];
+        const int64_t S = std::min<int64_t>(n_slots, n_expert);
 
         std::vector<std::pair<int64_t, int32_t>> ranked; // (-count, expert)
         for (const auto & [e, c] : freq[il]) {
@@ -2604,7 +2664,7 @@ void llama_model_base::init_moe_expert_cache() {
         }
         std::sort(ranked.begin(), ranked.end());
 
-        if (params.moe_cache_live_resize || hybrid) {
+        if (params.moe_cache_live_resize || hybrid || two_channel) {
             auto & order = pimpl->moe_cache_rankings[il];
             order.reserve(ranked.size());
             for (const auto & item : ranked) {
@@ -2628,9 +2688,10 @@ void llama_model_base::init_moe_expert_cache() {
                     const int32_t e = ranked[s].second;
                     map_hot[e]  = (int32_t) s;
                     map_cold[e] = -1;
-                    const ggml_tensor * srcs[3] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+                    const ggml_tensor * srcs[3] = { moe_cache_gate(l), l.ffn_up_exps, l.ffn_down_exps };
                     ggml_tensor * dsts[3] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
                     for (int t = 0; t < 3; t++) {
+                        if (!srcs[t]) continue;
                         const size_t nb = srcs[t]->nb[2];
                         slab.resize(nb);
                         ggml_backend_tensor_get(srcs[t], slab.data(), e*nb, nb);
@@ -2646,9 +2707,10 @@ void llama_model_base::init_moe_expert_cache() {
                     if (e < 0) continue;
                     map_hot[e] = (int32_t) s;
                     map_cold[e] = -1;
-                    const ggml_tensor * srcs[3] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+                    const ggml_tensor * srcs[3] = { moe_cache_gate(l), l.ffn_up_exps, l.ffn_down_exps };
                     ggml_tensor * dsts[3] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
                     for (int t = 0; t < 3; t++) {
+                        if (!srcs[t]) continue;
                         const size_t nb = srcs[t]->nb[2];
                         slab.resize(nb);
                         ggml_backend_tensor_get(srcs[t], slab.data(), e*nb, nb);
@@ -2663,9 +2725,10 @@ void llama_model_base::init_moe_expert_cache() {
                 const int32_t e = ranked[s].second;
                 map_hot[e]  = (int32_t) s;
                 map_cold[e] = -1;
-                const ggml_tensor * srcs[3] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+                const ggml_tensor * srcs[3] = { moe_cache_gate(l), l.ffn_up_exps, l.ffn_down_exps };
                 ggml_tensor * dsts[3] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
                 for (int t = 0; t < 3; t++) {
+                    if (!srcs[t]) continue;
                     const size_t nb = srcs[t]->nb[2];
                     slab.resize(nb);
                     ggml_backend_tensor_get(srcs[t], slab.data(), e*nb, nb);
@@ -2674,8 +2737,43 @@ void llama_model_base::init_moe_expert_cache() {
                 }
             }
         }
+        // Retain the legacy GPU lookup node; the CPU hook needs global IDs.
+        if (two_channel) std::iota(map_cold.begin(), map_cold.end(), 0);
         ggml_backend_tensor_set(l.moe_map_hot,  map_hot.data(),  0, n_expert*sizeof(int32_t));
         ggml_backend_tensor_set(l.moe_map_cold, map_cold.data(), 0, n_expert*sizeof(int32_t));
+        if (two_channel) {
+            auto & runtime = pimpl->moe_channels.try_emplace(il).first->second;
+            if (!runtime.policy.initialize(int(n_expert), int(S), pimpl->moe_cache_rankings.at(il))) {
+                throw std::runtime_error("invalid two-channel cache seed");
+            }
+            runtime.begin.reset(pimpl->moe_event_new_timed(dev));
+            runtime.end.reset(pimpl->moe_event_new_timed(dev));
+            runtime.ids.reserve(64);
+            if (!runtime.begin || !runtime.end) throw std::runtime_error("failed to create channel timing events");
+            l.moe_cache_two_channel = true;
+        }
+        if (probe_backend && !ranked.empty() && !hybrid) {
+            const int32_t expert = ranked.front().second;
+            const ggml_tensor * sources[] = { moe_cache_gate(l), l.ffn_up_exps, l.ffn_down_exps };
+            ggml_tensor * targets[] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
+            size_t bytes = 0;
+            ggml_backend_synchronize(probe_backend.get());
+            const int64_t start_us = ggml_time_us();
+            for (int copy = 0; copy < probe_copies; ++copy) {
+                for (int projection = 0; projection < 3; ++projection) {
+                    if (!sources[projection] || !targets[projection]) continue;
+                    const size_t size = sources[projection]->nb[2];
+                    const char * source = (const char *) sources[projection]->data + size_t(expert)*size;
+                    ggml_backend_tensor_set_async(probe_backend.get(), targets[projection], source, 0, size);
+                    bytes += size;
+                }
+            }
+            ggml_backend_synchronize(probe_backend.get());
+            const int64_t elapsed_us = std::max<int64_t>(1, ggml_time_us() - start_us);
+            LLAMA_LOG_INFO("moe_cache_copy_probe: layer=%d source=%s copies=%d bytes=%zu us=%lld GBps=%.3f\n",
+                    il, ggml_backend_buffer_name(moe_cache_gate(l)->buffer), probe_copies, bytes,
+                    (long long) elapsed_us, double(bytes)/double(elapsed_us)/1000.0);
+        }
     }
 
     pimpl->ctxs_bufs.emplace_back(ggml_context_ptr{ctx}, std::vector<ggml_backend_buffer_ptr>{});
@@ -2688,7 +2786,7 @@ void llama_model_base::init_moe_expert_cache() {
 }
 
 bool llama_model_base::moe_expert_cache_requires_serialization() const {
-    return params.moe_cache_live_resize || pimpl->moe_cache_hybrid;
+    return params.moe_cache_live_resize || pimpl->moe_cache_hybrid || pimpl->moe_cache_two_channel;
 }
 
 uint64_t llama_model_base::moe_expert_cache_generation() const {
@@ -2717,8 +2815,8 @@ bool llama_model_base::update_moe_expert_cache_locked(ggml_backend_sched_t sched
         const auto & layer = layers[route.layer];
         if (state == pimpl->moe_cache_hybrid_layers.end() || layer.moe_map_hot == nullptr ||
                 layer.moe_map_cold == nullptr || layer.ffn_gate_exps_hot == nullptr ||
-                layer.ffn_up_exps_hot == nullptr || layer.ffn_down_exps_hot == nullptr ||
-                layer.ffn_gate_exps == nullptr || layer.ffn_up_exps == nullptr || layer.ffn_down_exps == nullptr) {
+                (!layer.ffn_gate_up_exps && layer.ffn_up_exps_hot == nullptr) || layer.ffn_down_exps_hot == nullptr ||
+                moe_cache_gate(layer) == nullptr || (!layer.ffn_gate_up_exps && layer.ffn_up_exps == nullptr) || layer.ffn_down_exps == nullptr) {
             return false;
         }
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, layer.moe_map_hot);
@@ -2755,7 +2853,7 @@ bool llama_model_base::update_moe_expert_cache_locked(ggml_backend_sched_t sched
         }
         route_batch batch{route.layer, route.n_expert_used, route.n_tokens, std::vector<int32_t>(n_ids)};
         ggml_backend_tensor_get(route.ids_flat, batch.ids.data(), 0, n_ids * sizeof(int32_t));
-        const int32_t n_expert = int32_t(layers[route.layer].ffn_gate_exps->ne[2]);
+        const int32_t n_expert = int32_t(moe_cache_gate(layers[route.layer])->ne[2]);
         if (std::any_of(batch.ids.begin(), batch.ids.end(), [n_expert](int32_t id) {
                     return id < 0 || id >= n_expert;
                 })) {
@@ -2828,7 +2926,7 @@ bool llama_model_base::update_moe_expert_cache_locked(ggml_backend_sched_t sched
     for (const auto & [il, changes] : changed) {
         auto & layer = layers[il];
         if (layer.moe_map_hot == nullptr || layer.moe_map_cold == nullptr ||
-                layer.ffn_gate_exps_hot == nullptr || layer.ffn_up_exps_hot == nullptr ||
+                layer.ffn_gate_exps_hot == nullptr || (!layer.ffn_gate_up_exps && layer.ffn_up_exps_hot == nullptr) ||
                 layer.ffn_down_exps_hot == nullptr) {
             return false;
         }
@@ -2837,13 +2935,14 @@ bool llama_model_base::update_moe_expert_cache_locked(ggml_backend_sched_t sched
             copy_backends.push_back(backend);
         }
 
-        const ggml_tensor * sources[3] = {layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps};
+        const ggml_tensor * sources[3] = {moe_cache_gate(layer), layer.ffn_up_exps, layer.ffn_down_exps};
         ggml_tensor * targets[3] = {layer.ffn_gate_exps_hot, layer.ffn_up_exps_hot, layer.ffn_down_exps_hot};
         for (const auto & change : changes.slots) {
             if (change.new_expert < 0) {
                 continue;
             }
             for (int projection = 0; projection < 3; ++projection) {
+                if (!sources[projection]) continue;
                 const size_t src_bytes = sources[projection]->nb[2];
                 const size_t dst_bytes = targets[projection]->nb[2];
                 if (src_bytes != dst_bytes ||
@@ -2862,7 +2961,7 @@ bool llama_model_base::update_moe_expert_cache_locked(ggml_backend_sched_t sched
             ++copies;
         }
 
-        const int64_t n_expert = layer.ffn_gate_exps->ne[2];
+        const int64_t n_expert = moe_cache_gate(layer)->ne[2];
         staged_map map{il, backend, std::vector<int32_t>(n_expert, -1), std::vector<int32_t>(n_expert)};
         for (int32_t expert = 0; expert < n_expert; ++expert) {
             map.cold[expert] = expert;
@@ -2907,6 +3006,153 @@ bool llama_model_base::update_moe_expert_cache_locked(ggml_backend_sched_t sched
     return true;
 }
 
+bool llama_model_base::moe_expert_cache_two_channel_enabled() const {
+    return pimpl->moe_cache_two_channel && pimpl->moe_cache_slots > 0 && !pimpl->moe_channels.empty();
+}
+
+bool llama_model_base::moe_expert_cache_split(ggml_backend_sched_t sched, ggml_backend_t backend,
+        ggml_cgraph * graph, bool before, int64_t elapsed_us) {
+    if (!moe_expert_cache_two_channel_enabled()) return true;
+    const bool cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    if (!cpu && before) return true;
+    const char * prefix = cpu ? "ffn_moe_down_cold_tc-" : "ffn_moe_down_hot_tc-";
+    ggml_tensor * output = nullptr;
+    int il = -1;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        ggml_tensor * node = ggml_graph_node(graph, i);
+        if (strncmp(node->name, prefix, strlen(prefix)) != 0) continue;
+        char * end = nullptr;
+        const long layer = strtol(node->name + strlen(prefix), &end, 10);
+        if (!end || *end != '\0' || layer < 0 || layer >= long(layers.size()) || output) {
+            LLAMA_LOG_ERROR("invalid two-channel split layout\n");
+            return false;
+        }
+        output = node;
+        il = int(layer);
+    }
+    if (!output) return true;
+    auto found = pimpl->moe_channels.find(il);
+    if (found == pimpl->moe_channels.end()) return false;
+    auto & runtime = found->second;
+    if (!cpu) {
+        if (!runtime.active || runtime.gpu_ended) return false;
+        ggml_backend_event_record(runtime.end.get(), backend);
+        runtime.gpu_ended = true;
+        return true;
+    }
+    if (!before) {
+        if (!runtime.active) return false;
+        runtime.cpu_us = double(std::max<int64_t>(1, ggml_time_us() - runtime.start_us));
+        runtime.cpu_compute_us = double(elapsed_us);
+        runtime.cpu_ready = true;
+        return true;
+    }
+    if (runtime.active || output->op != GGML_OP_MUL_MAT_ID) return false;
+    ggml_tensor * ids = output->src[2];
+    if (!ids || !ids->data || !ids->buffer || !ggml_backend_buffer_is_host(ids->buffer) ||
+            ids->type != GGML_TYPE_I32 || ids->ne[0] < 1 || ids->ne[0] > 8 ||
+            ids->ne[1] < 1 || ids->ne[1] > 8) return false;
+    auto & layer = layers[il];
+    ggml_tensor * sources[] = {moe_cache_gate(layer), layer.ffn_up_exps, layer.ffn_down_exps};
+    ggml_tensor * targets[] = {layer.ffn_gate_exps_hot, layer.ffn_up_exps_hot, layer.ffn_down_exps_hot};
+    for (int projection = 0; projection < 3; ++projection) {
+        if (!sources[projection] || !targets[projection]) continue;
+        if (!sources[projection]->data ||
+                !sources[projection]->buffer || !ggml_backend_buffer_is_host(sources[projection]->buffer) ||
+                sources[projection]->nb[2] != targets[projection]->nb[2] ||
+                targets[projection]->ne[2] != runtime.policy.capacity()) return false;
+    }
+    ggml_backend_t gpu = ggml_backend_sched_get_tensor_backend(sched, layer.moe_map_hot);
+    if (!gpu || ggml_backend_get_device(gpu) != ggml_backend_buft_get_device(
+            ggml_backend_buffer_get_type(layer.ffn_gate_exps_hot->buffer))) return false;
+    runtime.ids.resize(ids->ne[0] * ids->ne[1]);
+    size_t index = 0;
+    for (int64_t token = 0; token < ids->ne[1]; ++token) {
+        for (int64_t k = 0; k < ids->ne[0]; ++k) {
+            runtime.ids[index++] = *(const int32_t *) ((const char *) ids->data + token*ids->nb[1] + k*ids->nb[0]);
+        }
+    }
+    if (!runtime.policy.make_plan(runtime.ids, int(ids->ne[1]), int(ids->ne[0]))) return false;
+    const auto & plan = runtime.policy.latest();
+    runtime.active = true;
+    runtime.cpu_ready = runtime.gpu_ended = false;
+    runtime.start_us = ggml_time_us();
+    ggml_backend_event_record(runtime.begin.get(), gpu);
+    uint64_t bytes = 0, insertions = 0;
+    for (const auto & entry : plan.uploads) {
+        for (int projection = 0; projection < 3; ++projection) {
+            if (!sources[projection] || !targets[projection]) continue;
+            const size_t size = sources[projection]->nb[2];
+            const char * source = (const char *) sources[projection]->data + size_t(entry.expert)*size;
+            ggml_backend_tensor_set_async(gpu, targets[projection], source, size_t(entry.slot)*size, size);
+            bytes += size;
+        }
+        insertions += entry.persistent;
+    }
+    ggml_backend_tensor_set_async(gpu, layer.moe_map_hot, plan.slot_map.data(), 0,
+            plan.slot_map.size()*sizeof(int32_t));
+    index = 0;
+    for (int64_t token = 0; token < ids->ne[1]; ++token) {
+        for (int64_t k = 0; k < ids->ne[0]; ++k) {
+            const int32_t expert = runtime.ids[index++];
+            *(int32_t *) ((char *) ids->data + token*ids->nb[1] + k*ids->nb[0]) =
+                    plan.slot_map[expert] >= 0 ? -1 : expert;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(pimpl->moe_cache_stats_mutex);
+        auto & stats = pimpl->moe_cache_stats;
+        stats.enabled = true;
+        if (il == pimpl->moe_channels.begin()->first) stats.tokens += plan.n_tokens;
+        stats.hits += plan.hits;
+        stats.misses += plan.uploaded + plan.cpu;
+        stats.uploaded += plan.uploaded;
+        stats.cpu += plan.cpu;
+        stats.copies += plan.uploads.size();
+        stats.insertions += insertions;
+        stats.copied_bytes += bytes;
+    }
+    const char * trace = getenv("GGML_MOE_CACHE_TRACE");
+    if (trace && trace[0] == '1') {
+        const auto & cost = runtime.policy.estimate(plan.n_tokens);
+        fprintf(stderr, "moe_cache_layer layer=%d hits=%d uploaded=%d cpu=%d tokens=%d unique_uploads=%zu bytes=%llu "
+                "cpu_us_prev=%.3f gpu_us_prev=%.3f cpu_expert_us=%.3f gpu_upload_us=%.3f samples=%llu\n",
+                il, plan.hits, plan.uploaded, plan.cpu, plan.n_tokens, plan.uploads.size(), (unsigned long long) bytes,
+                runtime.observed_cpu_us, runtime.observed_gpu_us, cost.cpu_expert_us, cost.gpu_upload_us,
+                (unsigned long long) cost.samples);
+    }
+    return true;
+}
+
+bool llama_model_base::finish_moe_expert_cache_channels(bool success) {
+    if (!moe_expert_cache_two_channel_enabled()) return true;
+    bool ok = true;
+    uint64_t cpu_us = 0, gpu_us = 0;
+    for (auto & item : pimpl->moe_channels) {
+        auto & runtime = item.second;
+        if (!runtime.active) continue;
+        float ms = 0;
+        if (success) {
+            if (!runtime.cpu_ready || !runtime.gpu_ended ||
+                    !pimpl->moe_event_elapsed(runtime.begin.get(), runtime.end.get(), &ms)) {
+                LLAMA_LOG_ERROR("missing two-channel timing for layer %d\n", item.first);
+                ok = false;
+            } else {
+                runtime.observed_cpu_us = runtime.cpu_us;
+                runtime.observed_gpu_us = ms*1000.0;
+                runtime.policy.observe(runtime.observed_cpu_us, runtime.observed_gpu_us);
+                cpu_us += uint64_t(runtime.observed_cpu_us);
+                gpu_us += uint64_t(runtime.observed_gpu_us);
+            }
+        }
+        runtime.active = runtime.gpu_ended = runtime.cpu_ready = false;
+    }
+    std::lock_guard<std::mutex> lock(pimpl->moe_cache_stats_mutex);
+    pimpl->moe_cache_stats.cpu_channel_us += cpu_us;
+    pimpl->moe_cache_stats.gpu_channel_us += gpu_us;
+    return ok;
+}
+
 bool llama_model_base::get_moe_expert_cache_stats(llama_moe_cache_stats & stats) const {
     std::lock_guard<std::mutex> lock(pimpl->moe_cache_stats_mutex);
     stats = pimpl->moe_cache_stats;
@@ -2926,6 +3172,9 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
     }
     if (n_slots == old_slots) {
         return true;
+    }
+    if (pimpl->moe_cache_two_channel) {
+        return false;
     }
 
     const bool had_cache = old_slots > 0 && pimpl->moe_cache_bundle_index < pimpl->ctxs_bufs.size();
@@ -3015,24 +3264,24 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
     int64_t max_experts = 0;
     for (const auto & [il, _] : pimpl->moe_cache_rankings) {
         auto & l = layers[il];
-        const int64_t n_expert = l.ffn_gate_exps->ne[2];
+        const int64_t n_expert = moe_cache_gate(l)->ne[2];
         if (n_slots > n_expert) {
             return false;
         }
         const int64_t slots = std::min<int64_t>(n_slots, n_expert);
         resized_layer next = {
             il,
-            ggml_new_tensor_3d(ctx.get(), l.ffn_gate_exps->type, l.ffn_gate_exps->ne[0], l.ffn_gate_exps->ne[1], slots),
-            ggml_new_tensor_3d(ctx.get(), l.ffn_up_exps->type, l.ffn_up_exps->ne[0], l.ffn_up_exps->ne[1], slots),
+            ggml_new_tensor_3d(ctx.get(), moe_cache_gate(l)->type, moe_cache_gate(l)->ne[0], moe_cache_gate(l)->ne[1], slots),
+            l.ffn_up_exps ? ggml_new_tensor_3d(ctx.get(), l.ffn_up_exps->type, l.ffn_up_exps->ne[0], l.ffn_up_exps->ne[1], slots) : nullptr,
             ggml_new_tensor_3d(ctx.get(), l.ffn_down_exps->type, l.ffn_down_exps->ne[0], l.ffn_down_exps->ne[1], slots),
             ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, n_expert),
             ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, n_expert),
         };
-        if (!next.gate || !next.up || !next.down || !next.map_hot || !next.map_cold) {
+        if (!next.gate || (!l.ffn_gate_up_exps && !next.up) || !next.down || !next.map_hot || !next.map_cold) {
             return false;
         }
-        ggml_format_name(next.gate, "blk.%d.ffn_gate_exps_hot", il);
-        ggml_format_name(next.up, "blk.%d.ffn_up_exps_hot", il);
+        ggml_format_name(next.gate, l.ffn_gate_up_exps ? "blk.%d.ffn_gate_up_exps_hot" : "blk.%d.ffn_gate_exps_hot", il);
+        if (next.up) ggml_format_name(next.up, "blk.%d.ffn_up_exps_hot", il);
         ggml_format_name(next.down, "blk.%d.ffn_down_exps_hot", il);
         ggml_format_name(next.map_hot, "blk.%d.moe_map_hot", il);
         ggml_format_name(next.map_cold, "blk.%d.moe_map_cold", il);
@@ -3051,7 +3300,7 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
             old_resized.push_back({il, l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot, l.moe_map_hot, l.moe_map_cold});
         }
         max_experts = std::max(max_experts, n_expert);
-        max_slab = std::max(max_slab, std::max(l.ffn_gate_exps->nb[2], std::max(l.ffn_up_exps->nb[2], l.ffn_down_exps->nb[2])));
+        max_slab = std::max(max_slab, std::max(moe_cache_gate(l)->nb[2], std::max(l.ffn_up_exps ? l.ffn_up_exps->nb[2] : 0, l.ffn_down_exps->nb[2])));
     }
 
     pimpl->ctxs_bufs.reserve(pimpl->ctxs_bufs.size() + 1);
@@ -3068,14 +3317,14 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
         for (const auto & item : target) {
             auto & l = layers[item.il];
             const auto & order = pimpl->moe_cache_rankings.at(item.il);
-            const int64_t n_expert = l.ffn_gate_exps->ne[2];
+            const int64_t n_expert = moe_cache_gate(l)->ne[2];
             const int64_t slots = item.gate->ne[2];
             map_hot.assign(n_expert, -1);
             map_cold.resize(n_expert);
             for (int64_t e = 0; e < n_expert; e++) {
                 map_cold[e] = (int32_t) e;
             }
-            const ggml_tensor * srcs[3] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+            const ggml_tensor * srcs[3] = { moe_cache_gate(l), l.ffn_up_exps, l.ffn_down_exps };
             ggml_tensor * dsts[3] = { item.gate, item.up, item.down };
             const auto order_it = slot_orders.find(item.il);
             const bool use_hybrid_order = order_it != slot_orders.end();
@@ -3089,6 +3338,7 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
                 map_hot[e] = (int32_t) s;
                 map_cold[e] = -1;
                 for (int t = 0; t < 3; t++) {
+                    if (!srcs[t]) continue;
                     const size_t nb = srcs[t]->nb[2];
                     slab.resize(nb);
                     ggml_backend_tensor_get(srcs[t], slab.data(), (size_t)e*nb, nb);
@@ -3127,6 +3377,7 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
         for (const auto & item : old_resized) {
             ggml_tensor * tensors[5] = {item.gate, item.up, item.down, item.map_hot, item.map_cold};
             for (ggml_tensor * tensor : tensors) {
+                if (!tensor) continue;
                 tensor->buffer = nullptr;
                 tensor->data = nullptr;
             }
@@ -3134,6 +3385,7 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
         for (const auto & item : resized) {
             ggml_tensor * tensors[5] = {item.gate, item.up, item.down, item.map_hot, item.map_cold};
             for (ggml_tensor * tensor : tensors) {
+                if (!tensor) continue;
                 tensor->buffer = nullptr;
                 tensor->data = nullptr;
             }
@@ -4207,6 +4459,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_cache_profile           =*/ nullptr,
         /*.moe_cache_slots             =*/ 0,
         /*.moe_cache_live_resize       =*/ false,
+        /*.moe_cache_pinned_source     =*/ false,
         /*.moe_cache_policy            =*/ "static",
         /*.moe_cache_pinned_percent    =*/ 50,
         /*.moe_cache_inserts_per_layer_token =*/ 1,

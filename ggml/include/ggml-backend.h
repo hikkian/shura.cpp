@@ -316,6 +316,11 @@ extern "C" {
     // if the user returns false, the scheduler will cancel the graph compute
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
+    // Before: inputs are ready. After: GPU work is queued, or CPU work is complete.
+    typedef bool (*ggml_backend_sched_split_callback)(ggml_backend_sched_t sched, ggml_backend_t backend,
+            struct ggml_cgraph * graph, bool before, int64_t elapsed_us, void * user_data);
+    GGML_API void ggml_backend_sched_set_split_callback(ggml_backend_sched_t sched,
+            ggml_backend_sched_split_callback callback, void * user_data);
 
     // Callback while copying input weights of a split
     // if the user returns false the scheduler simply copies the entire weight

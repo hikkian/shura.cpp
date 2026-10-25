@@ -2820,11 +2820,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_LIVE_RESIZE"));
     add_opt(common_arg(
-        {"--moe-cache-policy"}, "static|hybrid",
-        "expert cache policy; static is the default, hybrid enables a profile-pinned set and bounded LRU tail",
+        {"--moe-cache-pinned-source"},
+        "use pinned GPU host buffers for CPU expert weights (qwen35moe, default: disabled)",
+        [](common_params & params) {
+            params.moe_cache_pinned_source = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PINNED_SOURCE"));
+    add_opt(common_arg(
+        {"--moe-cache-policy"}, "static|hybrid|two-channel",
+        "expert cache policy; two-channel overlaps CPU misses with GPU uploads (qwen35moe)",
         [](common_params & params, const std::string & value) {
-            if (value != "static" && value != "hybrid") {
-                throw std::invalid_argument("moe cache policy must be static or hybrid");
+            if (value != "static" && value != "hybrid" && value != "two-channel") {
+                throw std::invalid_argument("moe cache policy must be static, hybrid, or two-channel");
             }
             params.moe_cache_policy = value;
         }

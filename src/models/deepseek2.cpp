@@ -660,7 +660,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                 nullptr,
                 model.layers[il].ffn_gate_up_exps,
                 nullptr, nullptr, nullptr,
-                nullptr, &model.layers[il]);
+                nullptr, nullptr, 1e-5f, &model.layers[il]);
             cb(moe_out, "ffn_moe_out", il);
 
             // FFN shared expert

@@ -594,7 +594,8 @@ struct common_params {
     std::string moe_cache_profile = ""; // MoE expert cache routing profile CSV (empty = disabled)
     int32_t     moe_cache_slots   = 0;  // MoE expert cache slots per layer (0 = disabled)
     bool        moe_cache_live_resize = false;
-    std::string moe_cache_policy = "static"; // static (default) or hybrid pinned + LRU tail
+    bool        moe_cache_pinned_source = false;
+    std::string moe_cache_policy = "static"; // static (default), hybrid, or opt-in two-channel
     int32_t     moe_cache_pinned_percent = 50; // hybrid profile-pinned share
     int32_t     moe_cache_inserts_per_layer_token = 1; // hybrid LRU miss insert cap
 

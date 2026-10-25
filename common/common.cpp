@@ -1700,6 +1700,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     }
     mparams.moe_cache_slots = params.moe_cache_slots;
     mparams.moe_cache_live_resize = params.moe_cache_live_resize;
+    mparams.moe_cache_pinned_source = params.moe_cache_pinned_source;
     mparams.moe_cache_policy = params.moe_cache_policy.c_str();
     mparams.moe_cache_pinned_percent = params.moe_cache_pinned_percent;
     mparams.moe_cache_inserts_per_layer_token = params.moe_cache_inserts_per_layer_token;

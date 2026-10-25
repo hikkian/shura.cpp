@@ -940,6 +940,9 @@ struct ggml_sched_cpu_async {
     ggml_backend_t          job_backend = nullptr;
     struct ggml_cgraph *    job_graph   = nullptr;
     enum ggml_status        job_status  = GGML_STATUS_SUCCESS;
+    ggml_backend_sched_t    job_sched = nullptr;
+    ggml_backend_sched_split_callback job_callback = nullptr;
+    void *                  job_user_data = nullptr;
     bool                    job_ready   = false;
     bool                    job_done    = false;
     bool                    stop        = false;
@@ -956,9 +959,17 @@ struct ggml_sched_cpu_async {
                 job_ready = false;
                 ggml_backend_t   backend = job_backend;
                 ggml_cgraph *    graph   = job_graph;
+                auto callback = job_callback;
+                auto callback_sched = job_sched;
+                void * user_data = job_user_data;
                 lock.unlock();
 
+                const int64_t start_us = callback ? ggml_time_us() : 0;
                 enum ggml_status status = ggml_backend_graph_compute_async(backend, graph);
+                if (status == GGML_STATUS_SUCCESS && callback &&
+                        !callback(callback_sched, backend, graph, false, ggml_time_us() - start_us, user_data)) {
+                    status = GGML_STATUS_FAILED;
+                }
 
                 lock.lock();
                 job_status = status;
@@ -977,11 +988,15 @@ struct ggml_sched_cpu_async {
         worker.join();
     }
 
-    void launch(ggml_backend_t backend, struct ggml_cgraph * graph) {
+    void launch(ggml_backend_t backend, struct ggml_cgraph * graph, ggml_backend_sched_t sched,
+                ggml_backend_sched_split_callback callback, void * user_data) {
         {
             std::lock_guard<std::mutex> lock(mtx);
             job_backend = backend;
             job_graph   = graph;
+            job_sched = sched;
+            job_callback = callback;
+            job_user_data = user_data;
             job_status  = GGML_STATUS_SUCCESS;
             job_done    = false;
             job_ready   = true;
@@ -1044,6 +1059,8 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    ggml_backend_sched_split_callback callback_split;
+    void * callback_split_user_data;
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
@@ -2141,11 +2158,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_sched_copy_input(sched, split, input);
         }
 
+        if (sched->callback_split && !sched->callback_split(sched, split_backend, &split->graph, true, 0,
+                sched->callback_split_user_data)) {
+            return GGML_STATUS_FAILED;
+        }
+        const int64_t split_start_us = sched->callback_split ? ggml_time_us() : 0;
         if (!sched->callback_eval) {
             if (sched->cpu_async && split_backend_id == sched->n_backends - 1 && split_prefetch_slot == -1) {
                 // run the CPU split on the worker; the loop continues launching
                 // later splits until one depends on this split's outputs
-                sched->cpu_async->launch(split_backend, &split->graph);
+                sched->cpu_async->launch(split_backend, &split->graph, sched,
+                        sched->callback_split, sched->callback_split_user_data);
                 continue;
             }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -2191,6 +2214,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 j0 = j1;
             }
+        }
+
+        if (sched->callback_split && !sched->callback_split(sched, split_backend, &split->graph, false,
+                ggml_time_us() - split_start_us, sched->callback_split_user_data)) {
+            return GGML_STATUS_FAILED;
         }
 
         // record the event of this split
@@ -2414,6 +2442,12 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     }
 
     return ggml_backend_sched_compute_splits(sched);
+}
+
+void ggml_backend_sched_set_split_callback(ggml_backend_sched_t sched,
+        ggml_backend_sched_split_callback callback, void * user_data) {
+    sched->callback_split = callback;
+    sched->callback_split_user_data = user_data;
 }
 
 void ggml_backend_sched_set_async_cpu(ggml_backend_sched_t sched, bool enable) {
