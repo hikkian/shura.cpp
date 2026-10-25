@@ -3444,7 +3444,11 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
     ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
     GGML_UNUSED(total_bytes);
 
-    const bool release_first = had_cache && free_bytes < new_need + reserve_bytes;
+    // The new bank is filled from the host copy of the experts (fill_cache), never from the old bank, so nothing is lost by freeing
+    // the old one first. Allocating the new bank beside the old one made a transient of one whole bank (about 1 GiB at 13 chunks)
+    // on top of the footprint: a grow at room_90mib took the card from 1.9 GiB free to 0.77 GiB for a poll (SAGE1 stand, 2026-10-25).
+    // Release first, always: the peak is then max(old, new), and free VRAM only rises in between.
+    const bool release_first = had_cache;
     ggml_backend_buffer_t buf = release_first ? nullptr : try_allocate(ctx.get());
     if (buf == nullptr && had_cache) {
         ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
