@@ -51,6 +51,8 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+static float (*g_row_amp)(size_t row, size_t col) = nullptr; // test hook: per-row amplitude of the next init_tensor_uniform call (peaky attention data)
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
         return;
@@ -84,6 +86,11 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
                 t.get();
             }
         }
+    }
+
+    if (g_row_amp) {
+        const size_t ne0 = tensor->ne[0];
+        for (size_t i = 0; i < nels; i++) { data[i] *= g_row_amp(i / ne0, i % ne0); }
     }
 
     if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32) {
@@ -8600,6 +8607,8 @@ struct test_leaky_relu : public test_case {
 };
 
 // GGML_OP_FLASH_ATTN_EXT
+struct ggml_type_pair { ggml_type first; ggml_type second; };
+
 struct test_flash_attn_ext : public test_case {
     const int64_t hsk; // K head size
     const int64_t hsv; // V head size
@@ -8744,6 +8753,51 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     void initialize_tensors(ggml_context * ctx) override {
         test_flash_attn_ext::initialize_tensors(ctx);
         init_tensor_uniform(ggml_get_tensor(ctx, "q"), -(float) q_range, (float) q_range);
+// Flash attention with "peaky" K: a few rows have a much larger amplitude, so the softmax is sharp and the running maximum changes in the middle of the key pass.
+// Used to compare the GQA-packed decode path against the old path with a tight tolerance.
+static float g_peaky_frac = 0.02f;
+static float g_peaky_amp  = 30.0f;
+static bool g_peaky_outlier = false; // outlier channels in Q and K (massive activations)
+static float g_peaky_chan_amp = 8.0f;
+static float peaky_row_amp(size_t row, size_t col) {
+    uint64_t h = row * 0x9E3779B97F4A7C15ull; h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
+    float a = (h % 10000) < (uint64_t)(g_peaky_frac*10000.0f) ? g_peaky_amp : 1.0f;
+    if (g_peaky_outlier && (col == 5 || col == 77 || col == 130 || col == 200)) { a *= g_peaky_chan_amp; }
+    return a;
+}
+static float outlier_q_amp(size_t, size_t col) { return (g_peaky_outlier && (col == 5 || col == 77 || col == 130 || col == 200)) ? g_peaky_chan_amp : 1.0f; }
+struct test_flash_attn_ext_peaky : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+    static float env_f(const char * n, float d) { const char * e = getenv(n); return e ? (float) atof(e) : d; }
+    std::string vars() override { return test_flash_attn_ext::vars() + ",peaky=1,outlier=" + std::to_string((int) env_f("PEAKY_OUTLIER", 0)) + ",masktail=" + std::to_string(env_f("PEAKY_MASKTAIL", 0.0f)); }
+    double max_nmse_err() override { const char * e = getenv("PEAKY_NMSE"); return e ? atof(e) : 1e-4; } // set PEAKY_NMSE=1e-12 to print every case's NMSE
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            g_peaky_outlier = env_f("PEAKY_OUTLIER", 0) != 0;
+            const float tail = env_f("PEAKY_MASKTAIL", 0.0f);
+            if (strcmp(t->name, "m") == 0) {
+                if (tail > 0.0f) {
+                    // causal-like decode mask: the last `tail` fraction of the keys (positions after the current one) is -inf
+                    const int64_t n_kv_m = t->ne[0], n_rows = t->ne[1];
+                    std::vector<ggml_fp16_t> mv((size_t) n_kv_m*n_rows);
+                    const int64_t vis = (int64_t) (n_kv_m*(1.0f - tail));
+                    for (int64_t r = 0; r < n_rows; r++) {
+                        for (int64_t i = 0; i < n_kv_m; i++) {
+                            mv[(size_t) r*n_kv_m + i] = ggml_fp32_to_fp16(i < vis + r ? 0.0f : -INFINITY);
+                        }
+                    }
+                    ggml_backend_tensor_set(t, mv.data(), 0, mv.size()*sizeof(ggml_fp16_t));
+                } else {
+                    init_tensor_kq_mask(t);
+                }
+            } else if (strcmp(t->name, "k") == 0) {
+                g_row_amp = peaky_row_amp; init_tensor_uniform(t); g_row_amp = nullptr;
+            } else if (strcmp(t->name, "q") == 0) {
+                g_row_amp = outlier_q_amp; init_tensor_uniform(t); g_row_amp = nullptr;
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -12162,6 +12216,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
+    // GQA 4 with the packed path
+    for (int64_t nb_q : { 1, 2 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 4096, nb_q, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 4096, nb_q, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+    // max_bias != 0 and sinks must stay on the old path and still pass
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 4096, 1, true, true, 8, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
+    // Peaky data (sharp softmax, late new maxima), tight NMSE: catches errors that uniform data hides
+    for (int64_t kv_len : { 256, 512, 768, 4096, 16384 }) {
+        for (int64_t nb_q : { 1, 2 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_peaky(256, 256, 2, {8, 1}, kv_len, nb_q, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
+            test_cases.emplace_back(new test_flash_attn_ext_peaky(256, 256, 2, {8, 1}, kv_len, nb_q, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+    // Tiel shape (GQA 8, 2 KV heads, head 256) with the live KV types; also exercises the GQA-packed decode path (GGML_HIP_FA_GQA_VEC=1)
+    for (ggml_type_pair tkv : { ggml_type_pair{GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0}, ggml_type_pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+                                ggml_type_pair{GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0}, ggml_type_pair{GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0} }) {
+        for (int64_t kv_len : { 512, 4096, 65536 }) {
+            for (int64_t nb_q : { 1, 2 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv_len, nb_q, true, false, 0, 0, GGML_PREC_F32, tkv.first, tkv.second));
+            }
+        }
+    }
+
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -12779,6 +12857,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
 
+    // Tiel decode shape (GQA 8, 2 KV heads, head 256), live and comparison KV types
+    for (ggml_type_pair tkv : { ggml_type_pair{GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0}, ggml_type_pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+                                ggml_type_pair{GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0}, ggml_type_pair{GGML_TYPE_F16, GGML_TYPE_F16} }) {
+        for (int64_t kv_len : { 16384, 65536 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv_len, 1, true, false, 0, 0, GGML_PREC_F32, tkv.first, tkv.second));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
