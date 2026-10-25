@@ -1303,6 +1303,7 @@ struct llama_model::impl {
     uint64_t moe_cache_generation = 0;
     bool moe_cache_hybrid = false;
     bool moe_cache_two_channel = false;
+    int32_t moe_cache_test_fail_resize_allocations_remaining = 0;
     std::map<int, llama_moe_channel_runtime> moe_channels;
     ggml_backend_event_t (*moe_event_new_timed)(ggml_backend_dev_t) = nullptr;
     bool (*moe_event_elapsed)(ggml_backend_event_t, ggml_backend_event_t, float *) = nullptr;
@@ -2472,6 +2473,9 @@ void llama_model_base::init_moe_expert_cache() {
     }
     pimpl->moe_cache_hybrid = hybrid;
     pimpl->moe_cache_two_channel = two_channel;
+    if (const char * fail_allocs = getenv("GGML_MOE_CACHE_TEST_FAIL_RESIZE_ALLOCS_ONCE")) {
+        pimpl->moe_cache_test_fail_resize_allocations_remaining = std::max(0, atoi(fail_allocs));
+    }
     pimpl->moe_cache_pinned_percent = params.moe_cache_pinned_percent;
     pimpl->moe_cache_inserts_per_layer_token = params.moe_cache_inserts_per_layer_token;
     pimpl->moe_cache_stats = {};
@@ -3166,6 +3170,8 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
     new_slots = old_slots;
     released_bytes = 0;
     allocated_bytes = 0;
+    int32_t test_fail_new_allocations = pimpl->moe_cache_test_fail_resize_allocations_remaining;
+    pimpl->moe_cache_test_fail_resize_allocations_remaining = 0;
 
     if (!params.moe_cache_live_resize || n_slots < 0 || pimpl->moe_cache_rankings.empty()) {
         return false;
@@ -3173,10 +3179,7 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
     if (n_slots == old_slots) {
         return true;
     }
-    if (pimpl->moe_cache_two_channel) {
-        return false;
-    }
-
+    const bool two_channel = pimpl->moe_cache_two_channel;
     const bool had_cache = old_slots > 0 && pimpl->moe_cache_bundle_index < pimpl->ctxs_bufs.size();
     if (old_slots > 0 && !had_cache) {
         return false;
@@ -3201,6 +3204,7 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
             l.moe_map_hot = nullptr;
             l.moe_map_cold = nullptr;
             l.moe_cache_hybrid = pimpl->moe_cache_hybrid;
+            l.moe_cache_two_channel = false;
             auto policy = pimpl->moe_cache_hybrid_layers.find(il);
             if (policy != pimpl->moe_cache_hybrid_layers.end()) {
                 policy->second.commit_resize(0);
@@ -3209,6 +3213,15 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
         pimpl->ctxs_bufs.erase(pimpl->ctxs_bufs.begin() + cache_index);
         pimpl->moe_cache_bundle_index = SIZE_MAX;
         pimpl->moe_cache_slots = 0;
+        if (two_channel) {
+            for (auto & [_, runtime] : pimpl->moe_channels) {
+                if (!runtime.policy.commit_resize(runtime.policy.preview_resize(0))) return false;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> stats_lock(pimpl->moe_cache_stats_mutex);
+            pimpl->moe_cache_stats.enabled = false;
+        }
         ++pimpl->moe_cache_generation;
         new_slots = 0;
         released_bytes = old_buffer_bytes;
@@ -3257,6 +3270,8 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
     std::vector<resized_layer> old_resized;
     std::map<int, std::vector<int32_t>> new_slot_orders;
     std::map<int, std::vector<int32_t>> old_slot_orders;
+    std::map<int, llama_moe_channel_policy> staged_channel_policies;
+    std::map<int, std::pair<ggml_backend_event_ptr, ggml_backend_event_ptr>> staged_channel_events;
     resized.reserve(n_layers);
     old_resized.reserve(n_layers);
 
@@ -3269,11 +3284,12 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
             return false;
         }
         const int64_t slots = std::min<int64_t>(n_slots, n_expert);
+        const int64_t capacity = slots + (two_channel ? llama_moe_channel_policy::transient_slots : 0);
         resized_layer next = {
             il,
-            ggml_new_tensor_3d(ctx.get(), moe_cache_gate(l)->type, moe_cache_gate(l)->ne[0], moe_cache_gate(l)->ne[1], slots),
-            l.ffn_up_exps ? ggml_new_tensor_3d(ctx.get(), l.ffn_up_exps->type, l.ffn_up_exps->ne[0], l.ffn_up_exps->ne[1], slots) : nullptr,
-            ggml_new_tensor_3d(ctx.get(), l.ffn_down_exps->type, l.ffn_down_exps->ne[0], l.ffn_down_exps->ne[1], slots),
+            ggml_new_tensor_3d(ctx.get(), moe_cache_gate(l)->type, moe_cache_gate(l)->ne[0], moe_cache_gate(l)->ne[1], capacity),
+            l.ffn_up_exps ? ggml_new_tensor_3d(ctx.get(), l.ffn_up_exps->type, l.ffn_up_exps->ne[0], l.ffn_up_exps->ne[1], capacity) : nullptr,
+            ggml_new_tensor_3d(ctx.get(), l.ffn_down_exps->type, l.ffn_down_exps->ne[0], l.ffn_down_exps->ne[1], capacity),
             ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, n_expert),
             ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, n_expert),
         };
@@ -3295,6 +3311,25 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
             new_slot_orders[il] = policy->second.preview_resize(int32_t(slots));
             old_slot_orders[il] = policy->second.slot_to_expert();
         }
+        if (two_channel) {
+            llama_moe_channel_policy staged;
+            auto runtime = pimpl->moe_channels.find(il);
+            if (runtime == pimpl->moe_channels.end()) {
+                if (!staged.initialize(int(n_expert), 0, pimpl->moe_cache_rankings.at(il))) return false;
+                if (!pimpl->moe_event_new_timed || !pimpl->moe_event_elapsed) return false;
+                ggml_backend_event_ptr begin{pimpl->moe_event_new_timed(dev)};
+                ggml_backend_event_ptr end{pimpl->moe_event_new_timed(dev)};
+                if (!begin || !end) return false;
+                staged_channel_events.emplace(il, std::make_pair(std::move(begin), std::move(end)));
+                old_slot_orders[il] = {};
+            } else {
+                staged = runtime->second.policy;
+                old_slot_orders[il] = runtime->second.policy.slots();
+            }
+            new_slot_orders[il] = staged.preview_resize(int32_t(slots));
+            if (int64_t(new_slot_orders[il].size()) != slots) return false;
+            staged_channel_policies.emplace(il, std::move(staged));
+        }
 
         if (had_cache) {
             old_resized.push_back({il, l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot, l.moe_map_hot, l.moe_map_cold});
@@ -3313,12 +3348,12 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
     map_cold.reserve(max_experts);
 
     auto fill_cache = [&](const std::vector<resized_layer> & target,
-                          const std::map<int, std::vector<int32_t>> & slot_orders) {
+                          const std::map<int, std::vector<int32_t>> & slot_orders, int64_t logical_slots) {
         for (const auto & item : target) {
             auto & l = layers[item.il];
             const auto & order = pimpl->moe_cache_rankings.at(item.il);
             const int64_t n_expert = moe_cache_gate(l)->ne[2];
-            const int64_t slots = item.gate->ne[2];
+            const int64_t slots = std::min<int64_t>(logical_slots, n_expert);
             map_hot.assign(n_expert, -1);
             map_cold.resize(n_expert);
             for (int64_t e = 0; e < n_expert; e++) {
@@ -3336,7 +3371,7 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
                     continue;
                 }
                 map_hot[e] = (int32_t) s;
-                map_cold[e] = -1;
+                map_cold[e] = two_channel ? (int32_t) e : -1;
                 for (int t = 0; t < 3; t++) {
                     if (!srcs[t]) continue;
                     const size_t nb = srcs[t]->nb[2];
@@ -3351,6 +3386,12 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
     };
 
     auto try_allocate = [&](ggml_context * tensor_ctx) {
+        if (tensor_ctx == ctx.get() && test_fail_new_allocations > 0) {
+            --test_fail_new_allocations;
+            LLAMA_LOG_WARN("%s: test-only forced resize allocation failure (remaining=%d)\n",
+                    __func__, test_fail_new_allocations);
+            return (ggml_backend_buffer_t) nullptr;
+        }
         try {
             return ggml_backend_alloc_ctx_tensors_from_buft(tensor_ctx, buft);
         } catch (...) {
@@ -3359,7 +3400,7 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
     };
 
     const size_t new_need = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
-    const size_t reserve_bytes = 194*1024*1024;
+    const size_t reserve_bytes = 1536*1024*1024;
     size_t free_bytes = 0;
     size_t total_bytes = 0;
     ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
@@ -3399,7 +3440,8 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
                 ggml_backend_buffer_ptr rollback_guard{rollback};
                 ggml_backend_buffer_set_usage(rollback_guard.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                 old_bundle.second.emplace_back(std::move(rollback_guard));
-                fill_cache(old_resized, old_slot_orders);
+                fill_cache(old_resized, old_slot_orders, old_slots);
+                ++pimpl->moe_cache_generation; // rollback may replace the old buffer address
                 LLAMA_LOG_WARN("%s: resize allocation failed; restored %d-slot cache\n", __func__, old_slots);
                 return false;
             }
@@ -3411,6 +3453,16 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
                 l.ffn_down_exps_hot = nullptr;
                 l.moe_map_hot = nullptr;
                 l.moe_map_cold = nullptr;
+                l.moe_cache_two_channel = false;
+            }
+            if (two_channel) {
+                for (auto & [_, runtime] : pimpl->moe_channels) {
+                    runtime.policy.commit_resize(runtime.policy.preview_resize(0));
+                }
+            }
+            {
+                std::lock_guard<std::mutex> stats_lock(pimpl->moe_cache_stats_mutex);
+                pimpl->moe_cache_stats.enabled = false;
             }
             pimpl->ctxs_bufs.erase(pimpl->ctxs_bufs.begin() + old_index);
             pimpl->moe_cache_bundle_index = SIZE_MAX;
@@ -3431,7 +3483,7 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
     ggml_backend_buffer_ptr buf_guard{buf};
     ggml_backend_buffer_set_usage(buf_guard.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     const size_t new_buffer_bytes = ggml_backend_buffer_get_size(buf_guard.get());
-    fill_cache(resized, new_slot_orders);
+    fill_cache(resized, new_slot_orders, n_slots);
 
     buffers.emplace_back(std::move(buf_guard));
     const size_t new_index = pimpl->ctxs_bufs.size();
@@ -3453,6 +3505,30 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
         pimpl->moe_cache_bundle_index = new_index;
     }
     pimpl->moe_cache_slots = n_slots;
+    if (two_channel) {
+        for (auto & [il, policy] : staged_channel_policies) {
+            const auto order = new_slot_orders.at(il);
+            auto runtime = pimpl->moe_channels.find(il);
+            if (runtime == pimpl->moe_channels.end()) {
+                llama_moe_channel_runtime created;
+                created.policy = std::move(policy);
+                if (!created.policy.commit_resize(order)) return false;
+                auto events = staged_channel_events.find(il);
+                if (events == staged_channel_events.end()) return false;
+                created.begin = std::move(events->second.first);
+                created.end = std::move(events->second.second);
+                created.ids.reserve(64);
+                pimpl->moe_channels.emplace(il, std::move(created));
+            } else if (!runtime->second.policy.commit_resize(order)) {
+                return false;
+            }
+            layers[il].moe_cache_two_channel = true;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> stats_lock(pimpl->moe_cache_stats_mutex);
+        pimpl->moe_cache_stats.enabled = pimpl->moe_cache_hybrid || two_channel;
+    }
     ++pimpl->moe_cache_generation;
     if (pimpl->moe_cache_hybrid) {
         for (auto & [_, policy] : pimpl->moe_cache_hybrid_layers) {
