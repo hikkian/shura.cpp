@@ -4049,6 +4049,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // FUSE1: ADD -> RMS_NORM -> MUL (residual add before a norm); off unless GGML_HIP_FUSE_EXTRA=1
+    static const bool fuse_extra = getenv("GGML_HIP_FUSE_EXTRA") != nullptr && std::atoi(getenv("GGML_HIP_FUSE_EXTRA"));
+    if (fuse_extra && node->op == GGML_OP_ADD) {
+        const int n_fused = ggml_cuda_try_fuse_add_rms_norm(*cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
+
     // multi-(add or mul)
     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
         int     n_fuse = 0;
@@ -4652,6 +4661,8 @@ struct ggml_cuda_op_prof_rec {
     double      mb;
     int         ev0;
     int         ev1;
+    int         node;  // FUSE1: index of the first graph node of this record
+    std::string name;  // FUSE1: tensor name of that node (for the SEQ dump)
 };
 
 struct ggml_cuda_op_prof_entry {
@@ -4740,7 +4751,7 @@ static void ggml_cuda_op_prof_push(const ggml_cgraph * cgraph, int first, int n,
             mb  += ggml_cuda_op_prof_mb(cgraph->nodes[first + k]);
         }
     }
-    g_op_prof.recs.push_back({key, mb, ev0, ev1});
+    g_op_prof.recs.push_back({key, mb, ev0, ev1, first, cgraph->nodes[first]->name});
 }
 
 static void ggml_cuda_op_prof_flush(cudaStream_t stream, std::chrono::steady_clock::time_point t0) {
@@ -4748,6 +4759,9 @@ static void ggml_cuda_op_prof_flush(cudaStream_t stream, std::chrono::steady_clo
     CUDA_CHECK(cudaStreamSynchronize(stream));
     P.graph_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     P.graphs++;
+    // FUSE1: GGML_CUDA_OP_PROFILE_SEQ=N prints the per-record order of the first N graph evaluations
+    const char * seq_env = getenv("GGML_CUDA_OP_PROFILE_SEQ");
+    const long long seq_max = seq_env ? atoll(seq_env) : 0;
     for (const auto & r : P.recs) {
         float ms = 0.0f;
 #ifdef GGML_USE_HIP
@@ -4755,6 +4769,9 @@ static void ggml_cuda_op_prof_flush(cudaStream_t stream, std::chrono::steady_clo
 #else
         CUDA_CHECK(cudaEventElapsedTime(&ms, P.events[r.ev0], P.events[r.ev1]));
 #endif
+        if (P.graphs <= seq_max) {
+            fprintf(stderr, "SEQ\t%lld\t%d\t%s\t%s\t%.4f\n", P.graphs, r.node, r.name.c_str(), r.key.c_str(), ms);
+        }
         auto & e = P.table[r.key];
         e.calls++;
         e.ms += ms;

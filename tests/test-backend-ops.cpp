@@ -4136,6 +4136,46 @@ struct test_add_add : public test_case {
             return 1e-4;
         }
         return test_case::max_nmse_err();
+// FUSE1: GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL (the residual add before a layer's norm, fused operation). The sum
+// and the product are both checked: the sum has a later reader. Ported from achyudh/llama.cpp (RDNA fork, MIT), without
+// its q8_1 matmul variants.
+struct test_add_rms_norm_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool inplace;
+
+    std::vector<ggml_tensor *> checked;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, inplace);
+    }
+
+    test_add_rms_norm_mul(std::array<int64_t, 4> ne = {5120, 4, 1, 1}, bool inplace = false)
+        : ne(ne), inplace(inplace) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(b, "b");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * sum = inplace ? ggml_add_inplace(ctx, a, b) : ggml_add(ctx, a, b);
+        ggml_set_name(sum, "sum");
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, sum, 1e-6f), w);
+        ggml_set_name(out, "out");
+
+        checked = { sum, out };
+        return out;
     }
 };
 
@@ -10981,6 +11021,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
+
+    // FUSE1: the residual add before a layer's norm, then the norm's weight (ADD -> RMS_NORM -> MUL): both block sizes,
+    // a decode row, a verify batch and a prefill ubatch, in place or not; rows too long for the register path
+    for (int64_t ncols : {1000, 5120}) {
+        for (int64_t nrows : {1, 4, 512}) {
+            for (bool inplace : {false, true}) {
+                test_cases.emplace_back(new test_add_rms_norm_mul({ncols, nrows, 1, 1}, inplace));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_add_rms_norm_mul({10000, 4, 1, 1}, false));
 
     for (auto multi_add : {false, true}) {
         for (auto set_rows : {false, true}) {
