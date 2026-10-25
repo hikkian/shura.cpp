@@ -11201,6 +11201,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 16, 8, false, 256, 64, 256, 0, false, /*skip=*/true));
     }
 
+    // PREFILLPROF4: MMQ minimal cases without -1 (control for the concentrated-routing hang check)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 8, false, 256, 4, 256, false));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 8, false, 256, 64, 256, false));
+    // PREFILLPROF4: production shapes of the cold expert pack (prefill, 512 tokens, 256 experts, 8 used)
+    for (ggml_type ta : {GGML_TYPE_Q3_K, GGML_TYPE_IQ3_XXS}) {
+        for (bool skip : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256, 8, true,  512,  512, 2048, skip)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256, 8, false, 2048, 512,  512, skip)); // down
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
@@ -12633,6 +12644,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // PREFILLPROF4: production shapes of the cold expert pack (prefill, 512 tokens, 256 experts, 8 used)
+    for (ggml_type ta : {GGML_TYPE_Q3_K, GGML_TYPE_IQ3_XXS}) {
+        for (bool skip : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256, 8, true,  512,  512, 2048, skip)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256, 8, false, 2048, 512,  512, skip)); // down
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

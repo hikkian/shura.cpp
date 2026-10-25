@@ -2146,16 +2146,54 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
-        for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+    // PREFILLPROF4: one pass over ids instead of expert x token x slot. For each (token, expert) the first
+    // matching slot is used; compact rows are grouped by expert with tokens ascending (same layout as before).
+    {
+        auto id_at = [&](int64_t i12, int64_t iex) {
+            return *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+        };
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= -1 && expert_to_use < ne02); // -1 = skip (hot/cold expert split)
-                if (expert_to_use == i02) {
-                    ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
-                    ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
-                    tokens_per_expert[i02]++;
-                    break;
+                const int32_t e = id_at(i12, iex);
+                assert(e >= -1 && e < ne02); // -1 = skip (hot/cold expert split)
+                if (e < 0) {
+                    continue;
+                }
+                bool first = true;
+                for (int64_t k = 0; k < iex; ++k) {
+                    if (id_at(i12, k) == e) {
+                        first = false;
+                        break;
+                    }
+                }
+                if (first) {
+                    tokens_per_expert[e]++;
+                }
+            }
+        }
+        std::vector<int32_t> expert_offset(ne02 + 1, 0);
+        for (int64_t e = 0; e < ne02; ++e) {
+            expert_offset[e + 1] = expert_offset[e] + tokens_per_expert[e];
+        }
+        ids_to_sorted_host.resize(expert_offset[ne02]);
+        std::vector<int32_t> cursor(expert_offset.begin(), expert_offset.end() - 1);
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                const int32_t e = id_at(i12, iex);
+                if (e < 0) {
+                    continue;
+                }
+                bool first = true;
+                for (int64_t k = 0; k < iex; ++k) {
+                    if (id_at(i12, k) == e) {
+                        first = false;
+                        break;
+                    }
+                }
+                if (first) {
+                    const int32_t pos = cursor[e]++;
+                    ids_from_sorted_host[i12*n_expert_used + iex] = pos;
+                    ids_to_sorted_host[pos] = i12*ne11 + iex % ne11;
                 }
             }
         }
