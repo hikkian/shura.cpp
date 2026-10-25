@@ -2647,6 +2647,16 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
+        { // PFAULT1 diagnostic
+            const ggml_tensor * s0 = dst->src[0]; const ggml_tensor * s1 = dst->src[1]; const ggml_tensor * s2 = dst->src[2];
+            GGML_LOG_ERROR("PFAULT1 op=%s name=%s op_params0=%d dst[%lld,%lld,%lld] src0=%s[%lld,%lld,%lld] data=%p buf=%s src1[%lld,%lld,%lld] ids[%lld,%lld]\n",
+                ggml_op_name(dst->op), dst->name, (int) dst->op_params[0],
+                (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2],
+                s0 ? ggml_type_name(s0->type) : "-", s0 ? (long long) s0->ne[0] : 0, s0 ? (long long) s0->ne[1] : 0, s0 ? (long long) s0->ne[2] : 0,
+                s0 ? s0->data : nullptr, s0 && s0->buffer ? ggml_backend_buffer_name(s0->buffer) : "-",
+                s1 ? (long long) s1->ne[0] : 0, s1 ? (long long) s1->ne[1] : 0, s1 ? (long long) s1->ne[2] : 0,
+                s2 ? (long long) s2->ne[0] : 0, s2 ? (long long) s2->ne[1] : 0);
+        }
         CUDA_CHECK(err);
     }
 
