@@ -4138,6 +4138,9 @@ struct test_add_add : public test_case {
             return 1e-4;
         }
         return test_case::max_nmse_err();
+    }
+};
+
 // FUSE1: GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL (the residual add before a layer's norm, fused operation). The sum
 // and the product are both checked: the sum has a later reader. Ported from achyudh/llama.cpp (RDNA fork, MIT), without
 // its q8_1 matmul variants.
@@ -8795,6 +8798,9 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     void initialize_tensors(ggml_context * ctx) override {
         test_flash_attn_ext::initialize_tensors(ctx);
         init_tensor_uniform(ggml_get_tensor(ctx, "q"), -(float) q_range, (float) q_range);
+    }
+};
+
 // Flash attention with "peaky" K: a few rows have a much larger amplitude, so the softmax is sharp and the running maximum changes in the middle of the key pass.
 // Used to compare the GQA-packed decode path against the old path with a tight tolerance.
 static float g_peaky_frac = 0.02f;
@@ -12203,6 +12209,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (int nb : { 75, 1024, }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
                 }
+            }
+        }
+    }
+
     // Gemma 4 global layers: head size 512, 2 KV heads with 8 Q heads per KV head, quantized KV, decode-sized batches (GEMMAFA1c).
     // The head-size loop above tests quantized KV only for head sizes 64 and 72.
     for (const auto & kv_types : std::initializer_list<std::pair<ggml_type, ggml_type>>{
