@@ -1717,6 +1717,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--slot-save-checkpoints"}, "N",
+        "ignored, kept for scripts of the shura stack: upstream always appends the context checkpoints to saved slots",
+        [](common_params &, int) {}
+    ).set_env("LLAMA_ARG_SLOT_SAVE_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {
