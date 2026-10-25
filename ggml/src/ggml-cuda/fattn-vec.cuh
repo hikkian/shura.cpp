@@ -73,11 +73,17 @@ static __global__ void flash_attn_ext_vec(
 
 #ifdef GGML_USE_HIP
 #ifdef RDNA
-    constexpr int nthreads_KQ_q = 2;
+#ifndef GGML_HIP_FA_VEC_KQ_Q
+#define GGML_HIP_FA_VEC_KQ_Q 2
+#endif
+    constexpr int nthreads_KQ_q = GGML_HIP_FA_VEC_KQ_Q;
 #else
     constexpr int nthreads_KQ_q = 4;
 #endif // RDNA
-    constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
+#ifndef GGML_HIP_FA_VEC_V_Q
+#define GGML_HIP_FA_VEC_V_Q (D/4 < 32 ? D/4 : 32)
+#endif
+    constexpr int nthreads_V_q  = GGML_HIP_FA_VEC_V_Q;
 #else
     constexpr int nthreads_KQ_q = (D/4 < 32 ? D/4 : 32);
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);

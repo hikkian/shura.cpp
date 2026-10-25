@@ -16,6 +16,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -326,6 +327,9 @@ llama_context::llama_context(
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
+    if (const char * env = std::getenv("LLAMA_GDN_FUSED_CH")) {
+        cparams.fused_gdn_ch = std::strcmp(env, "0") != 0;
+    }
     cparams.auto_fgdn    = false;
 
     cparams.fused_lid = true;
