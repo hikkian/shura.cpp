@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 100 100">
+  <rect x="2" y="2" width="96" height="96" rx="22" fill="#0F4A55"/>
+  <defs><mask id="seam"><rect width="100" height="100" fill="white"/>
+    <path d="M 100 34 H 66 A 16 16 0 1 0 50 50 A 16 16 0 1 1 34 66 H 0" fill="none" stroke="black" stroke-width="10"/>
+    <rect x="66" y="0" width="34" height="39.0" fill="black"/>
+    <rect x="60" y="0" width="40" height="29.0" fill="black"/>
+    <rect x="0" y="61.0" width="34" height="39.0" fill="black"/>
+    <rect x="0" y="71.0" width="40" height="29.0" fill="black"/>
+  </mask></defs>
+  <rect x="18" y="18" width="64" height="64" rx="17" fill="#7DE3CB" mask="url(#seam)"/>
+</svg>
