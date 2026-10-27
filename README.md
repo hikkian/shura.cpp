@@ -16,11 +16,11 @@ again.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/shura-cpp/governor-dark.svg">
-  <img alt="The card's memory to scale: model 11.4 GiB, expert cache, 1.5 GiB floor plus 256 MiB buffer kept free, desktop" src="assets/shura-cpp/governor-light.svg" width="100%">
+  <img alt="The card's memory to scale: model 11.4 GiB, expert cache, the desktop's free room (1.5 GiB floor + 256 MiB buffer), desktop" src="assets/shura-cpp/governor-light.svg" width="100%">
 </picture>
 
-One loop, to scale: the desktop takes 1.25 GiB at once, the expert cache gives back five banks in one step, and once the
-desktop lets go the cache grows back bank by bank.
+One loop, to scale: the desktop grows 1.25 GiB into its free room at once, the expert cache gives back five banks in one
+step so the room is whole again, and once the desktop lets go the cache grows back bank by bank.
 
 It is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp): the file format, the backends and the server
 are theirs. Our changes are separate commits on the `shura` branch, rebased on upstream. Upstream's README is kept at

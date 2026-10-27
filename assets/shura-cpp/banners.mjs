@@ -4,8 +4,9 @@
 //   npm i fontkit && node banners.mjs [out-dir]     Montserrat Medium and SemiBold must be installed (MONTSERRAT_DIR)
 //
 // banner-{light,dark}.svg    the mark and the name, at the top of the README
-// governor-{light,dark}.svg  the card's memory to scale: when the desktop takes more VRAM, the expert cache gives it back
-//                            in one step, then grows again bank by bank (a CSS animation, still under prefers-reduced-motion)
+// governor-{light,dark}.svg  the card's memory to scale: the desktop grows into its free room at once, the expert cache
+//                            gives back banks so the room is whole again, then grows back bank by bank when the desktop
+//                            lets go (a CSS animation, still under prefers-reduced-motion)
 import { createRequire } from "node:module";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -20,11 +21,12 @@ const fonts = {
 const OUT = process.argv[2] || ".";
 mkdirSync(OUT, { recursive: true });
 
+// room: the outline of the desktop's free room, the desktop's own amber (darker on the light ground, so it still reads)
 const THEMES = {
   light: { ground: "#EEF4F3", ink: "#082A31", model: "#0F4A55", onModel: "#E6F1EF", cache: "#7DE3CB", desk: "#E4B54A",
-           kept: "#D3E3E0", tile: "#0F4A55", mint: "#7DE3CB" },
+           room: "#B4851A", tile: "#0F4A55", mint: "#7DE3CB" },
   dark:  { ground: "#082A31", ink: "#E6F1EF", model: "#1D5E6A", onModel: "#E6F1EF", cache: "#7DE3CB", desk: "#E4B54A",
-           kept: "#12434D", tile: "#0F4A55", mint: "#7DE3CB" },
+           room: "#E4B54A", tile: "#0F4A55", mint: "#7DE3CB" },
 };
 
 const r1 = (s) => s.replace(/-?\d+\.\d+/g, (n) => String(Math.round(parseFloat(n) * 10) / 10));
@@ -76,7 +78,7 @@ const LEDE = "A fork of llama.cpp that shares one gaming GPU with the desktop yo
 // compute 364 MiB, from the server log), the governor's 1.5 GiB floor + 256 MiB buffer, a desktop with a browser.
 // The expert cache is what is left; it is drawn as 256 MiB banks.
 function governor(t) {
-  const H = 196, TOTAL = 16368, px = W / TOTAL;
+  const H = 204, TOTAL = 16368, px = W / TOTAL;
   const MODEL = 10856 + 440 + 364, KEPT = 1536 + 256, DESK = 1100, BANK = 256;
   const banks = Math.floor((TOTAL - MODEL - KEPT - DESK) / BANK);              // 7
   const cache = banks * BANK, spare = TOTAL - MODEL - KEPT - DESK - cache;      // spare stays with the desktop
@@ -85,26 +87,21 @@ function governor(t) {
   const xDesk = xKept + wKept, TRIM = 5, shift = TRIM * pitch;                  // the desktop takes 5 banks: 1.25 GiB
   const barY = 54, barH = 66;
 
-  // Timeline, 12 s: the desktop jumps at 1.5 s, the governor trims all five banks at once 0.15 s later, the desktop
-  // lets go at 5.5 s, the cache waits for a calm 2 s and then grows back one bank every 0.4 s.
-  const T = 12, pc = (s) => `${((s / T) * 100).toFixed(3)}%`;
-  const jump = 1.5, trim = 1.65, letGo = 5.5, regrow = [7.5, 7.9, 8.3, 8.7, 9.1];
-  const deskKF = `0%,${pc(jump)}{transform:translateX(0)}${pc(jump + 0.1)},${pc(letGo)}{transform:translateX(-${shift.toFixed(1)}px)}${pc(letGo + 0.12)},100%{transform:translateX(0)}`;
-  let keptKF = `0%,${pc(trim)}{transform:translateX(0)}${pc(trim + 0.02)}{transform:translateX(-${shift.toFixed(1)}px)}`;
-  regrow.forEach((s, i) => {
-    keptKF += `${pc(s)}{transform:translateX(-${(shift - i * pitch).toFixed(1)}px)}${pc(s + 0.02)}{transform:translateX(-${(shift - (i + 1) * pitch).toFixed(1)}px)}`;
-  });
-  keptKF += `100%{transform:translateX(0)}`;
-  // While the desktop's jump eats into the free block (below the floor for those 0.15 s) the block narrows to what is left
-  // and its figures fade out, then come back once the trim has restored it.
-  const squeeze = ((xDesk - shift - xKept) / (wKept - 3)).toFixed(3);
-  const squeezeKF = `0%,${pc(jump)}{transform:scaleX(1)}${pc(jump + 0.1)},${pc(trim)}{transform:scaleX(${squeeze})}${pc(trim + 0.02)},100%{transform:scaleX(1)}`;
-  const figuresKF = `0%,${pc(jump)}{opacity:1}${pc(jump + 0.06)},${pc(trim + 0.02)}{opacity:0}${pc(trim + 0.2)},100%{opacity:1}`;
+  // The free VRAM is the desktop's room: an empty space outlined in the desktop's colour (dashed: empty, not a block), from
+  // the end of the expert cache to the desktop. Its left edge follows the cache; the desktop, drawn over it, grows into it.
+  // Timeline, 12 s: the desktop grows into its room at 1.5 s, the governor gives back five banks at 2 s and the room is
+  // whole again; the desktop lets go at 5.5 s (the room is wider than it has to be), the cache waits for a calm 2 s and
+  // grows back one bank every 0.4 s until the room is back to the floor plus the buffer.
+  const T = 12, pc = (s) => `${((s / T) * 100).toFixed(3)}%`, slide = 0.15;
+  const jump = 1.5, grown = 1.8, trim = 2.0, letGo = 5.5, regrow = [7.5, 7.9, 8.3, 8.7, 9.1];
+  const tx = (v) => `{transform:translateX(${v ? `-${v.toFixed(1)}px` : 0})}`;
+  const deskKF = `0%,${pc(jump)}${tx(0)}${pc(grown)},${pc(letGo)}${tx(shift)}${pc(letGo + 0.3)},100%${tx(0)}`;
+  let roomKF = `0%,${pc(trim)}${tx(0)}${pc(trim + slide)}${tx(shift)}`;
+  regrow.forEach((s, i) => { roomKF += `${pc(s)}${tx(shift - i * pitch)}${pc(s + slide)}${tx(shift - (i + 1) * pitch)}`; });
+  roomKF += `100%${tx(0)}`;
   let style = `.m{animation-duration:${T}s;animation-iteration-count:infinite;animation-timing-function:linear}
 .desk{animation-name:desk}@keyframes desk{${deskKF}}
-.kept{animation-name:kept}@keyframes kept{${keptKF}}
-.squeeze{transform-box:fill-box;transform-origin:0 50%;animation-name:squeeze}@keyframes squeeze{${squeezeKF}}
-.figures{animation-name:figures}@keyframes figures{${figuresKF}}`;
+.room{animation-name:room}@keyframes room{${roomKF}}`;
   let bankRects = "";
   for (let i = 0; i < banks; i++) {
     const x = xModel + i * pitch;
@@ -112,7 +109,7 @@ function governor(t) {
     let cls = "";
     if (k >= 0) {
       const back = regrow[k];
-      style += `\n.b${i}{animation-name:b${i}}@keyframes b${i}{0%,${pc(trim)}{opacity:1}${pc(trim + 0.02)},${pc(back)}{opacity:0}${pc(back + 0.02)},100%{opacity:1}}`;
+      style += `\n.b${i}{animation-name:b${i}}@keyframes b${i}{0%,${pc(trim)}{opacity:1}${pc(trim + slide)},${pc(back)}{opacity:0}${pc(back + slide)},100%{opacity:1}}`;
       cls = ` class="m b${i}"`;
     }
     // banks touch: the gap between two of them is the ground showing through, 3 px
@@ -120,25 +117,25 @@ function governor(t) {
   }
   style += `\n@media (prefers-reduced-motion: reduce){.m{animation:none}}`;
 
+  // the room's outline: top, left and bottom edges; its right side runs on under the desktop, which closes it
+  const sw = 2.5, top = barY + sw / 2, bottom = barY + barH - sw / 2, far = W + shift + 20;
+  const room = `<path class="m room" d="M ${far} ${top} H ${(xKept + sw / 2).toFixed(1)} V ${bottom} H ${far}" fill="none" ` +
+               `stroke="${t.room}" stroke-width="${sw}" stroke-dasharray="8 6"/>`;
   const lab = 21, mid = barY + barH / 2;
   const body = `<rect width="${W}" height="${H}" fill="${t.ground}"/>
+${text("To scale: one 16 GiB card, Tiel-Coder-35B-A3B at 32k context", { x: M, y: barY - 14, size: lab, fill: t.ink })}
 ${text("expert cache", { x: xModel, y: barY - 14, size: lab, fill: t.ink })}
 ${text("desktop", { x: W - M, y: barY - 14, size: lab, fill: t.ink, anchor: "end" })}
 <rect x="0" y="${barY}" width="${xModel.toFixed(1)}" height="${barH}" fill="${t.model}"/>
 ${text("Model weights, KV cache and compute: 11.4 GiB", { x: M, y: mid + 7.5, size: lab, fill: t.onModel })}
 ${bankRects}
-<g class="m kept">
-<rect class="m squeeze" x="${xKept.toFixed(1)}" y="${barY}" width="${(wKept - 3).toFixed(1)}" height="${barH}" fill="${t.kept}"/>
-<g class="m figures">
-${text("1.5 GiB", { x: xKept + 12, y: barY + 28, size: 19, weight: 600, fill: t.ink })}
-${text("+ 256 MiB", { x: xKept + 12, y: barY + 53, size: 19, weight: 600, fill: t.ink })}
-</g>
-${text("floor + buffer, kept free", { x: xKept + wKept - 3, y: barY + barH + 34, size: lab, fill: t.ink, anchor: "end" })}
-</g>
+${room}
 <rect class="m desk" x="${xDesk.toFixed(1)}" y="${barY}" width="${(W - xDesk + shift + 4).toFixed(1)}" height="${barH}" fill="${t.desk}"/>
-${text("To scale: one 16 GiB card, Tiel-Coder-35B-A3B at 32k context", { x: M, y: barY + barH + 34, size: lab, fill: t.ink })}`;
-  return { svg: svg(W, H, body, "The VRAM governor: when the desktop needs VRAM, the expert cache gives it back", style),
-           facts: { banks, cache, spare, xModel, xKept, xDesk, shift, pitch } };
+${text("free: the desktop takes it at once", { x: xDesk, y: barY + barH + 32, size: lab, fill: t.ink, anchor: "end" })}
+${text("1.5 GiB floor + 256 MiB buffer", { x: xDesk, y: barY + barH + 58, size: 18, fill: t.ink, anchor: "end" })}`;
+  return { svg: svg(W, H, body, "The VRAM governor: the desktop takes its free room at once, the expert cache gives the room back", style),
+           facts: { banks, cache, spare, xModel, xKept, xDesk, shift, pitch,
+                    scaleNoteEnd: M + measure("To scale: one 16 GiB card, Tiel-Coder-35B-A3B at 32k context", lab) } };
 }
 
 // ---- quiet -------------------------------------------------------------------------------------------------------
