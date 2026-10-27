@@ -48,11 +48,13 @@ jobs:
           build/bin/test-vram-governor
           build/bin/test-moe-cache-policy
 
-      - name: Interrupting llama_decode (small generated model)
+      - name: Interrupting llama_decode (small generated models, one with recurrent state)
         run: |
           mkdir -p models
           build/bin/test-llama-archs -a "^llama$" -o models
           build/bin/test-vram-abort models/llama-dense.gguf
+          build/bin/test-llama-archs -a "^qwen35moe$" -o models
+          build/bin/test-vram-abort models/qwen35moe-moe.gguf
 
   hip:
     runs-on: ubuntu-22.04
