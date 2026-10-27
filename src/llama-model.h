@@ -999,6 +999,7 @@ struct llama_model_base : public llama_model {
             int32_t & new_slots, size_t & released_bytes, size_t & allocated_bytes);
     bool moe_expert_cache_requires_serialization() const;
     void reset_moe_expert_cache_learning();
+    void set_moe_expert_cache_release_wait(void (*wait)(size_t, void *), void * data);   // VRAMLOGIC3
     // VRAMLOGIC1: current slot count, bytes of VRAM per slot across all cached layers, largest valid slot count
     bool moe_expert_cache_info(int32_t & slots, size_t & slot_bytes, int32_t & max_slots) const;
     bool moe_expert_cache_two_channel_enabled() const;

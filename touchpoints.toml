@@ -160,3 +160,21 @@ probe = "sched_async_cpu"
 feature = "qwen4exp"
 file = "conversion/base.py"
 probe = "mtp_shared_embd"
+
+[[hook]]
+feature = "vram-governor"
+file = "ggml/src/ggml-cuda/ggml-cuda.cu"
+probe = "ggml_backend_cuda_set_abort_callback"
+note = "VRAMLOGIC3: abort callback of the CUDA/HIP backend, checked every GGML_CUDA_ABORT_CHECK_NODES nodes of a large-batch node-by-node graph; GGML_CUDA_LOG_ALLOCS"
+
+[[hook]]
+feature = "vram-governor"
+file = "src/llama-context.cpp"
+probe = "first_ubatch"
+note = "VRAMLOGIC3: llama_decode checks the abort callback between ubatches"
+
+[[hook]]
+feature = "vram-governor"
+file = "src/llama-model.cpp"
+probe = "moe_cache_release_wait"
+note = "VRAMLOGIC3: a resize waits (hook) between releasing the old bank and allocating the new one"

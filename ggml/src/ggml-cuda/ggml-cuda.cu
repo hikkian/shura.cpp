@@ -187,6 +187,20 @@ static int ggml_cuda_op_offload_min_batch() {
     return min_batch;
 }
 
+// SHURA (VRAMLOGIC3): GGML_CUDA_LOG_ALLOCS=1 logs every device allocation and release of the buffers and the legacy pool with its
+// size and a timestamp, to find what briefly takes VRAM around an expert-cache resize (REBASE2V: free VRAM dips by the new bank's
+// size + ~75 MiB). Off by default: one getenv at the first call.
+static bool ggml_cuda_log_allocs() {
+    static const bool on = getenv("GGML_CUDA_LOG_ALLOCS") != nullptr;
+    return on;
+}
+
+static void ggml_cuda_log_alloc(const char * what, const void * ptr, size_t size) {
+    if (ggml_cuda_log_allocs()) {
+        GGML_LOG_INFO("cuda %s: %.1f MiB %p t=%.3f s\n", what, size / 1048576.0, ptr, ggml_time_us() / 1e6);
+    }
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -520,6 +534,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
+                ggml_cuda_log_alloc("pool release", b.ptr, b.size);
                 CUDA_CHECK(cudaFree(b.ptr));
                 pool_size -= b.size;
                 b.ptr  = nullptr;
@@ -599,6 +614,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             }
         }
         CUDA_CHECK(err);
+        ggml_cuda_log_alloc("pool alloc", ptr, look_ahead_size);
         *actual_size = look_ahead_size;
         ggml_cuda_pool_note_growth("legacy", device, look_ahead_size);
         pool_size += look_ahead_size;
@@ -620,6 +636,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
+        ggml_cuda_log_alloc("pool release (full)", ptr, size);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
         invalidate_cuda_graphs();
@@ -838,6 +855,7 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    ggml_cuda_log_alloc("buffer release", ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -993,6 +1011,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         return nullptr;
     }
 
+    ggml_cuda_log_alloc("buffer alloc", dev_ptr, size);
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
@@ -4876,8 +4895,36 @@ static void ggml_cuda_op_prof_flush(cudaStream_t stream, std::chrono::steady_clo
     P.next_ev = 0;
 }
 
+static int64_t get_op_batch_size(const ggml_tensor * op);
+
+// SHURA (VRAMLOGIC3): how often a node-by-node large-batch graph checks the abort callback (0 = never). Each check first waits
+// for the work queued so far: the host launches far ahead of the GPU, and a stop must neither take effect after the whole graph
+// nor leave queued kernels reading memory the caller frees after the stop. 64 nodes is ~1/25 of a prefill ubatch.
+static int ggml_cuda_abort_check_nodes() {
+    static const int n = [] {
+        const char * env = getenv("GGML_CUDA_ABORT_CHECK_NODES");
+        return env != nullptr ? std::max(0, atoi(env)) : 64;
+    }();
+    return n;
+}
+
+static bool ggml_cuda_graph_wants_abort_checks(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, bool use_cuda_graph) {
+    if (cuda_ctx->abort_callback == nullptr || use_cuda_graph || ggml_cuda_abort_check_nodes() == 0) {
+        return false;
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && get_op_batch_size(node) >= 32) {
+            return true;   // a prefill-sized batch: decode steps are too short to need it and must not pay the waits
+        }
+    }
+    return false;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
+    const bool abort_checks = ggml_cuda_graph_wants_abort_checks(cuda_ctx, cgraph, use_cuda_graph);
+    int last_abort_check = 0;
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4987,6 +5034,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (abort_checks && !is_concurrent_event_active && i - last_abort_check >= ggml_cuda_abort_check_nodes()) {
+                    last_abort_check = i;
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    if (cuda_ctx->abort_callback(cuda_ctx->abort_callback_data)) {
+                        cuda_ctx->aborted = true;   // nothing is queued past this node: the caller may free memory at once
+                        break;
+                    }
+                }
 #ifdef USE_CUDA_GRAPH
                 // fused nodes are skipped together, so a cut never splits a fusion
                 // a concurrent region must join before its capture can end
@@ -5200,13 +5255,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    cuda_ctx->aborted = false;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
     if (g_op_prof.on) {
         ggml_cuda_op_prof_flush(cuda_ctx->stream(), prof_t0);
     }
 
-    return GGML_STATUS_SUCCESS;
+    return cuda_ctx->aborted ? GGML_STATUS_ABORTED : GGML_STATUS_SUCCESS;
+}
+
+// SHURA (VRAMLOGIC3): the abort callback of this backend (see ggml_backend_cuda_context::abort_callback)
+static void ggml_backend_cuda_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->abort_callback      = abort_callback;
+    cuda_ctx->abort_callback_data = abort_callback_data;
 }
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -6561,6 +6624,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
+        return (void *)ggml_backend_cuda_set_abort_callback;
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;

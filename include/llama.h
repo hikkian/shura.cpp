@@ -624,6 +624,11 @@ extern "C" {
     // VRAMLOGIC1: expert cache geometry; false when the model has no expert cache rankings
     // VRAMLOGIC1: forget what the two-channel cache learned (called after the governor's warm-up)
     LLAMA_API void llama_model_moe_cache_reset_learning(const struct llama_model * model);
+    // VRAMLOGIC3: called by a resize between releasing the old cache bank and allocating the new one, with the bytes released.
+    // The driver may account freed VRAM back later than the free call returns; a caller that watches the card (the VRAM
+    // governor) can wait here until it does, so the old and the new bank never count at the same time. NULL = no wait.
+    LLAMA_API void llama_model_moe_cache_set_release_wait(const struct llama_model * model,
+            void (*wait)(size_t released_bytes, void * data), void * data);
     LLAMA_API bool llama_model_moe_cache_info(const struct llama_model * model,
             int32_t * slots, size_t * slot_bytes, int32_t * max_slots);
     LLAMA_API bool llama_model_get_moe_cache_stats(const struct llama_model * model,

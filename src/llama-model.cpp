@@ -1313,6 +1313,8 @@ struct llama_model::impl {
     std::map<int, llama_moe_cache_hybrid_policy> moe_cache_hybrid_layers;
     mutable std::mutex moe_cache_mutex;
     std::atomic<int> moe_cache_resize_waiters{0};
+    void (*moe_cache_release_wait)(size_t, void *) = nullptr;   // VRAMLOGIC3: see llama_model_moe_cache_set_release_wait
+    void * moe_cache_release_wait_data = nullptr;
     mutable std::mutex moe_cache_stats_mutex;
     llama_moe_cache_stats moe_cache_stats = {};
 
@@ -2795,6 +2797,12 @@ bool llama_model_base::moe_expert_cache_requires_serialization() const {
     return params.moe_cache_live_resize || pimpl->moe_cache_hybrid || pimpl->moe_cache_two_channel;
 }
 
+void llama_model_base::set_moe_expert_cache_release_wait(void (*wait)(size_t, void *), void * data) {
+    std::lock_guard<std::mutex> cache_lock(pimpl->moe_cache_mutex);
+    pimpl->moe_cache_release_wait = wait;
+    pimpl->moe_cache_release_wait_data = data;
+}
+
 void llama_model_base::reset_moe_expert_cache_learning() {
     std::lock_guard<std::mutex> cache_lock(pimpl->moe_cache_mutex);
     for (auto & [il, runtime] : pimpl->moe_channels) {
@@ -3474,6 +3482,11 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
             }
         }
         old_bundle.second.clear();
+        if (pimpl->moe_cache_release_wait != nullptr) {
+            // VRAMLOGIC3: REBASE2V saw old + new bank on the card at once (free VRAM down by the smaller bank + ~74 MiB for
+            // a few samples) although the old buffer is freed first: the release becomes visible later than the free returns
+            pimpl->moe_cache_release_wait(old_buffer_bytes, pimpl->moe_cache_release_wait_data);
+        }
 
         buf = try_allocate(ctx.get());
         if (buf == nullptr) {
@@ -4625,6 +4638,13 @@ bool llama_model_moe_cache_resize(const llama_model * model, int32_t n_slots,
     if (released_bytes) { *released_bytes = freed; }
     if (allocated_bytes) { *allocated_bytes = used; }
     return ok;
+}
+
+void llama_model_moe_cache_set_release_wait(const llama_model * model, void (*wait)(size_t, void *), void * data) {
+    auto * base = model ? dynamic_cast<llama_model_base *>(const_cast<llama_model *>(model)) : nullptr;
+    if (base != nullptr) {
+        base->set_moe_expert_cache_release_wait(wait, data);
+    }
 }
 
 void llama_model_moe_cache_reset_learning(const llama_model * model) {

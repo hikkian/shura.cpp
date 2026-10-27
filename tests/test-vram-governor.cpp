@@ -328,6 +328,36 @@ int main() {
         off.desk_mib = 12282 - 1300;
         for (int i = 0; i < 100; i++) { CHECK(off.tick(0.05).kind != vram_action_kind::PAUSE); }
     }
+    // 19. VRAMLOGIC3: the buffer changes at run time through the policy (the gateway: 256 on a quiet desk, 512 while it is active).
+    //     Raising it trims to the new target on the next poll; lowering it lets the cache grow back after the calm period.
+    {
+        // hysteresis 128 here: with the default 256 the quiet steady state (target + hysteresis = 2048) already equals the active
+        // target, so the raise only stops growth and moves the trim threshold; the immediate trim shows with a smaller hysteresis
+        sim s = make(7000, 256); s.gov.policy.grow_seconds = 10; s.gov.policy.hysteresis_mib = 128; s.tick();
+        const int32_t quiet = s.g.chunks;
+        CHECK(s.free_mib() >= 1536 + 256 + 128 && s.free_mib() < 1536 + 256 + 128 + 52);
+        s.gov.policy.buffer_mib = 512;                          // the desk became active
+        vram_action a = s.tick();
+        CHECK(a.kind == vram_action_kind::SET_CHUNKS && !a.urgent);
+        CHECK(s.free_mib() >= 2048 && s.g.chunks < quiet);      // the new target at once; the floor was never near
+        const int32_t active = s.g.chunks;
+        for (int i = 0; i < 20; i++) { CHECK(s.tick().kind == vram_action_kind::NONE); }   // held, no flapping
+        s.gov.policy.buffer_mib = 256;                          // quiet again (the calm period counts from the trim, 4 s ago)
+        for (int i = 0; i < 20; i++) { s.tick(); }               // 8 s since the trim < grow_seconds 10: still the active size
+        CHECK(s.g.chunks == active);
+        for (int i = 0; i < 20; i++) { s.tick(); }               // past the calm period: grown back to the quiet size
+        CHECK(s.g.chunks == quiet);
+        CHECK(s.gov.below_reserve_events == 0 && s.gov.pauses == 0);
+    }
+    // 19b. with the default hysteresis the raise trims nothing at once but stops growth: a later burst is trimmed to the new target
+    {
+        sim s = make(7000, 256); s.tick(); const int32_t quiet = s.g.chunks;
+        s.gov.policy.buffer_mib = 512;
+        for (int i = 0; i < 5; i++) { CHECK(s.tick().kind == vram_action_kind::NONE); }
+        s.desk_mib += 300;                                      // a burst: free ~1748 < 2048
+        vram_action a = s.tick();
+        CHECK(a.kind == vram_action_kind::SET_CHUNKS && !a.urgent && s.free_mib() >= 2048 && s.g.chunks < quiet);
+    }
     printf("test-vram-governor: all passed\n");
     return 0;
 }

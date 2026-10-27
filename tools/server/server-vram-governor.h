@@ -23,7 +23,8 @@
 
 struct vram_policy {
     int32_t reserve_mib     = 1536;  // the floor: free VRAM is never meant to go below it
-    int32_t buffer_mib      = 512;   // VRAMLOGIC2: working target = reserve + buffer; trimming starts below the target
+    int32_t buffer_mib      = 256;   // VRAMLOGIC2: working target = reserve + buffer; trimming starts below the target
+                                     // (VRAMLOGIC3: 256 base; the gateway raises it to 512 while the desk is active)
     int32_t hysteresis_mib  = 256;
     int32_t grow_seconds    = 30;
     int32_t pause_floor_mib = 768;

@@ -122,6 +122,7 @@ void server_vram::start() {
         if (host_limit_ && host_pinned_max_mib_ > 0) { host_limit_((uint64_t) host_pinned_max_mib_ * 1024 * 1024); }
         break;
     }
+    llama_model_moe_cache_set_release_wait(model_, &server_vram::release_wait_cb, this);   // VRAMLOGIC3
     thread_ = std::thread([this] { loop(); });
     if (warmup_enabled_) {
         warm_thread_ = std::thread([this] { warmup(); });
@@ -189,6 +190,7 @@ void server_vram::stop() {
     stop_.store(true);
     if (warm_thread_.joinable()) { warm_thread_.join(); }
     if (thread_.joinable()) { thread_.join(); }
+    llama_model_moe_cache_set_release_wait(model_, nullptr, nullptr);   // VRAMLOGIC3: no hook into a governor that is gone
 }
 
 void server_vram::refresh_geometry(vram_cache_geometry & g) {
@@ -249,17 +251,45 @@ bool server_vram::apply_chunks(int32_t chunks, const std::string & why, double n
     // again before the retry can start computing, because the retry waits for this very lock.
     const bool interrupt = urgent && chunks < before && core_.policy.trim_abort;
     if (interrupt) { abort_wanted_.store(true, std::memory_order_relaxed); }
+    {
+        int32_t f = 0, t = 0, u = 0;
+        release_baseline_free_ = read_card(f, t, u) ? f : -1;   // VRAMLOGIC3: wait_released() measures against this
+        last_release_wait_ms_ = 0;
+        last_release_seen_mib_ = 0;
+    }
     const bool ok = llama_model_moe_cache_resize(model_, slots, &old_slots, &new_slots, &released, &allocated);
+    release_baseline_free_ = -1;
     if (interrupt) { abort_wanted_.store(false, std::memory_order_relaxed); }
     const double ms = (mono_s() - t0) * 1000.0;
     last_resize_ms_ = (uint64_t) ms;
     refresh_geometry(geom_);
-    LOG_INF("vram governor: cache %d -> %d chunks (%d -> %d slots, %s%s) in %.0f ms, free %d MiB%s\n",
-            before, geom_.chunks, old_slots, new_slots, why.c_str(), interrupt ? ", urgent" : "", ms, last_free_mib_, ok ? "" : " [resize failed]");
+    LOG_INF("vram governor: cache %d -> %d chunks (%d -> %d slots, %s%s) in %.0f ms, free %d MiB%s; old bank showed %d MiB back after %.0f ms\n",
+            before, geom_.chunks, old_slots, new_slots, why.c_str(), interrupt ? ", urgent" : "", ms, last_free_mib_, ok ? "" : " [resize failed]",
+            last_release_seen_mib_, last_release_wait_ms_);
     if (!ok) {
         core_.reset_calm(now_s);
     }
     return ok;
+}
+
+void server_vram::wait_released(size_t released_bytes) {
+    // the old bank is freed; the card may count it a little later (the driver's delayed release). Wait until free VRAM rose by
+    // most of it, so that the new bank is never allocated on top of the old one. A desk that takes VRAM at the same moment can
+    // keep the rise short: the wait is bounded and the resize goes on.
+    const int32_t baseline = release_baseline_free_.load();
+    if (baseline < 0 || released_bytes == 0) { return; }
+    const int32_t want = (int32_t) (released_bytes / (1024 * 1024) * 8 / 10);
+    const double t0 = mono_s();
+    int32_t f = 0, t = 0, u = 0;
+    while (true) {
+        if (read_card(f, t, u)) {
+            last_release_seen_mib_ = f - baseline;
+            if (last_release_seen_mib_ >= want) { break; }
+        }
+        if ((mono_s() - t0) * 1000.0 >= release_wait_ms_) { break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    last_release_wait_ms_ = (mono_s() - t0) * 1000.0;
 }
 
 void server_vram::loop() {
@@ -323,6 +353,8 @@ bool server_vram::request_pause(const std::string & reason, const std::string & 
         }
     }
     pause_cb_(reason, checkpoint.empty() ? "vram-pause.bin" : checkpoint);
+    // VRAMLOGIC3: only now (the task is in the queue, at its front): a running prefill slice may stop, and the queue runs the pause next
+    pause_pending_.store(true);
     return true;
 }
 
@@ -513,7 +545,8 @@ server_vram::json server_vram::status() {
         {"cache", {{"enabled", geom_.chunks > 0}, {"chunk_slots", geom_.chunk_slots}, {"chunk_mib", geom_.chunk_mib},
                    {"chunks", geom_.chunks}, {"slots", geom_.chunks * geom_.chunk_slots}, {"mib", cache_mib},
                    {"target_chunks", geom_.chunks}, {"max_chunks", core_.policy.max_chunks < 0 ? json(nullptr) : json(core_.policy.max_chunks)},
-                   {"last_resize_ms", last_resize_ms_}, {"ubatch_interrupts", ubatch_interrupts_.load()}}},
+                   {"last_resize_ms", last_resize_ms_}, {"ubatch_interrupts", ubatch_interrupts_.load()}, {"pause_cuts", pause_cuts_.load()},
+                   {"last_release_wait_ms", std::round(last_release_wait_ms_)}, {"last_release_seen_mib", last_release_seen_mib_}}},
         {"policy", policy_locked()},
         {"journal", {{"last_id", core_.journal.last_id()}, {"yields", core_.journal.totals.yields}, {"yielded_mib", core_.journal.totals.yielded_mib},
                      {"recovered_max_s", std::round(core_.journal.totals.recovered_max_s * 100.0) / 100.0}}},

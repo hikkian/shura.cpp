@@ -2849,7 +2849,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--vram-buffer-mib"}, "N",
-        string_format("working buffer above the reserve, MiB: the cache is trimmed as soon as free VRAM drops below reserve + buffer, so a desk burst up to the buffer never reaches the reserve (default: %d)", 512),
+        string_format("working buffer above the reserve, MiB: the cache is trimmed as soon as free VRAM drops below reserve + buffer, so a desk burst up to the buffer never reaches the reserve (default: %d)", 256),
         [](common_params & params, int value) { params.vram_buffer_mib = value; }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(

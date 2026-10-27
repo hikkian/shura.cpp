@@ -3300,6 +3300,9 @@ private:
                                     {"tokens", slot.prompt.tokens.get_text_tokens()},
                                     {"multimodal", slot.prompt.tokens.size() != slot.prompt.tokens.get_text_tokens().size()},
                                     {"processing", slot.is_processing()},
+                                    // VRAMLOGIC3: false when the pause came before the whole prompt was read; then `tokens` is only
+                                    // a prefix of the prompt and a resume must read the prompt from the request again
+                                    {"prompt_done", !slot.is_processing() || slot.state == SLOT_STATE_DONE_PROMPT || slot.state == SLOT_STATE_GENERATING},
                                     {"generated_tokens", (int64_t) slot.stats.n_gen},
                                 };
                                 if (slot.is_processing() && slot.task) {
@@ -3757,6 +3760,10 @@ private:
 
                 batch.render(off, n_tokens);
                 bool ok = decode(n_batch, off);
+                if (pause_cut_) {
+                    pause_cut_ = false;
+                    return;   // VRAMLOGIC3: the pause task runs next; nothing of this batch is left to process
+                }
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -4776,6 +4783,41 @@ private:
     }
 
     int32_t vram_retries_ = 0;   // VRAMLOGIC2: interrupted-and-retried slices in a row (bounded)
+    bool    pause_cut_ = false;  // VRAMLOGIC3: decode() rolled the batch back for a pause; update_slots returns at once
+
+    // VRAMLOGIC3: for a pause, drop the batch entries from `off` on: their positions leave the memory (target and draft), and the
+    // tokens the batch fill already appended to each slot's list are taken off again (one list entry per batch entry), with the
+    // context checkpoints that lie beyond. A multimodal slot keeps its list (its pause cannot be continued exactly anyway).
+    void rewind_for_pause(int32_t off) {
+        std::map<int32_t, std::pair<llama_pos, int32_t>> per_slot;   // id_slot -> (first position, entries)
+        for (int32_t i = off; i < batch.size(); ++i) {
+            const auto & t = batch.tokens[i];
+            auto it = per_slot.find(t.id_slot);
+            if (it == per_slot.end()) {
+                per_slot[t.id_slot] = {t.pos[0], 1};
+            } else {
+                it->second.first = std::min(it->second.first, t.pos[0]);
+                it->second.second++;
+            }
+        }
+        for (const auto & [id_slot, info] : per_slot) {
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, info.first, -1);
+            if (ctx_dft != nullptr && ctx_dft != ctx_tgt) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, info.first, -1);
+            }
+            for (auto & slot : slots) {
+                if (slot.id != id_slot) { continue; }
+                const size_t n = slot.prompt.tokens.size();
+                const bool text_only = slot.prompt.tokens.get_text_tokens().size() == n;
+                if (text_only && (size_t) info.second <= n) {
+                    slot.prompt.tokens.keep_first(n - info.second);
+                    const int64_t keep = (int64_t) slot.prompt.tokens.size();
+                    slot.prompt.checkpoints.remove_if([keep](const common_prompt_checkpoint & c) { return c.n_tokens > keep; });
+                }
+            }
+        }
+        batch.truncate(off);
+    }
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
@@ -4806,9 +4848,12 @@ private:
         }
 
         bool has_output = false;
+        bool prompt_only = true;
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+            prompt_only &= batch.tokens[i].is_prompt;
         }
+        if (vram) { vram->set_prefill_in_flight(prompt_only); }   // VRAMLOGIC3: a pause may cut only a prompt slice
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
@@ -4839,6 +4884,16 @@ private:
                     err = "Compute error.";
                 }
 
+                if (ret == 2 && vram && vram->pause_pending()) {
+                    // VRAMLOGIC3: the governor asked for a pause while a prompt slice ran. Do not retry: roll back the rest of the
+                    // batch (memory and the slots' token lists, which already hold its tokens), leave update_slots, and let the
+                    // queue run the pause task next (it is at the front). The checkpoint then holds exactly what was processed.
+                    rewind_for_pause(off);
+                    vram->note_pause_cut();
+                    pause_cut_ = true;
+                    SRV_WRN("decode cut short for a VRAM pause: the rest of the batch from off = %d is rolled back\n", off);
+                    return false;
+                }
                 if (ret == 2 && vram && ++vram_retries_ <= 8) {
                     // VRAMLOGIC2: the VRAM governor interrupted this ubatch for an urgent cache trim (nothing else sets the
                     // abort callback). llama_decode removed the aborted ubatch from the memory; the earlier ubatches of this
@@ -4947,6 +5002,7 @@ private:
                 }
             }
         });
+        if (vram) { vram->set_prefill_in_flight(false); }
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
@@ -5522,7 +5578,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             for (int64_t i = n_past - n_gen; i < n_past; i++) {
                 resume_base_text += common_token_to_piece(ctx_server.vocab, toks[i], params.special || keep.count(toks[i]) > 0);
             }
-            inputs[0] = server_tokens(toks, ctx_server.mctx != nullptr);
+            if (side.value("prompt_done", true)) {
+                inputs[0] = server_tokens(toks, ctx_server.mctx != nullptr);
+            } else {
+                // VRAMLOGIC3: the pause came while the prompt was still being read (nothing was generated): the tokens are a
+                // prefix only. Keep the request's own prompt; the restored slot holds that prefix, so it is not read twice.
+                resume_base_text.clear();
+                SRV_INF("resume: the pause came after %lld of the prompt's tokens; the prompt is read from the request, the restored prefix is reused\n",
+                        (long long) n_past);
+            }
             resume_n_predict_left = side.value("n_predict_left", (int64_t) -1);
             if (data["resume"].contains("tool_call_ids") && data["resume"]["tool_call_ids"].is_array()) {
                 for (const auto & id : data["resume"]["tool_call_ids"]) { resume_tool_call_ids.push_back(id.get<std::string>()); }
