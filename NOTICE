@@ -1,0 +1,25 @@
+shura.cpp: sources and licenses
+
+shura.cpp is released under the MIT License. It combines code from these sources, all under the MIT License:
+
+1. llama.cpp (https://github.com/ggml-org/llama.cpp)
+   Copyright (c) 2023-2026 The ggml authors. The upstream LICENSE and AUTHORS files are kept unchanged. The `upstream` branch is
+   ggml-org/llama.cpp master; the `shura` branch is rebased on it (currently upstream commit 74bca3950).
+
+2. thecodacus/llama.cpp, branch `perf` (https://github.com/thecodacus/llama.cpp), by Anirban Kar
+   The starting point of this fork: a snapshot taken on 2026-09-03 (upstream commit 42f0225fe at the time). From it come the
+   MoE expert cache in VRAM (hot expert packs, static placement), the scheduler's expert prefetch and CPU worker, pinning of the
+   CPU experts, tools/moe-trace and the qwen4exp conversion support.
+
+3. TheTom/llama-cpp-turboquant, branch `feature/turboquant-kv-cache` (https://github.com/TheTom/llama-cpp-turboquant)
+   The TurboQuant KV cache types (after arXiv 2504.19874), their CUDA and HIP flash-attention kernels and the rotation data,
+   which came into the snapshot in (2).
+
+4. Changes written for Shura, Copyright (c) 2026 hikkian
+   The VRAM governor and its endpoints, pause with a checkpoint and resume, live resize of the expert cache with a
+   rollback-safe release, the bounded LRU, hybrid and two-channel cache policies, the loader options (direct I/O, page-cache
+   drop, pinned memory limit), the CUDA/HIP kernels and fixes listed in docs/SHURA.md, and the tests for them.
+
+The parts from (2) and (3) were moved onto a current upstream as commits of this branch, so the git history of this repository
+does not show their authors; this file, README.md and docs/SHURA.md do. Model weights are not part of this repository and are
+covered by their own licenses.

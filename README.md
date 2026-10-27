@@ -21,18 +21,21 @@ needs it.
 
 ## Built on
 
-shura.cpp started from **[thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp)**, the MoE performance fork by
-**Anirban Kar**. The ideas and the first implementations of these parts are his:
+shura.cpp started from a snapshot of **[thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp)** (branch `perf`,
+2026-09-03), the MoE performance fork by **Anirban Kar**. The ideas and the first implementations of these parts are his:
 
 * the **expert cache**: the most-routed experts of each layer kept in VRAM as packs, the rest computed from RAM and the
-  two halves merged exactly (static and LRU placement);
+  two halves merged exactly;
 * **expert prefetch** in the scheduler during large batches and CPU splits on a worker thread;
 * **pinning** the memory-mapped CPU experts so uploads go over DMA;
-* the **TurboQuant KV cache types** `TURBO2_0`, `TURBO3_0`, `TURBO4_0` (after arXiv
-  [2504.19874](https://arxiv.org/abs/2504.19874)) with their CUDA/HIP flash-attention paths;
 * the routing-trace recorder `tools/moe-trace` and the qwen4exp conversion support.
 
-We moved them onto a current upstream, fixed what broke and built the rest on top. Thank you, Anirban.
+The **TurboQuant KV cache types** (after arXiv [2504.19874](https://arxiv.org/abs/2504.19874)) with their CUDA/HIP
+flash-attention kernels and rotation data came into that base from **[TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)**
+(branch `feature/turboquant-kv-cache`).
+
+We moved all of it onto a current upstream, fixed what broke and built the rest on top. Thank you, Anirban and Tom.
+Every source and its license is listed in [NOTICE](NOTICE).
 
 ## What this fork adds
 
@@ -41,7 +44,7 @@ We moved them onto a current upstream, fixed what broke and built the rest on to
 | **VRAM governor** | A thread inside `llama-server` keeps free VRAM above a floor (1.5 GiB) plus a working buffer (256 MiB, 512 while the desktop is busy). When free VRAM drops below that, it gives the whole deficit back in one cache resize; under pressure it polls every 50 ms. A resize waits until the card really shows the old bank released before allocating the new one, so the two never count at once. Endpoints `GET /vram`, `POST /vram/policy`, `POST /vram/pause`, `GET /vram/journal`. | [docs/SHURA.md](docs/SHURA.md), "VRAM governor" |
 | **Stopping a long prefill** | An urgent trim, or a pause, interrupts the running prefill step: the CUDA/HIP backend checks the abort callback in large batches (upstream checks it only on the CPU backend), `llama_decode` checks it between micro-batches, and the server rolls the interrupted part back and runs it again. The check keeps the GPU queue full; its cost is within the noise. | "VRAM governor" |
 | **Pause with a checkpoint, and resume** | When the desktop needs more than the cache can give back, the server saves the slot, tells the client, and exits with code 75. The client (Shura's gateway) restarts it in a lighter layout, restores the slot and **continues the same answer** with `resume` in the chat request; a pause in the middle of a prompt continues from the prompt. | "VRAM governor" |
-| **Elastic expert cache** | Live resize over HTTP, hybrid and two-channel placement policies, a pinned source for the cold experts. | feature 6 |
+| **Elastic expert cache** | Live resize over HTTP with a rollback-safe release, a bounded LRU policy, hybrid and two-channel placement policies, a pinned source for the cold experts. | feature 6 |
 | **Loading that does not evict your browser** | `--load-mode dio` reads the weights without going through the page cache, drops the file pages after pinning the CPU experts, and caps pinned host memory. | feature 4 |
 | **Kernels for one consumer GPU** | GQA-vectorised flash-attention decode, faster `MUL_MAT_ID` prefill, an optional ADD+RMS_NORM+MUL fusion, a per-op profiler and failure diagnostics. CUDA and HIP. | feature 7 |
 | **Page-fault hunt** | A GPU page fault on long, growing sessions was traced to an out-of-bounds read in the q8_1 padding of the MoE matmul (`MUL_MAT_ID` ids path). Upstream has since rewritten that code; this fork carries upstream's version and keeps the reproducer in its tests. | "Where we use upstream's version" |
@@ -140,5 +143,7 @@ to a newer upstream, with the things that broke on previous rebases, is [docs/SH
 ## License
 
 MIT, like llama.cpp. The upstream [LICENSE](LICENSE) and [AUTHORS](AUTHORS) are kept unchanged. The parts that come
-from [thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp) are © Anirban Kar, the rest of this fork's changes
-© 2026 hikkian, all under the same MIT license. Model weights are not included and are covered by their own licenses.
+from [thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp) are © Anirban Kar, the TurboQuant parts from
+[TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) © their author, the rest of this fork's
+changes © 2026 hikkian, all under the same MIT license; see [NOTICE](NOTICE). Model weights are not included and are
+covered by their own licenses.
