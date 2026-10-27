@@ -59,13 +59,14 @@ public:
     // the server retries the interrupted slice (llama_decode removed its positions from the memory).
     // VRAMLOGIC3: a pending pause stops a running prefill slice too (the server then rolls the slice back, saves and exits); a decode
     // step is short and is never cut for a pause, because its sampled token may already be on its way to the client.
-    // ABORTFIX1: never on a model with recurrent state (hybrid or recurrent memory, e.g. Qwen3.5): its state cannot be taken
-    // back to the start of an interrupted slice, so the retry failed ("Invalid input batch", HTTP 500). There a trim waits for
-    // the end of the slice and a pause for the end of the prompt slice, as before VRAMLOGIC2.
+    // ABORTFIX1: on a model with recurrent state (hybrid or recurrent memory, e.g. Qwen3.5) the positions of an interrupted
+    // slice cannot simply be removed: the recurrent state already holds the later tokens, and a retry from the start of the slice
+    // failed ("Invalid input batch", HTTP 500). There the server snapshots the recurrent part before each prompt slice and
+    // restores it on a rollback; a slice without that snapshot (a decode step, a mixed batch) is never interrupted.
     static bool abort_callback(void * data) {
         if (data == nullptr) { return false; }
         const auto * v = static_cast<server_vram *>(data);
-        if (!v->rollback_safe_) { return false; }
+        if (v->recurrent_ && !v->slice_snapshot_.load(std::memory_order_relaxed)) { return false; }
         return v->abort_wanted_.load(std::memory_order_relaxed) ||
                (v->pause_pending_.load(std::memory_order_relaxed) && v->prefill_in_flight_.load(std::memory_order_relaxed));
     }
@@ -74,6 +75,11 @@ public:
     bool pause_pending() const { return pause_pending_.load(); }
     void set_prefill_in_flight(bool on) { prefill_in_flight_.store(on, std::memory_order_relaxed); }
     void note_pause_cut() { ++pause_cuts_; }
+    // ABORTFIX1: the model keeps recurrent state; the server then snapshots each prompt slice and says so for the running one
+    bool recurrent_state() const { return recurrent_; }
+    void set_slice_snapshot(bool on) { slice_snapshot_.store(on, std::memory_order_relaxed); }
+    void note_snapshot(double ms, size_t bytes) { ++snapshots_; snapshot_us_ += (uint64_t) (ms * 1000.0); snapshot_bytes_ = bytes; }
+    void note_rollback_failed() { ++rollback_failures_; }
 
 private:
     void loop();
@@ -132,7 +138,12 @@ private:
     std::atomic<uint64_t> pool_overflow_{0};
     std::function<void(const std::string &, const std::string &)> pause_cb_;
     std::atomic<bool> pause_requested_{false};
-    bool rollback_safe_ = true;                    // ABORTFIX1: false for hybrid or recurrent memory (no interrupts there)
+    bool recurrent_ = false;                       // ABORTFIX1: hybrid or recurrent memory (snapshot before an interruptible slice)
+    std::atomic<bool> slice_snapshot_{false};      // ABORTFIX1: the running prompt slice has its snapshot (it may be interrupted)
+    std::atomic<uint64_t> snapshots_{0};           // ABORTFIX1: snapshots taken, their total time and the size of the last
+    std::atomic<uint64_t> snapshot_us_{0};
+    std::atomic<uint64_t> snapshot_bytes_{0};
+    std::atomic<uint64_t> rollback_failures_{0};   // ABORTFIX1: a snapshot could not be restored (the request then fails)
     std::atomic<bool> abort_wanted_{false};        // VRAMLOGIC2: set while an urgent trim waits for the cache lock
     std::atomic<bool> pause_pending_{false};       // VRAMLOGIC3: a pause task is posted and has not run yet
     std::atomic<bool> prefill_in_flight_{false};   // VRAMLOGIC3: the running llama_process is a prompt-only slice

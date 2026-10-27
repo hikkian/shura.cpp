@@ -57,7 +57,7 @@ static std::string find_card_dir() {
 server_vram::server_vram(const common_params & params, const llama_model * model, std::function<bool()> busy,
         std::function<fixed_parts()> fixed)
     : model_(model), busy_(std::move(busy)), fixed_cb_(std::move(fixed)) {
-    rollback_safe_ = model == nullptr || !(llama_model_is_recurrent(model) || llama_model_is_hybrid(model));
+    recurrent_ = model != nullptr && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model));
     host_ = params.hostnames.empty() ? "127.0.0.1" : params.hostnames[0];
     port_ = params.port;
     n_ubatch_ = params.n_ubatch;
@@ -104,8 +104,8 @@ server_vram::server_vram(const common_params & params, const llama_model * model
         LOG_INF("vram governor: card %d MiB, reserve %d MiB, hysteresis %d MiB, chunk %d slots = %d MiB, up to %d chunks\n",
                 card_total_mib_, core_.policy.reserve_mib, core_.policy.hysteresis_mib, chunk_slots_,
                 geom_.chunk_mib, geom_.max_chunks);
-        if (!rollback_safe_) {
-            LOG_INF("vram governor: the model keeps recurrent state; a trim or a pause waits for the end of the running slice\n");
+        if (recurrent_) {
+            LOG_INF("vram governor: the model keeps recurrent state; prompt slices are snapshotted so an interrupt can roll them back\n");
         }
     }
 }
@@ -253,7 +253,7 @@ bool server_vram::apply_chunks(int32_t chunks, const std::string & why, double n
     // already below the floor) raises the abort flag: the ubatch stops at its next graph node (CPU splits check the callback
     // per node), the lock is handed to the waiting resize, and the server retries that slice afterwards. The flag is down
     // again before the retry can start computing, because the retry waits for this very lock.
-    const bool interrupt = urgent && chunks < before && core_.policy.trim_abort && rollback_safe_;
+    const bool interrupt = urgent && chunks < before && core_.policy.trim_abort;
     if (interrupt) { abort_wanted_.store(true, std::memory_order_relaxed); }
     {
         int32_t f = 0, t = 0, u = 0;
@@ -549,7 +549,9 @@ server_vram::json server_vram::status() {
         {"cache", {{"enabled", geom_.chunks > 0}, {"chunk_slots", geom_.chunk_slots}, {"chunk_mib", geom_.chunk_mib},
                    {"chunks", geom_.chunks}, {"slots", geom_.chunks * geom_.chunk_slots}, {"mib", cache_mib},
                    {"target_chunks", geom_.chunks}, {"max_chunks", core_.policy.max_chunks < 0 ? json(nullptr) : json(core_.policy.max_chunks)},
-                   {"last_resize_ms", last_resize_ms_}, {"ubatch_interrupts", ubatch_interrupts_.load()}, {"interrupts", rollback_safe_ ? "on" : "off_recurrent_state"}, {"pause_cuts", pause_cuts_.load()},
+                   {"last_resize_ms", last_resize_ms_}, {"ubatch_interrupts", ubatch_interrupts_.load()}, {"recurrent_state", recurrent_}, {"slice_snapshots", snapshots_.load()},
+                   {"slice_snapshot_ms", snapshots_.load() ? (double) snapshot_us_.load() / 1000.0 / (double) snapshots_.load() : 0.0},
+                   {"slice_snapshot_mib", (double) snapshot_bytes_.load() / 1048576.0}, {"rollback_failures", rollback_failures_.load()}, {"pause_cuts", pause_cuts_.load()},
                    {"last_release_wait_ms", std::round(last_release_wait_ms_)}, {"last_release_seen_mib", last_release_seen_mib_}}},
         {"policy", policy_locked()},
         {"journal", {{"last_id", core_.journal.last_id()}, {"yields", core_.journal.totals.yields}, {"yielded_mib", core_.journal.totals.yielded_mib},

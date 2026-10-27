@@ -1,7 +1,10 @@
 // VRAMLOGIC3: llama_decode stops for the abort callback inside a ubatch (CPU nodes) and between ubatches; the memory holds
 // exactly the ubatches that finished, and the same batch decoded again gives the same logits as a clean run.
+// ABORTFIX1: with a model that keeps recurrent state (hybrid or recurrent memory) the positions of an interrupted slice cannot
+// be removed; the rollback restores a snapshot of the recurrent part taken before the slice, as the server does.
 // Needs a small model: build test-llama-archs and save one, e.g.
 //     test-llama-archs -a llama -o /tmp/models && test-vram-abort /tmp/models/llama-dense.gguf
+//     test-llama-archs -a qwen35moe -o /tmp/models && test-vram-abort /tmp/models/<the qwen35moe file>
 #include "llama.h"
 
 #include <atomic>
@@ -21,11 +24,11 @@ static bool abort_cb(void *) {
     return after >= 0 && n >= after;
 }
 
-static llama_batch make_batch(int n_tokens, int n_vocab) {
+static llama_batch make_batch(int n_tokens, int n_vocab, int p0 = 0) {
     llama_batch b = llama_batch_init(n_tokens, 0, 1);
     for (int i = 0; i < n_tokens; i++) {
-        b.token[i] = (llama_token) ((i * 7919 + 13) % n_vocab);
-        b.pos[i] = i;
+        b.token[i] = (llama_token) (((p0 + i) * 7919 + 13) % n_vocab);
+        b.pos[i] = p0 + i;
         b.n_seq_id[i] = 1;
         b.seq_id[i][0] = 0;
         b.logits[i] = i == n_tokens - 1;
@@ -98,6 +101,70 @@ int main(int argc, char ** argv) {
     printf("max |logit difference| after the stops and the retry: %g\n", max_diff);
     CHECK(max_diff < 1e-4);
     CHECK(llama_memory_seq_pos_max(mem, 0) == n_tokens - 1);
+
+    // D. ABORTFIX1, models with recurrent state: a first slice, then a second slice stopped inside its second ubatch. Removing
+    //    the second slice's positions is refused (the recurrent state already holds them; the server's retry then failed with
+    //    "Invalid input batch"). Restoring the snapshot taken before the slice, then removing the attention positions from the
+    //    slice's start, takes the memory back exactly: the slice decoded again gives the logits of a clean run.
+    const bool recurrent = llama_model_is_hybrid(model) || llama_model_is_recurrent(model);
+    printf("memory with recurrent state: %s\n", recurrent ? "yes" : "no");
+    if (recurrent) {
+        const int n1 = 64, n2 = 96;
+        llama_batch s1 = make_batch(n1, n_vocab, 0), s2 = make_batch(n2, n_vocab, n1);
+        llama_memory_seq_rm(mem, 0, -1, -1);
+        g_calls = 0; g_fire_after = -1;
+        CHECK(llama_decode(ctx, s1) == 0);
+        CHECK(llama_decode(ctx, s2) == 0);
+        const std::vector<float> ref2 = last_logits(ctx, n_vocab);
+
+        llama_memory_seq_rm(mem, 0, -1, -1);
+        CHECK(llama_decode(ctx, s1) == 0);
+        const size_t snap_size = llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        std::vector<uint8_t> snap(snap_size);
+        CHECK(llama_state_seq_get_data_ext(ctx, snap.data(), snap_size, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap_size);
+        printf("snapshot of the recurrent part: %zu bytes\n", snap_size);
+
+        g_calls = 0; g_fire_after = per_ubatch + per_ubatch / 2;           // inside the second ubatch of the slice
+        CHECK(llama_decode(ctx, s2) == 2);
+        printf("after the stop: pos_max = %d\n", (int) llama_memory_seq_pos_max(mem, 0));
+        const bool plain_rm = llama_memory_seq_rm(mem, 0, n1, -1);
+        printf("removing the slice's positions without the snapshot: %s\n", plain_rm ? "accepted" : "refused");
+        g_calls = 0; g_fire_after = -1;
+        if (plain_rm) {
+            // if a memory accepts it, the plain removal must leave a memory that decodes the slice exactly
+            CHECK(llama_memory_seq_pos_max(mem, 0) == n1 - 1);
+        } else {
+            CHECK(llama_decode(ctx, s2) != 0);                                // the failure the server met: the retry is refused
+            CHECK(llama_state_seq_set_data_ext(ctx, snap.data(), snap_size, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap_size);
+            CHECK(llama_memory_seq_rm(mem, 0, n1, -1));
+            CHECK(llama_memory_seq_pos_max(mem, 0) == n1 - 1);
+        }
+        CHECK(llama_decode(ctx, s2) == 0);
+        const std::vector<float> again2 = last_logits(ctx, n_vocab);
+        double d2 = 0;
+        for (int i = 0; i < n_vocab; i++) { d2 = std::max(d2, (double) std::fabs(again2[i] - ref2[i])); }
+        printf("max |logit difference| after the rollback and the retry: %g\n", d2);
+        CHECK(d2 < 1e-4);
+        CHECK(llama_memory_seq_pos_max(mem, 0) == n1 + n2 - 1);
+
+        // E. the same with the stop between two ubatches of the slice (the check between micro-batches)
+        llama_memory_seq_rm(mem, 0, -1, -1);
+        CHECK(llama_decode(ctx, s1) == 0);
+        CHECK(llama_state_seq_get_data_ext(ctx, snap.data(), snap_size, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap_size);
+        g_calls = 0; g_fire_after = per_ubatch;
+        CHECK(llama_decode(ctx, s2) == 2);
+        CHECK(llama_state_seq_set_data_ext(ctx, snap.data(), snap_size, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap_size);
+        CHECK(llama_memory_seq_rm(mem, 0, n1, -1));
+        g_calls = 0; g_fire_after = -1;
+        CHECK(llama_decode(ctx, s2) == 0);
+        const std::vector<float> again3 = last_logits(ctx, n_vocab);
+        double d3 = 0;
+        for (int i = 0; i < n_vocab; i++) { d3 = std::max(d3, (double) std::fabs(again3[i] - ref2[i])); }
+        printf("max |logit difference| after a stop between ubatches, the rollback and the retry: %g\n", d3);
+        CHECK(d3 < 1e-4);
+        llama_batch_free(s1);
+        llama_batch_free(s2);
+    }
 
     llama_batch_free(batch);
     llama_free(ctx);

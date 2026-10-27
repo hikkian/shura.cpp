@@ -4764,9 +4764,49 @@ private:
         return true;
     }
 
+    // ABORTFIX1: on a model with recurrent state the positions of a slice cannot be removed after the fact (the state already
+    // holds them), so before each prompt slice that may be interrupted the recurrent part of every slot in it is saved (as a
+    // context checkpoint saves it); a rollback restores it and then removes the attention positions from the slice's start.
+    std::map<int32_t, common_prompt_checkpoint> slice_snaps_;
+
+    void snapshot_slice(int32_t off) {
+        slice_snaps_.clear();
+        const int64_t t0 = ggml_time_us();
+        size_t bytes = 0;
+        const int32_t n = (int32_t) batch.view.size();
+        for (int32_t i = off; i < off + n && i < batch.size(); ++i) {
+            const int32_t id_slot = batch.tokens[i].id_slot;
+            if (slice_snaps_.count(id_slot)) { continue; }
+            auto & snap = slice_snaps_[id_slot];
+            snap.update_tgt(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (ctx_dft != nullptr && ctx_dft != ctx_tgt) {
+                snap.update_dft(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+            bytes += snap.size();
+        }
+        vram->note_snapshot((ggml_time_us() - t0) / 1000.0, bytes);
+    }
+
+    // remove the positions from `pos` on for one slot, target and draft; with a snapshot of this slice, restore it first
+    bool remove_from(int32_t id_slot, llama_pos pos) {
+        const auto it = slice_snaps_.find(id_slot);
+        if (it != slice_snaps_.end()) {
+            if (!it->second.load_tgt(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+                !it->second.load_dft(ctx_dft != ctx_tgt ? ctx_dft : nullptr, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                return false;
+            }
+        }
+        bool ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, pos, -1);
+        if (ctx_dft != nullptr && ctx_dft != ctx_tgt) {
+            ok = llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, pos, -1) && ok;
+        }
+        return ok;
+    }
+
     // VRAMLOGIC2: remove the positions of the rendered slice [off, off + view.size()) from the memory of every slot in it,
-    // so that the slice can be decoded again from scratch (an interrupted llama_decode leaves its earlier ubatches applied)
-    void rewind_slice(int32_t off) {
+    // so that the slice can be decoded again from scratch (an interrupted llama_decode leaves its earlier ubatches applied).
+    // Returns false when the memory could not be taken back (ABORTFIX1: the slice is then not retried).
+    bool rewind_slice(int32_t off) {
         std::map<int32_t, llama_pos> first_pos;
         const int32_t n = (int32_t) batch.view.size();
         for (int32_t i = off; i < off + n && i < batch.size(); ++i) {
@@ -4774,12 +4814,11 @@ private:
             auto it = first_pos.find(t.id_slot);
             if (it == first_pos.end() || t.pos[0] < it->second) { first_pos[t.id_slot] = t.pos[0]; }
         }
+        bool ok = true;
         for (const auto & [id_slot, pos] : first_pos) {
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, pos, -1);
-            if (ctx_dft != nullptr && ctx_dft != ctx_tgt) {
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, pos, -1);
-            }
+            ok = remove_from(id_slot, pos) && ok;
         }
+        return ok;
     }
 
     int32_t vram_retries_ = 0;   // VRAMLOGIC2: interrupted-and-retried slices in a row (bounded)
@@ -4788,7 +4827,7 @@ private:
     // VRAMLOGIC3: for a pause, drop the batch entries from `off` on: their positions leave the memory (target and draft), and the
     // tokens the batch fill already appended to each slot's list are taken off again (one list entry per batch entry), with the
     // context checkpoints that lie beyond. A multimodal slot keeps its list (its pause cannot be continued exactly anyway).
-    void rewind_for_pause(int32_t off) {
+    bool rewind_for_pause(int32_t off) {
         std::map<int32_t, std::pair<llama_pos, int32_t>> per_slot;   // id_slot -> (first position, entries)
         for (int32_t i = off; i < batch.size(); ++i) {
             const auto & t = batch.tokens[i];
@@ -4800,11 +4839,9 @@ private:
                 it->second.second++;
             }
         }
+        bool ok = true;
         for (const auto & [id_slot, info] : per_slot) {
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, info.first, -1);
-            if (ctx_dft != nullptr && ctx_dft != ctx_tgt) {
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, info.first, -1);
-            }
+            ok = remove_from(id_slot, info.first) && ok;
             for (auto & slot : slots) {
                 if (slot.id != id_slot) { continue; }
                 const size_t n = slot.prompt.tokens.size();
@@ -4817,6 +4854,7 @@ private:
             }
         }
         batch.truncate(off);
+        return ok;
     }
 
     // returns true = success ; false = retry with smaller batch size
@@ -4854,6 +4892,14 @@ private:
             prompt_only &= batch.tokens[i].is_prompt;
         }
         if (vram) { vram->set_prefill_in_flight(prompt_only); }   // VRAMLOGIC3: a pause may cut only a prompt slice
+        // ABORTFIX1: with recurrent state a prompt slice is interruptible only with its snapshot; anything else runs to its end
+        const bool snapshot = vram && vram->recurrent_state() && prompt_only;
+        if (snapshot) {
+            snapshot_slice(off);
+        } else {
+            slice_snaps_.clear();
+        }
+        if (vram) { vram->set_slice_snapshot(snapshot); }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
@@ -4864,6 +4910,7 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (vram) { vram->set_slice_snapshot(false); }
 
         if (ret != 0) {
             {
@@ -4888,24 +4935,33 @@ private:
                     // VRAMLOGIC3: the governor asked for a pause while a prompt slice ran. Do not retry: roll back the rest of the
                     // batch (memory and the slots' token lists, which already hold its tokens), leave update_slots, and let the
                     // queue run the pause task next (it is at the front). The checkpoint then holds exactly what was processed.
-                    rewind_for_pause(off);
-                    vram->note_pause_cut();
-                    pause_cut_ = true;
-                    SRV_WRN("decode cut short for a VRAM pause: the rest of the batch from off = %d is rolled back\n", off);
-                    return false;
+                    if (rewind_for_pause(off)) {
+                        vram->note_pause_cut();
+                        pause_cut_ = true;
+                        SRV_WRN("decode cut short for a VRAM pause: the rest of the batch from off = %d is rolled back\n", off);
+                        return false;
+                    }
+                    vram->note_rollback_failed();
+                    SRV_ERR("decode cut short for a VRAM pause, but the memory could not be rolled back (off = %d)\n", off);
+                    err = "Decode aborted.";
+                } else if (ret == 2 && vram && vram_retries_ < 8) {
+                    if (!rewind_slice(off)) {
+                        vram->note_rollback_failed();
+                        SRV_ERR("decode interrupted by the VRAM governor, but the memory could not be rolled back (off = %d)\n", off);
+                        err = "Decode aborted.";
+                    } else {
+                        ++vram_retries_;
+                        // VRAMLOGIC2: the VRAM governor interrupted this ubatch for an urgent cache trim (nothing else sets the
+                        // abort callback). llama_decode removed the aborted ubatch from the memory; the earlier ubatches of this
+                        // slice stayed in it, so take the whole slice out again and run it once more with the same batch size.
+                        // The retry waits for the cache lock, which the resize holds until it is done; if the flag is still up
+                        // for an instant after that, the retry is interrupted once more and comes back here (bounded above).
+                        vram->note_ubatch_interrupted();
+                        SRV_INF("decode interrupted by the VRAM governor (urgent cache trim): retrying the slice, off = %d, n_batch = %d\n", off, n_batch);
+                        return false;
+                    }
                 }
-                if (ret == 2 && vram && ++vram_retries_ <= 8) {
-                    // VRAMLOGIC2: the VRAM governor interrupted this ubatch for an urgent cache trim (nothing else sets the
-                    // abort callback). llama_decode removed the aborted ubatch from the memory; the earlier ubatches of this
-                    // slice stayed in it, so take the whole slice out again and run it once more with the same batch size.
-                    // The retry waits for the cache lock, which the resize holds until it is done; if the flag is still up
-                    // for an instant after that, the retry is interrupted once more and comes back here (bounded above).
-                    rewind_slice(off);
-                    vram->note_ubatch_interrupted();
-                    SRV_INF("decode interrupted by the VRAM governor (urgent cache trim): retrying the slice, off = %d, n_batch = %d\n", off, n_batch);
-                    return false;
-                }
-                if (ret == 2) {
+                if (ret == 2 && err.empty()) {
                     err = "Decode aborted.";
                 }
 
