@@ -1453,6 +1453,7 @@ struct ggml_backend_cuda_context {
     ggml_abort_callback abort_callback = nullptr;
     void * abort_callback_data = nullptr;
     bool aborted = false;
+    cudaEvent_t abort_marks[2] = {nullptr, nullptr};   // the host waits on the mark one check back: the GPU queue never drains
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

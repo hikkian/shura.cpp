@@ -817,6 +817,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    for (cudaEvent_t & mark : abort_marks) {   // SHURA (VRAMLOGIC3)
+        if (mark != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(mark));
+            mark = nullptr;
+        }
+    }
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -4897,9 +4903,11 @@ static void ggml_cuda_op_prof_flush(cudaStream_t stream, std::chrono::steady_clo
 
 static int64_t get_op_batch_size(const ggml_tensor * op);
 
-// SHURA (VRAMLOGIC3): how often a node-by-node large-batch graph checks the abort callback (0 = never). Each check first waits
-// for the work queued so far: the host launches far ahead of the GPU, and a stop must neither take effect after the whole graph
-// nor leave queued kernels reading memory the caller frees after the stop. 64 nodes is ~1/25 of a prefill ubatch.
+// SHURA (VRAMLOGIC3): how often a node-by-node large-batch graph checks the abort callback (0 = never). The host launches far
+// ahead of the GPU, so a check is meaningful only if that lead is bounded: at each check the host records a mark on its stream
+// and waits for the mark of the previous check, so the GPU always keeps one interval of work queued (a full stream sync here
+// drained the queue and cost 7-8 % of a prefill on the card, REBASE2V) while the host is at most two intervals ahead. On a stop
+// the stream is synchronized, so nothing queued reads memory the caller frees after it. 64 nodes is ~1/25 of a prefill ubatch.
 static int ggml_cuda_abort_check_nodes() {
     static const int n = [] {
         const char * env = getenv("GGML_CUDA_ABORT_CHECK_NODES");
@@ -4925,6 +4933,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     bool graph_evaluated_or_captured = false;
     const bool abort_checks = ggml_cuda_graph_wants_abort_checks(cuda_ctx, cgraph, use_cuda_graph);
     int last_abort_check = 0;
+    int n_abort_marks = 0;
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -5036,8 +5045,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_tensor * node = cgraph->nodes[i];
                 if (abort_checks && !is_concurrent_event_active && i - last_abort_check >= ggml_cuda_abort_check_nodes()) {
                     last_abort_check = i;
-                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    if (n_abort_marks > 0) {
+                        CUDA_CHECK(cudaEventSynchronize(cuda_ctx->abort_marks[(n_abort_marks - 1) % 2]));
+                    }
+                    cudaEvent_t & mark = cuda_ctx->abort_marks[n_abort_marks % 2];
+                    if (mark == nullptr) {
+#if defined(GGML_USE_HIP)
+                        CUDA_CHECK(cudaEventCreateWithFlags(&mark, hipEventDisableTiming | hipEventBlockingSync));   // wait asleep, not spinning
+#elif defined(GGML_USE_MUSA)
+                        CUDA_CHECK(cudaEventCreateWithFlags(&mark, cudaEventDisableTiming));
+#else
+                        CUDA_CHECK(cudaEventCreateWithFlags(&mark, cudaEventDisableTiming | cudaEventBlockingSync));
+#endif
+                    }
+                    CUDA_CHECK(cudaEventRecord(mark, cuda_ctx->stream()));
+                    n_abort_marks++;
                     if (cuda_ctx->abort_callback(cuda_ctx->abort_callback_data)) {
+                        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
                         cuda_ctx->aborted = true;   // nothing is queued past this node: the caller may free memory at once
                         break;
                     }
