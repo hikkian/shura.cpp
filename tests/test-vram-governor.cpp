@@ -99,7 +99,7 @@ int main() {
         CHECK(a.kind == vram_action_kind::PAUSE);
         CHECK(a.reason == "short_stall");
         CHECK(s.t < 3.5);                     // 2 s + the polls it took to get to the minimum
-        sim off = make(9000); off.gov.policy.pause_after_seconds = 0; off.tick();
+        sim off = make(9000); off.gov.policy.pause_after_ms = 0; off.tick();
         off.desk_mib = 12282 - 1000;
         for (int i = 0; i < 200; i++) { CHECK(off.tick().kind != vram_action_kind::PAUSE); }
     }
@@ -310,6 +310,23 @@ int main() {
             if (poll_ms == 50) { CHECK(min_free >= 1536); } else { CHECK(min_free < 1536); }
             CHECK(s.g.chunks >= 0 && s.gov.pauses == 0);
         }
+    }
+    // 18. VRAMLOGIC2: a sub-second stall pause (the gateway's default 250 ms) fires before a 1 s stand watchdog: with fast polls
+    //     the decision lands 250..300 ms after the first poll that saw the floor short with the cache at its minimum
+    {
+        sim s = make(9000, 512); s.gov.policy.pause_after_ms = 250; s.gov.policy.pause_floor_mib = 0; s.tick();
+        s.desk_mib = 12282 - 1300;                              // free 1300 with an empty cache: 236 below the floor (> slack)
+        double first_short = -1; vram_action a;
+        for (int i = 0; i < 40; i++) {
+            a = s.tick(0.05);
+            if (first_short < 0 && s.gov.state == vram_state::MIN) { first_short = s.t; }
+            if (a.kind == vram_action_kind::PAUSE) { break; }
+        }
+        CHECK(a.kind == vram_action_kind::PAUSE && a.reason == "short_stall");
+        CHECK(first_short >= 0 && s.t - first_short >= 0.25 - 1e-9 && s.t - first_short <= 0.30 + 1e-9);
+        sim off = make(9000, 512); off.gov.policy.pause_after_ms = 0; off.gov.policy.pause_floor_mib = 0; off.tick();
+        off.desk_mib = 12282 - 1300;
+        for (int i = 0; i < 100; i++) { CHECK(off.tick(0.05).kind != vram_action_kind::PAUSE); }
     }
     printf("test-vram-governor: all passed\n");
     return 0;

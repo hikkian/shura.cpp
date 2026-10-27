@@ -27,7 +27,8 @@ struct vram_policy {
     int32_t hysteresis_mib  = 256;
     int32_t grow_seconds    = 30;
     int32_t pause_floor_mib = 768;
-    int32_t pause_after_seconds = 2; // cache at its minimum and free < reserve for this long: pause (0 = off)
+    int32_t pause_after_ms  = 2000;  // cache at its minimum and free < reserve for this long: pause (0 = off); VRAMLOGIC2: ms,
+                                     // so the gateway can pause before a 1 s stand watchdog (the old field was whole seconds)
     int32_t stall_slack_mib = 48;    // a shortfall up to this much does not count as a stall (the reserve is a comfort figure)
     int32_t min_chunks      = 0;
     int32_t max_chunks      = -1;     // -1 = unlimited (JSON null); 0 = cache fully released ("game")
@@ -250,7 +251,7 @@ public:
                 low_polls_ = 0;
             }
             const bool floor_hit = low_polls_ >= 2;
-            const bool stalled = policy.pause_after_seconds > 0 && stall_since_ >= 0 && in.now_s - stall_since_ >= policy.pause_after_seconds;
+            const bool stalled = policy.pause_after_ms > 0 && stall_since_ >= 0 && in.now_s - stall_since_ >= policy.pause_after_ms / 1000.0 - 1e-9;
             if (floor_hit || stalled) {
                 act.kind = vram_action_kind::PAUSE;
                 act.reason = floor_hit ? "pause_floor" : "short_stall";

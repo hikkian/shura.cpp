@@ -2880,7 +2880,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--vram-pause-after-seconds"}, "N",
         string_format("with the cache at its minimum, free VRAM below the reserve for this many seconds pauses the server (0 = off, default: %d)", 2),
-        [](common_params & params, int value) { params.vram_pause_after_seconds = value; }
+        [](common_params & params, int value) { params.vram_pause_after_ms = value * 1000; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-pause-after-ms"}, "N",
+        "the same in milliseconds, for a pause sooner than a second (0 = off)",
+        [](common_params & params, int value) { params.vram_pause_after_ms = value; }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--vram-min-chunks"}, "N",

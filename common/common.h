@@ -603,7 +603,7 @@ struct common_params {
     int32_t     vram_hysteresis_mib = 256;
     int32_t     vram_grow_seconds = 30;
     int32_t     vram_pause_floor_mib = 768;
-    int32_t     vram_pause_after_seconds = 2;
+    int32_t     vram_pause_after_ms = 2000;   // VRAMLOGIC2: in ms (--vram-pause-after-seconds sets it in whole seconds)
     int32_t     vram_min_chunks = 0;
     int32_t     vram_poll_ms = 200;
     int32_t     moe_cache_chunk_slots = 4;

@@ -69,7 +69,7 @@ server_vram::server_vram(const common_params & params, const llama_model * model
     core_.policy.hysteresis_mib  = params.vram_hysteresis_mib;
     core_.policy.grow_seconds    = params.vram_grow_seconds;
     core_.policy.pause_floor_mib = params.vram_pause_floor_mib;
-    core_.policy.pause_after_seconds = params.vram_pause_after_seconds;
+    core_.policy.pause_after_ms  = params.vram_pause_after_ms;
     core_.policy.min_chunks      = params.vram_min_chunks;
     core_.policy.poll_ms         = params.vram_poll_ms;
     chunk_slots_ = std::max(1, params.moe_cache_chunk_slots);
@@ -331,7 +331,8 @@ server_vram::json server_vram::policy_locked() const {
     return {
         {"reserve_mib", p.reserve_mib}, {"buffer_mib", p.buffer_mib}, {"target_mib", p.target_mib()}, {"hysteresis_mib", p.hysteresis_mib},
         {"grow_seconds", p.grow_seconds},
-        {"pause_floor_mib", p.pause_floor_mib}, {"pause_after_seconds", p.pause_after_seconds}, {"min_chunks", p.min_chunks},
+        {"pause_floor_mib", p.pause_floor_mib}, {"pause_after_ms", p.pause_after_ms}, {"pause_after_seconds", p.pause_after_ms / 1000.0},
+        {"min_chunks", p.min_chunks},
         {"max_chunks", p.max_chunks < 0 ? json(nullptr) : json(p.max_chunks)},
         {"prefill_yield", p.prefill_yield}, {"poll_ms", p.poll_ms}, {"poll_fast_ms", p.poll_fast_ms}, {"trim_abort", p.trim_abort},
         {"sleep_level", p.sleep_level},
@@ -360,17 +361,23 @@ bool server_vram::set_policy(const json & body, std::string & err) {
         return true;
     };
     static const std::set<std::string> known = {"reserve_mib", "buffer_mib", "hysteresis_mib", "grow_seconds", "pause_floor_mib",
-        "min_chunks", "max_chunks", "prefill_yield", "poll_ms", "poll_fast_ms", "trim_abort", "pause_after_seconds", "sleep_level",
-        "human_need", "note"};
+        "min_chunks", "max_chunks", "prefill_yield", "poll_ms", "poll_fast_ms", "trim_abort", "pause_after_seconds", "pause_after_ms",
+        "sleep_level", "human_need", "note"};
     for (auto it = body.begin(); it != body.end(); ++it) {
         if (!known.count(it.key())) { err = "unknown field " + it.key(); return false; }
     }
     if (!num("reserve_mib", 256, 4096, p.reserve_mib) || !num("buffer_mib", 0, 2048, p.buffer_mib) ||
         !num("hysteresis_mib", 0, 1024, p.hysteresis_mib) ||
         !num("grow_seconds", 0, 600, p.grow_seconds) || !num("pause_floor_mib", 0, 2048, p.pause_floor_mib) ||
-        !num("min_chunks", 0, 64, p.min_chunks) || !num("pause_after_seconds", 0, 600, p.pause_after_seconds) || !num("poll_ms", 50, 1000, p.poll_ms) ||
+        !num("min_chunks", 0, 64, p.min_chunks) || !num("pause_after_ms", 0, 600000, p.pause_after_ms) || !num("poll_ms", 50, 1000, p.poll_ms) ||
         !num("poll_fast_ms", 20, 1000, p.poll_fast_ms) || !num("sleep_level", 0, 1, p.sleep_level)) {
         return false;
+    }
+    if (body.contains("pause_after_seconds") && !body.contains("pause_after_ms")) {
+        // the VRAMLOGIC1 field, now also fractional (0.25 = 250 ms); pause_after_ms wins when both are given
+        const auto & v = body["pause_after_seconds"];
+        if (!v.is_number() || v.get<double>() < 0.0 || v.get<double>() > 600.0) { err = "pause_after_seconds must be a number 0..600"; return false; }
+        p.pause_after_ms = (int32_t) std::lround(v.get<double>() * 1000.0);
     }
     if (body.contains("trim_abort")) {
         if (!body["trim_abort"].is_boolean()) { err = "trim_abort must be a boolean"; return false; }

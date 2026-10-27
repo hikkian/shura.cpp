@@ -3327,8 +3327,10 @@ private:
                         }
                     }
                     SRV_WRN("vram pause: slots saved in %.0f ms, exiting with code 75\n", (ggml_time_us() - t_start) / 1000.0);
-                    // let the HTTP threads flush the error frames
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    // let the HTTP threads flush the error frames: a result wakes its HTTP thread at once (condition variable) and
+                    // the frame is a few hundred bytes on loopback. VRAMLOGIC2: 150 ms instead of 500, because the VRAM comes
+                    // back only at exit and a 1 s stand watchdog counts this wait too.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(150));
                     fflush(nullptr);
                     std::_Exit(75);
                 } break;
