@@ -10,9 +10,9 @@ The fork started from a snapshot of [thecodacus/llama.cpp](https://github.com/th
 MoE performance fork by **Anirban Kar**: the expert cache (hot expert packs in VRAM), the scheduler's expert prefetch and CPU worker,
 pinning of the CPU experts, `tools/moe-trace` and the qwen4exp conversion support come from there (features 2, 3, 5 and the base of 6
 below). The TurboQuant KV types, their CUDA/HIP flash-attention kernels and rotation data (feature 1) came into that base from
-[TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) (branch `feature/turboquant-kv-cache`). All of it was moved
-onto a current upstream as the commits of this branch, so the history here does not show their authorship; [NOTICE](../NOTICE), this note
-and the README do. Everything else (the governor, pause and resume, live resize, the bounded LRU, hybrid and two-channel policies, the
+[TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) (branch `feature/turboquant-kv-cache`). All of it arrives,
+ported onto the current upstream, in the first commit of this branch (the import, co-authored by Anirban Kar); see also
+[NOTICE](../NOTICE). Everything else (the governor, pause and resume, live resize, the bounded LRU, hybrid and two-channel policies, the
 loader options, the kernels of feature 7, the fixes) was written for Shura.
 
 ## Branches
@@ -39,10 +39,12 @@ Each commit is one feature, so a conflict during a rebase names the feature it b
 
 ## Features, in commit order
 
+Features 1 to 5 are the import commit (split here by subsystem); 6 to 8 are this fork's own commits.
+
 1. **turbo-kv** (from TheTom/llama-cpp-turboquant via thecodacus/llama.cpp): KV cache types TURBO2/3/4_0 (enum 43..45), `GGML_OP_TURBO_WHT`, flash-attention vec and MMA paths, set-rows, dequantize. CUDA/HIP only; the other GPU backends (Vulkan, Metal, SYCL, MUSA) are not supported for these types and use upstream code.
 2. **scheduler-prefetch** (from thecodacus/llama.cpp): `ggml_backend_sched` prefetches full expert tensors through a second backend during large batches; CPU splits can run on a worker (`cpu_async`).
 3. **qwen4exp** (from thecodacus/llama.cpp): converter side only (`mtp_shared_embd`, `nextn_shared_target_tensors`); the architecture itself is upstream's.
-4. **llama core**: KV type plumbing, loader options (`--load-mode dio`, page-cache drop, pinned limit), graph and model changes.
+4. **llama core**: KV type plumbing, pinning of the CPU experts, graph and model changes. (Direct-I/O loading, `--load-mode dio`, is upstream's; the page-cache drop `--drop-file-cache` and the pinned limit `--host-pinned-max-mib` came with the governor, feature 8.)
 5. **moe-trace** (from thecodacus/llama.cpp), **README**.
 6. **moe cache (hot/cold packs)** (the packs and static placement from thecodacus/llama.cpp; LRU, hybrid, two-channel, live resize ours): separate expert packs on the GPU with `ids == -1` for "not owned by this pack"; LRU, hybrid and two-channel policies; bypass during prefill; pinned source; live resize without a double VRAM peak.
 7. **CUDA/HIP kernels**: GQA-vectorised FA decode (`GGML_HIP_FA_GQA_VEC`), head size 512 FA for Gemma, faster MUL_MAT_ID prefill (one pass over the ids), ADD+RMS_NORM+MUL fusion (off by default), GDN tuning knobs, per-op profiler, failure diagnostics.

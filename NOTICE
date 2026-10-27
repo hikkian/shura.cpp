@@ -17,9 +17,9 @@ shura.cpp is released under the MIT License. It combines code from these sources
 
 4. Changes written for Shura, Copyright (c) 2026 hikkian
    The VRAM governor and its endpoints, pause with a checkpoint and resume, live resize of the expert cache with a
-   rollback-safe release, the bounded LRU, hybrid and two-channel cache policies, the loader options (direct I/O, page-cache
-   drop, pinned memory limit), the CUDA/HIP kernels and fixes listed in docs/SHURA.md, and the tests for them.
+   rollback-safe release, the bounded LRU, hybrid and two-channel cache policies, the loader options (page-cache drop after
+   pinning, pinned memory limit), the CUDA/HIP kernels and fixes listed in docs/SHURA.md, and the tests for them.
 
-The parts from (2) and (3) were moved onto a current upstream as commits of this branch, so the git history of this repository
-does not show their authors; this file, README.md and docs/SHURA.md do. Model weights are not part of this repository and are
+The parts from (2) and (3) arrive, ported onto the current upstream, in one import commit at the start of the `shura` branch,
+with Anirban Kar as co-author; every commit after it is this fork's own. Model weights are not part of this repository and are
 covered by their own licenses.
