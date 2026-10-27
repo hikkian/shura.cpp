@@ -1214,6 +1214,9 @@ static bool backend_lacks_skipped_ids(ggml_backend_t backend, ggml_cgraph * gf) 
         if (node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_ADD_ID) {
             continue;
         }
+        if (node->op == GGML_OP_MUL_MAT_ID && node->op_params[0] != 0) {
+            continue; // the fork's CUDA/HIP path takes ids == -1 when the node announces it (op_params[0])
+        }
         const ggml_tensor * ids = node->src[2];
         std::vector<int32_t> row(ids->ne[0]);
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
@@ -11213,10 +11216,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_Q3_K, GGML_TYPE_IQ3_XXS}) {
         for (int capacity : {14, 24}) {
             for (int tokens : {1, 2, 3, 4, 8}) {
-                for (bool empty : {false, true}) {
-                    test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, capacity, 8, true, 512, tokens, 2048, true, empty));
-                    test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, capacity, 8, false, 2048, tokens, 512, true, empty));
-                }
+                // ids carry -1 (slots the bank does not own); upstream's `skip` replaces the old skip_ids/all_skip pair
+                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, capacity, 8, true, 512, tokens, 2048, 0, false, /*skip=*/true));
+                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, capacity, 8, false, 2048, tokens, 512, 0, false, /*skip=*/true));
             }
         }
     }
@@ -11227,8 +11229,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // PREFILLPROF4: production shapes of the cold expert pack (prefill, 512 tokens, 256 experts, 8 used)
     for (ggml_type ta : {GGML_TYPE_Q3_K, GGML_TYPE_IQ3_XXS}) {
         for (bool skip : {false, true}) {
-            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256, 8, true,  512,  512, 2048, skip)); // gate/up
-            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256, 8, false, 2048, 512,  512, skip)); // down
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256, 8, true,  512,  512, 2048, 0, false, skip)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256, 8, false, 2048, 512,  512, 0, false, skip)); // down
         }
     }
 
