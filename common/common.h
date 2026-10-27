@@ -597,6 +597,9 @@ struct common_params {
     // VRAMLOGIC1: VRAM governor (owns the expert cache; keeps the card above a free-VRAM reserve)
     bool        vram_governor = false;
     int32_t     vram_reserve_mib = 1536;
+    int32_t     vram_buffer_mib = 512;        // VRAMLOGIC2: working target = reserve + buffer
+    int32_t     vram_poll_fast_ms = 50;       // VRAMLOGIC2: polling period below the target
+    bool        vram_trim_abort = true;       // VRAMLOGIC2: an urgent trim may interrupt the running ubatch
     int32_t     vram_hysteresis_mib = 256;
     int32_t     vram_grow_seconds = 30;
     int32_t     vram_pause_floor_mib = 768;

@@ -63,6 +63,9 @@ server_vram::server_vram(const common_params & params, const llama_model * model
     n_ctx_ = params.n_ctx;
     warmup_enabled_ = getenv("LLAMA_VRAM_NO_WARMUP") == nullptr;
     core_.policy.reserve_mib     = params.vram_reserve_mib;
+    core_.policy.buffer_mib      = params.vram_buffer_mib;
+    core_.policy.poll_fast_ms    = params.vram_poll_fast_ms;
+    core_.policy.trim_abort      = params.vram_trim_abort;
     core_.policy.hysteresis_mib  = params.vram_hysteresis_mib;
     core_.policy.grow_seconds    = params.vram_grow_seconds;
     core_.policy.pause_floor_mib = params.vram_pause_floor_mib;
@@ -234,18 +237,25 @@ int32_t server_vram::read_proc_vram_mib() {
     return (int32_t) (kib / 1024);
 }
 
-bool server_vram::apply_chunks(int32_t chunks, const std::string & why, double now_s) {
+bool server_vram::apply_chunks(int32_t chunks, const std::string & why, double now_s, bool urgent) {
     const int32_t before = geom_.chunks;
     const int32_t slots = chunks * chunk_slots_;
     int32_t old_slots = 0, new_slots = 0;
     size_t released = 0, allocated = 0;
     const double t0 = mono_s();
+    // VRAMLOGIC2: the resize takes the cache lock, which a running ubatch holds until it ends. An urgent trim (the card is
+    // already below the floor) raises the abort flag: the ubatch stops at its next graph node (CPU splits check the callback
+    // per node), the lock is handed to the waiting resize, and the server retries that slice afterwards. The flag is down
+    // again before the retry can start computing, because the retry waits for this very lock.
+    const bool interrupt = urgent && chunks < before && core_.policy.trim_abort;
+    if (interrupt) { abort_wanted_.store(true, std::memory_order_relaxed); }
     const bool ok = llama_model_moe_cache_resize(model_, slots, &old_slots, &new_slots, &released, &allocated);
+    if (interrupt) { abort_wanted_.store(false, std::memory_order_relaxed); }
     const double ms = (mono_s() - t0) * 1000.0;
     last_resize_ms_ = (uint64_t) ms;
     refresh_geometry(geom_);
-    LOG_INF("vram governor: cache %d -> %d chunks (%d -> %d slots, %s) in %.0f ms, free %d MiB%s\n",
-            before, geom_.chunks, old_slots, new_slots, why.c_str(), ms, last_free_mib_, ok ? "" : " [resize failed]");
+    LOG_INF("vram governor: cache %d -> %d chunks (%d -> %d slots, %s%s) in %.0f ms, free %d MiB%s\n",
+            before, geom_.chunks, old_slots, new_slots, why.c_str(), interrupt ? ", urgent" : "", ms, last_free_mib_, ok ? "" : " [resize failed]");
     if (!ok) {
         core_.reset_calm(now_s);
     }
@@ -254,7 +264,11 @@ bool server_vram::apply_chunks(int32_t chunks, const std::string & why, double n
 
 void server_vram::loop() {
     while (!stop_.load()) {
-        const int poll_ms = std::max(20, core_.policy.poll_ms);
+        int poll_ms = 200;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            poll_ms = core_.poll_interval_ms();    // VRAMLOGIC2: fast below the target or while free VRAM falls
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
         int32_t free_mib = 0, total_mib = 0, used_mib = 0;
         if (!read_card(free_mib, total_mib, used_mib)) { continue; }
@@ -272,7 +286,7 @@ void server_vram::loop() {
         const vram_action act = core_.step(in, geom_);
         if (act.kind == vram_action_kind::SET_CHUNKS && act.chunks != geom_.chunks) {
             const int32_t before = geom_.chunks;
-            apply_chunks(act.chunks, act.reason, now);
+            apply_chunks(act.chunks, act.reason, now, act.urgent);
             core_.note_applied(act, before, geom_.chunks, now);
         } else if (act.kind == vram_action_kind::PAUSE) {
             pause_why = act.reason;
@@ -315,10 +329,12 @@ bool server_vram::request_pause(const std::string & reason, const std::string & 
 server_vram::json server_vram::policy_locked() const {
     const auto & p = core_.policy;
     return {
-        {"reserve_mib", p.reserve_mib}, {"hysteresis_mib", p.hysteresis_mib}, {"grow_seconds", p.grow_seconds},
+        {"reserve_mib", p.reserve_mib}, {"buffer_mib", p.buffer_mib}, {"target_mib", p.target_mib()}, {"hysteresis_mib", p.hysteresis_mib},
+        {"grow_seconds", p.grow_seconds},
         {"pause_floor_mib", p.pause_floor_mib}, {"pause_after_seconds", p.pause_after_seconds}, {"min_chunks", p.min_chunks},
         {"max_chunks", p.max_chunks < 0 ? json(nullptr) : json(p.max_chunks)},
-        {"prefill_yield", p.prefill_yield}, {"poll_ms", p.poll_ms}, {"sleep_level", p.sleep_level},
+        {"prefill_yield", p.prefill_yield}, {"poll_ms", p.poll_ms}, {"poll_fast_ms", p.poll_fast_ms}, {"trim_abort", p.trim_abort},
+        {"sleep_level", p.sleep_level},
     };
 }
 
@@ -343,16 +359,22 @@ bool server_vram::set_policy(const json & body, std::string & err) {
         out = (int32_t) x;
         return true;
     };
-    static const std::set<std::string> known = {"reserve_mib", "hysteresis_mib", "grow_seconds", "pause_floor_mib",
-        "min_chunks", "max_chunks", "prefill_yield", "poll_ms", "pause_after_seconds", "sleep_level", "human_need", "note"};
+    static const std::set<std::string> known = {"reserve_mib", "buffer_mib", "hysteresis_mib", "grow_seconds", "pause_floor_mib",
+        "min_chunks", "max_chunks", "prefill_yield", "poll_ms", "poll_fast_ms", "trim_abort", "pause_after_seconds", "sleep_level",
+        "human_need", "note"};
     for (auto it = body.begin(); it != body.end(); ++it) {
         if (!known.count(it.key())) { err = "unknown field " + it.key(); return false; }
     }
-    if (!num("reserve_mib", 256, 4096, p.reserve_mib) || !num("hysteresis_mib", 0, 1024, p.hysteresis_mib) ||
+    if (!num("reserve_mib", 256, 4096, p.reserve_mib) || !num("buffer_mib", 0, 2048, p.buffer_mib) ||
+        !num("hysteresis_mib", 0, 1024, p.hysteresis_mib) ||
         !num("grow_seconds", 0, 600, p.grow_seconds) || !num("pause_floor_mib", 0, 2048, p.pause_floor_mib) ||
         !num("min_chunks", 0, 64, p.min_chunks) || !num("pause_after_seconds", 0, 600, p.pause_after_seconds) || !num("poll_ms", 50, 1000, p.poll_ms) ||
-        !num("sleep_level", 0, 1, p.sleep_level)) {
+        !num("poll_fast_ms", 20, 1000, p.poll_fast_ms) || !num("sleep_level", 0, 1, p.sleep_level)) {
         return false;
+    }
+    if (body.contains("trim_abort")) {
+        if (!body["trim_abort"].is_boolean()) { err = "trim_abort must be a boolean"; return false; }
+        p.trim_abort = body["trim_abort"].get<bool>();
     }
     double human_need = -2;
     if (body.contains("human_need")) {
@@ -484,7 +506,7 @@ server_vram::json server_vram::status() {
         {"cache", {{"enabled", geom_.chunks > 0}, {"chunk_slots", geom_.chunk_slots}, {"chunk_mib", geom_.chunk_mib},
                    {"chunks", geom_.chunks}, {"slots", geom_.chunks * geom_.chunk_slots}, {"mib", cache_mib},
                    {"target_chunks", geom_.chunks}, {"max_chunks", core_.policy.max_chunks < 0 ? json(nullptr) : json(core_.policy.max_chunks)},
-                   {"last_resize_ms", last_resize_ms_}}},
+                   {"last_resize_ms", last_resize_ms_}, {"ubatch_interrupts", ubatch_interrupts_.load()}}},
         {"policy", policy_locked()},
         {"journal", {{"last_id", core_.journal.last_id()}, {"yields", core_.journal.totals.yields}, {"yielded_mib", core_.journal.totals.yielded_mib},
                      {"recovered_max_s", std::round(core_.journal.totals.recovered_max_s * 100.0) / 100.0}}},

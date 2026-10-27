@@ -2848,8 +2848,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.vram_warmup_shapes = value; }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--vram-buffer-mib"}, "N",
+        string_format("working buffer above the reserve, MiB: the cache is trimmed as soon as free VRAM drops below reserve + buffer, so a desk burst up to the buffer never reaches the reserve (default: %d)", 512),
+        [](common_params & params, int value) { params.vram_buffer_mib = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-poll-fast-ms"}, "N",
+        string_format("governor polling period while free VRAM is below reserve + buffer or falling, ms (default: %d)", 50),
+        [](common_params & params, int value) { params.vram_poll_fast_ms = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-no-trim-abort"},
+        "an urgent cache trim (free VRAM below the reserve) waits for the end of the running ubatch instead of interrupting it",
+        [](common_params & params) { params.vram_trim_abort = false; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--vram-hysteresis-mib"}, "N",
-        string_format("the cache grows only into room above reserve + this value, MiB (default: %d)", 256),
+        string_format("the cache grows only into room above reserve + buffer + this value, MiB (default: %d)", 256),
         [](common_params & params, int value) { params.vram_hysteresis_mib = value; }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(

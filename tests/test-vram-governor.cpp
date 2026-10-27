@@ -27,10 +27,13 @@ struct sim {
     }
 };
 
-static sim make(int32_t desk) {
+// VRAMLOGIC2: the scenarios 1..10 were written for a floor of 1536 with no buffer and keep that geometry (buffer 0);
+// the buffer has its own scenarios (11..17).
+static sim make(int32_t desk, int32_t buffer = 0) {
     sim s;
     s.g.chunks = 0; s.g.chunk_slots = 4; s.g.chunk_mib = 52; s.g.max_chunks = 64;
     s.desk_mib = desk;
+    s.gov.policy.buffer_mib = buffer;
     return s;
 }
 
@@ -212,6 +215,101 @@ int main() {
         CHECK(a.kind == vram_action_kind::PAUSE);
         const auto ev = s.gov.journal.since(0, 0);
         CHECK(ev.back().kind == "pause" && ev.back().reason == a.reason && s.gov.journal.totals.pauses == 1);
+    }
+    // 11. VRAMLOGIC2: with a buffer the trim starts below the working target, by the whole deficit, and the floor is not touched
+    {
+        sim s = make(9000, 512); s.tick();                     // free 3282 - cache: fills to target + hysteresis
+        CHECK(s.g.chunks == (3282 - 2048 - 256) / 52);
+        CHECK(s.free_mib() >= 2048 + 256);
+        const int32_t full = s.g.chunks;
+        s.desk_mib += 400;                                      // a burst within the buffer: above the floor
+        CHECK(s.free_mib() >= 1536);
+        vram_action a = s.tick();
+        CHECK(a.kind == vram_action_kind::SET_CHUNKS && !a.urgent);   // trimmed at once, not urgent: the floor was never crossed
+        CHECK(s.free_mib() >= 2048 && s.free_mib() < 2048 + 52);     // one resize restored the target exactly
+        CHECK(s.g.chunks < full);
+        CHECK(s.gov.below_reserve_events == 0);
+    }
+    // 12. a Brave-sized burst (+1700 MiB in one poll) with a full cache: one urgent resize gives the whole deficit back
+    {
+        sim s = make(7000, 512); s.tick();                     // free 5282 with an empty cache: a big cache
+        CHECK(s.g.chunks == (5282 - 2048 - 256) / 52);
+        s.desk_mib += 1700;                                     // free before the poll ~604, below the floor
+        CHECK(s.free_mib() < 1536);
+        vram_action a = s.tick();
+        CHECK(a.kind == vram_action_kind::SET_CHUNKS && a.urgent);
+        CHECK(s.free_mib() >= 2048);                            // back at the target after one resize
+        CHECK(s.gov.pauses == 0);
+        CHECK(s.gov.below_reserve_max_s <= 0.2 + 1e-9);        // the floor was crossed for one poll at most
+        a = s.tick();
+        CHECK(a.kind == vram_action_kind::NONE);                // nothing more to do: no second resize
+    }
+    // 13. a saw-tooth within the buffer (+-100 MiB) never trims and never grows: no flapping
+    {
+        sim s = make(9000, 512); s.tick(); const int32_t full = s.g.chunks;
+        for (int i = 0; i < 300; i++) {
+            s.desk_mib += (i % 2 == 0) ? 100 : -100;
+            CHECK(s.tick().kind == vram_action_kind::NONE);
+        }
+        CHECK(s.g.chunks == full && s.gov.trims == 0);
+    }
+    // 14. a slow rise: trims as the target is crossed, each one restoring the target; the floor stays untouched
+    {
+        sim s = make(9000, 512); s.tick();
+        for (int i = 0; i < 40; i++) {
+            s.desk_mib += 30;                                   // 150 MiB/s
+            s.tick();
+            CHECK(s.free_mib() >= 1536);
+            CHECK(s.free_mib() >= 2048 || s.g.chunks == 0);     // the target is restored by every trim while there is cache
+        }
+        CHECK(s.gov.below_reserve_events == 0);
+    }
+    // 15. between the floor and the target with an empty cache: MIN, but no stall and no pause (the pause rules are about the floor)
+    {
+        sim s = make(9000, 512); s.tick();
+        s.desk_mib = 12282 - 1800;                              // free 1800 with an empty cache: below the target, above the floor
+        for (int i = 0; i < 60; i++) { CHECK(s.tick().kind != vram_action_kind::PAUSE); }
+        CHECK(s.g.chunks == 0 && s.gov.state == vram_state::MIN && s.gov.pauses == 0);
+        s.desk_mib = 12282 - 1400;                              // free 1400: below the floor by 136 (more than the slack)
+        vram_action a; for (int i = 0; i < 30; i++) { a = s.tick(); if (a.kind == vram_action_kind::PAUSE) break; }
+        CHECK(a.kind == vram_action_kind::PAUSE && a.reason == "short_stall");
+    }
+    // 16. the poll period: normal with room above the target, fast below target + hysteresis or after a fast drop
+    {
+        sim s = make(7000, 512); s.tick();
+        CHECK(s.gov.poll_interval_ms() == 200);                 // room above the target (the cache just filled)
+        s.desk_mib += 150; s.tick();                            // a drop of 150 >= fast_drop_mib: fast
+        CHECK(s.gov.poll_interval_ms() == 50);
+        s.tick();                                               // the trim put free back at the target: below target + hysteresis, still fast
+        CHECK(s.gov.poll_interval_ms() == 50);
+        s.desk_mib -= 150; s.gov.policy.grow_seconds = 0; s.tick(); s.tick();
+        CHECK(s.gov.poll_interval_ms() == 200);                 // room again (the cache grew back above target + hysteresis)
+        sim w = make(9000, 512); CHECK(w.gov.poll_interval_ms() == 200);   // WARMUP: the normal period
+    }
+    // 17. a 2 GiB/s ramp (the largest SAGE1 burst) with the resize taking 100 ms: with 50 ms polls and the buffer the floor
+    //     is never crossed; with 200 ms polls the desk takes poll + resize worth of VRAM (600 MiB) before the first chunk is back,
+    //     more than the buffer. The pure core has no latency, so the test moves the desk while the resize "runs".
+    {
+        for (int poll_ms : {50, 200}) {
+            sim s = make(7000, 512); s.tick();
+            int32_t min_free = s.free_mib();
+            const double dt = poll_ms / 1000.0, resize_s = 0.1, rate = 2000;
+            for (double t = 0; t < 1.0 - 1e-9; t += dt) {
+                s.desk_mib += (int32_t) (rate * dt);            // the desk grows between two polls
+                min_free = std::min(min_free, s.free_mib());    // what the card sees just before the poll
+                s.t += dt;
+                vram_inputs in; in.now_s = s.t; in.free_mib = s.free_mib(); in.ready = true;
+                vram_action a = s.gov.step(in, s.g);
+                if (a.kind == vram_action_kind::SET_CHUNKS) {
+                    s.desk_mib += (int32_t) (rate * resize_s);  // the desk keeps growing while the resize runs
+                    min_free = std::min(min_free, s.free_mib());
+                    const int32_t before = s.g.chunks; s.g.chunks = a.chunks; s.gov.note_applied(a, before, s.g.chunks, s.t);
+                    s.desk_mib -= (int32_t) (rate * resize_s);  // (accounted again by the next poll's growth)
+                }
+            }
+            if (poll_ms == 50) { CHECK(min_free >= 1536); } else { CHECK(min_free < 1536); }
+            CHECK(s.g.chunks >= 0 && s.gov.pauses == 0);
+        }
     }
     printf("test-vram-governor: all passed\n");
     return 0;

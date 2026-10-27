@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include <map>
 #include <atomic>
 #include <thread>
 #include "base64.hpp"
@@ -1079,6 +1080,8 @@ public:
             return hp;
         });
         vram->set_big_prefill_callback([this]() { return big_prefill_flag.load() != 0; });
+        // VRAMLOGIC2: an urgent trim may stop the running ubatch at its next graph node (see decode(): the slice is retried)
+        llama_set_abort_callback(ctx_tgt, server_vram::abort_callback, vram.get());
         vram->set_pause_callback([this](const std::string & reason, const std::string & checkpoint) {
             server_task task(SERVER_TASK_TYPE_VRAM_PAUSE);
             task.id = queue_tasks.get_new_id();
@@ -4752,6 +4755,26 @@ private:
         return true;
     }
 
+    // VRAMLOGIC2: remove the positions of the rendered slice [off, off + view.size()) from the memory of every slot in it,
+    // so that the slice can be decoded again from scratch (an interrupted llama_decode leaves its earlier ubatches applied)
+    void rewind_slice(int32_t off) {
+        std::map<int32_t, llama_pos> first_pos;
+        const int32_t n = (int32_t) batch.view.size();
+        for (int32_t i = off; i < off + n && i < batch.size(); ++i) {
+            const auto & t = batch.tokens[i];
+            auto it = first_pos.find(t.id_slot);
+            if (it == first_pos.end() || t.pos[0] < it->second) { first_pos[t.id_slot] = t.pos[0]; }
+        }
+        for (const auto & [id_slot, pos] : first_pos) {
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, pos, -1);
+            if (ctx_dft != nullptr && ctx_dft != ctx_tgt) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, pos, -1);
+            }
+        }
+    }
+
+    int32_t vram_retries_ = 0;   // VRAMLOGIC2: interrupted-and-retried slices in a row (bounded)
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off) {
@@ -4814,7 +4837,20 @@ private:
                     err = "Compute error.";
                 }
 
-                // TODO: handle ret == 2 (abort) when we start aborting
+                if (ret == 2 && vram && ++vram_retries_ <= 8) {
+                    // VRAMLOGIC2: the VRAM governor interrupted this ubatch for an urgent cache trim (nothing else sets the
+                    // abort callback). llama_decode removed the aborted ubatch from the memory; the earlier ubatches of this
+                    // slice stayed in it, so take the whole slice out again and run it once more with the same batch size.
+                    // The retry waits for the cache lock, which the resize holds until it is done; if the flag is still up
+                    // for an instant after that, the retry is interrupted once more and comes back here (bounded above).
+                    rewind_slice(off);
+                    vram->note_ubatch_interrupted();
+                    SRV_INF("decode interrupted by the VRAM governor (urgent cache trim): retrying the slice, off = %d, n_batch = %d\n", off, n_batch);
+                    return false;
+                }
+                if (ret == 2) {
+                    err = "Decode aborted.";
+                }
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
@@ -4847,6 +4883,7 @@ private:
             // success, apply batch metrics
             metrics_post_decode(off, batch.view.size(), has_output);
         }
+        vram_retries_ = 0;   // VRAMLOGIC2: the slice went through
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity

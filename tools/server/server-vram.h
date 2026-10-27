@@ -54,6 +54,13 @@ public:
     bool test_hooks() const { return test_hooks_; }
     int32_t n_poll_ms() const { return core_.policy.poll_ms; }
 
+    // VRAMLOGIC2: an urgent trim (free VRAM below the floor) asks the running ubatch to stop at its next graph node, so the
+    // resize does not wait for the end of a long prefill ubatch. Register with llama_set_abort_callback(ctx, abort_callback, this);
+    // the server retries the interrupted slice (llama_decode removed its positions from the memory).
+    static bool abort_callback(void * data) { return data != nullptr && static_cast<server_vram *>(data)->abort_wanted_.load(std::memory_order_relaxed); }
+    uint64_t n_ubatch_interrupts() const { return ubatch_interrupts_.load(); }
+    void note_ubatch_interrupted() { ++ubatch_interrupts_; }
+
 private:
     void loop();
     void warmup();
@@ -61,7 +68,7 @@ private:
     bool read_card(int32_t & free_mib, int32_t & total_mib, int32_t & used_mib);
     int32_t read_proc_vram_mib();
     void refresh_geometry(vram_cache_geometry & g);
-    bool apply_chunks(int32_t chunks, const std::string & why, double now_s);
+    bool apply_chunks(int32_t chunks, const std::string & why, double now_s, bool urgent = false);
     json policy_locked() const;
 
     const llama_model * model_;
@@ -108,6 +115,8 @@ private:
     std::atomic<uint64_t> pool_overflow_{0};
     std::function<void(const std::string &, const std::string &)> pause_cb_;
     std::atomic<bool> pause_requested_{false};
+    std::atomic<bool> abort_wanted_{false};        // VRAMLOGIC2: set while an urgent trim waits for the cache lock
+    std::atomic<uint64_t> ubatch_interrupts_{0};   // how many ubatches the server retried because of it
     std::atomic<bool> stop_{false};
     std::thread thread_;
     bool test_hooks_ = false;

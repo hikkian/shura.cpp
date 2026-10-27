@@ -7,6 +7,12 @@
 // (a chunk is chunk_slots cache slots), and grows the cache into the room above reserve + hysteresis
 // only while the server is idle. When the cache is at its minimum and the card is still short, it asks
 // for a pause with a checkpoint (the gateway then restarts the server in a smaller layout).
+//
+// VRAMLOGIC2: the reserve is the floor (never below); the working target is reserve + buffer. Trimming
+// starts as soon as free VRAM drops below the target, by the whole deficit in one resize, so a desk burst
+// up to the buffer never reaches the floor; the cache grows only into the room above target + hysteresis.
+// A trim with free VRAM already below the floor is urgent: the runtime may interrupt the running ubatch
+// for it. Below the target the governor polls fast (poll_fast_ms) instead of poll_ms.
 
 #include <algorithm>
 #include <chrono>
@@ -16,7 +22,8 @@
 #include <vector>
 
 struct vram_policy {
-    int32_t reserve_mib     = 1536;
+    int32_t reserve_mib     = 1536;  // the floor: free VRAM is never meant to go below it
+    int32_t buffer_mib      = 512;   // VRAMLOGIC2: working target = reserve + buffer; trimming starts below the target
     int32_t hysteresis_mib  = 256;
     int32_t grow_seconds    = 30;
     int32_t pause_floor_mib = 768;
@@ -26,7 +33,12 @@ struct vram_policy {
     int32_t max_chunks      = -1;     // -1 = unlimited (JSON null); 0 = cache fully released ("game")
     bool    prefill_yield   = false;
     int32_t poll_ms         = 200;
+    int32_t poll_fast_ms    = 50;     // VRAMLOGIC2: polling period while free VRAM is below the target or falling fast
+    int32_t fast_drop_mib   = 128;    // a drop of this much between two polls switches to the fast period for the next poll
+    bool    trim_abort      = true;   // VRAMLOGIC2: an urgent trim may interrupt the running ubatch (the runtime decides how)
     int32_t sleep_level     = 0;      // MEMV2: 0 = awake, 1 = light sleep (the cache is released, the model stays in VRAM)
+
+    int32_t target_mib() const { return reserve_mib + buffer_mib; }
 };
 
 enum class vram_state {
@@ -73,6 +85,7 @@ struct vram_action {
     vram_action_kind kind = vram_action_kind::NONE;
     int32_t chunks = 0;
     std::string reason;
+    bool urgent = false;   // VRAMLOGIC2: a trim decided with free VRAM already below the floor
 };
 
 
@@ -168,6 +181,9 @@ public:
         vram_action act;
         const int32_t cap = effective_max(g);
         const int32_t floor_chunks = std::min(policy.min_chunks, cap);
+        falling_ = have_prev_free_ && prev_free_mib_ - in.free_mib >= policy.fast_drop_mib;
+        prev_free_mib_ = in.free_mib;
+        have_prev_free_ = true;
         last_free_mib_ = in.free_mib;
         last_chunk_mib_ = g.chunk_mib;
         track_below(in);
@@ -206,20 +222,24 @@ public:
             return set_chunks(act, cap, "policy_cap", vram_state::TRIM, g, in);
         }
 
-        // 2. short on free VRAM: drop chunks
-        if (in.free_mib < policy.reserve_mib) {
+        // 2. short on free VRAM: below the working target drop the whole deficit at once (VRAMLOGIC2)
+        const int32_t target_mib = policy.target_mib();
+        if (in.free_mib < target_mib) {
             calm_since_ = in.now_s;
-            const int32_t need = policy.reserve_mib - in.free_mib;
+            const int32_t need = target_mib - in.free_mib;
             const int32_t drop = (need + g.chunk_mib - 1) / std::max(1, g.chunk_mib);
             const int32_t target = std::max(floor_chunks, g.chunks - drop);
             if (target < g.chunks) {
                 low_polls_ = 0;
-                return set_chunks(act, target, "short_" + std::to_string(need) + "mib", vram_state::TRIM, g, in);
+                set_chunks(act, target, "short_" + std::to_string(need) + "mib", vram_state::TRIM, g, in);
+                act.urgent = in.free_mib < policy.reserve_mib;   // already below the floor: do not wait for the ubatch
+                return act;
             }
-            // nothing left to drop
+            // nothing left to drop: MIN (a signal to the gateway); the pause rules look at the floor, not the target
             state = vram_state::MIN;
             last_reason = "min_short_" + std::to_string(need) + "mib";
-            if (need <= policy.stall_slack_mib) {
+            const int32_t floor_need = policy.reserve_mib - in.free_mib;
+            if (floor_need <= policy.stall_slack_mib) {
                 stall_since_ = -1;
             } else if (stall_since_ < 0) {
                 stall_since_ = in.now_s;
@@ -244,8 +264,8 @@ public:
         low_polls_ = 0;
         stall_since_ = -1;
 
-        // 3. grow into the room above reserve + hysteresis, only when idle and calm
-        const int32_t room = in.free_mib - policy.reserve_mib - policy.hysteresis_mib;
+        // 3. grow into the room above target + hysteresis, only when idle and calm
+        const int32_t room = in.free_mib - target_mib - policy.hysteresis_mib;
         if ((!in.busy || refill_now_) && room >= g.chunk_mib && g.chunks < cap &&
                 in.now_s - calm_since_ >= policy.grow_seconds) {
             refill_now_ = false;
@@ -256,7 +276,7 @@ public:
         }
 
         // 4. steady state
-        if (g.chunks <= floor_chunks && in.free_mib < policy.reserve_mib + policy.hysteresis_mib) {
+        if (g.chunks <= floor_chunks && in.free_mib < target_mib + policy.hysteresis_mib) {
             state = floor_chunks > 0 ? vram_state::FULL : vram_state::MIN;
         } else if (state == vram_state::MIN || state == vram_state::TRIM || state == vram_state::GROW) {
             state = vram_state::FULL;
@@ -333,6 +353,19 @@ public:
         last_reason = why;
     }
 
+    // VRAMLOGIC2: how long to sleep before the next poll. Fast while free VRAM is below target + hysteresis (there is nothing
+    // to grow into and a burst may be under way) or fell by fast_drop_mib since the previous poll; the normal period otherwise.
+    int32_t poll_interval_ms() const {
+        const int32_t fast = std::max(20, std::min(policy.poll_fast_ms, policy.poll_ms));
+        if (state == vram_state::WARMUP || state == vram_state::PAUSING || state == vram_state::PAUSED) {
+            return std::max(20, policy.poll_ms);
+        }
+        if (falling_ || last_free_mib_ < policy.target_mib() + policy.hysteresis_mib) {
+            return fast;
+        }
+        return std::max(20, policy.poll_ms);
+    }
+
     void reset_calm(double now_s) { calm_since_ = now_s; }
 
 private:
@@ -345,6 +378,9 @@ private:
     double  below_since_ = 0;
     int32_t last_free_mib_  = 0;
     int32_t last_chunk_mib_ = 0;
+    int32_t prev_free_mib_  = 0;   // VRAMLOGIC2: the previous poll's free VRAM (for the falling-fast rule)
+    bool    have_prev_free_ = false;
+    bool    falling_        = false;
 
     int32_t effective_max(const vram_cache_geometry & g) const {
         if (policy.sleep_level >= 1) { return 0; }
