@@ -1,0 +1,75 @@
+# shura.cpp: build checks for the fork's own changes. Upstream's workflows stay as they are (they target master and
+# upstream's infrastructure); this one runs on the `shura` branch and on pull requests to it.
+#
+# cpu: a CPU build, the governor and expert-cache tests, the llama_decode interrupt test on a small generated model,
+#      and the check that every hook point into upstream files is still in place.
+# hip: the HIP build compiles for gfx1101 in ROCm's container. Nothing runs on a GPU here.
+
+name: shura
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [shura]
+  pull_request:
+    branches: [shura]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build libssl-dev python3
+
+      - name: Hook points into upstream files
+        run: python3 scripts/shura-touchpoints.py
+
+      - name: Build
+        run: |
+          cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
+                -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF
+          cmake --build build --target llama-server test-vram-governor test-moe-cache-policy test-llama-archs test-vram-abort
+
+      - name: Governor and expert-cache tests
+        run: |
+          build/bin/test-vram-governor
+          build/bin/test-moe-cache-policy
+
+      - name: Interrupting llama_decode (small generated model)
+        run: |
+          mkdir -p models
+          build/bin/test-llama-archs -a "^llama$" -o models
+          build/bin/test-vram-abort models/llama-dense.gguf
+
+  hip:
+    runs-on: ubuntu-22.04
+    container: rocm/dev-ubuntu-22.04:7.2.1
+    timeout-minutes: 120
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential cmake ninja-build rocblas-dev hipblas-dev libssl-dev
+
+      - name: Build (compile only, gfx1101)
+        run: |
+          cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" -DGGML_HIP=ON -DGPU_TARGETS=gfx1101 \
+                -DGGML_HIP_NO_VMM=ON -DLLAMA_CURL=OFF
+          cmake --build build --target llama-server
