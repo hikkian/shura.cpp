@@ -19,40 +19,61 @@ needs it.
 > [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md). Nothing here is endorsed by or affiliated with the llama.cpp or
 > ggml projects.
 
+## Built on
+
+shura.cpp started from **[thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp)**, the MoE performance fork by
+**Anirban Kar**. The ideas and the first implementations of these parts are his:
+
+* the **expert cache**: the most-routed experts of each layer kept in VRAM as packs, the rest computed from RAM and the
+  two halves merged exactly (static and LRU placement);
+* **expert prefetch** in the scheduler during large batches and CPU splits on a worker thread;
+* **pinning** the memory-mapped CPU experts so uploads go over DMA;
+* the **TurboQuant KV cache types** `TURBO2_0`, `TURBO3_0`, `TURBO4_0` (after arXiv
+  [2504.19874](https://arxiv.org/abs/2504.19874)) with their CUDA/HIP flash-attention paths;
+* the routing-trace recorder `tools/moe-trace` and the qwen4exp conversion support.
+
+We moved them onto a current upstream, fixed what broke and built the rest on top. Thank you, Anirban.
+
 ## What this fork adds
 
 | | What | Where to read |
 |---|---|---|
-| **VRAM governor** | A thread inside `llama-server` polls the card every 200 ms and keeps a configurable amount of VRAM free for the desktop (1.5 GiB by default in Shura). It shrinks the expert cache in a safe point between compute steps and grows it back when the desktop is quiet. Endpoints `GET /vram`, `POST /vram/policy`, `POST /vram/pause`, `GET /vram/journal`. | [docs/SHURA.md](docs/SHURA.md), feature 8 |
-| **Elastic expert cache** | Hot experts of every layer live in VRAM in packs, the cold ones are computed from RAM; the two halves are merged exactly, so the output is the same as without the cache. Live resize over HTTP; a resize releases the old bank first and never holds two banks at once. Static, LRU, hybrid and two-channel policies; a routing-trace recorder (`tools/moe-trace`) to choose the hot set. | feature 6 |
-| **Pause with a checkpoint, and resume** | When the desktop needs more than the cache can give back, the server saves the slot, tells the client, and exits with code 75. The client (Shura's gateway) restarts it in a lighter layout, restores the slot and **continues the same answer** with `resume` in the chat request. | feature 8 |
-| **TurboQuant KV types** | `TURBO2_0`, `TURBO3_0`, `TURBO4_0` for the KV cache (CPU reference, CUDA/HIP kernels, flash-attention paths), so that a 200k window fits next to the weights. | feature 1 |
-| **Kernels for one consumer GPU** | GQA-vectorised flash-attention decode, head size 512 for Gemma, a faster `MUL_MAT_ID` prefill with one pass over the ids, expert prefetch in the scheduler during large batches. CUDA and HIP. | feature 7 |
+| **VRAM governor** | A thread inside `llama-server` keeps free VRAM above a floor (1.5 GiB) plus a working buffer (256 MiB, 512 while the desktop is busy). When free VRAM drops below that, it gives the whole deficit back in one cache resize; under pressure it polls every 50 ms. A resize waits until the card really shows the old bank released before allocating the new one, so the two never count at once. Endpoints `GET /vram`, `POST /vram/policy`, `POST /vram/pause`, `GET /vram/journal`. | [docs/SHURA.md](docs/SHURA.md), "VRAM governor" |
+| **Stopping a long prefill** | An urgent trim, or a pause, interrupts the running prefill step: the CUDA/HIP backend checks the abort callback in large batches (upstream checks it only on the CPU backend), `llama_decode` checks it between micro-batches, and the server rolls the interrupted part back and runs it again. The check keeps the GPU queue full; its cost is within the noise. | "VRAM governor" |
+| **Pause with a checkpoint, and resume** | When the desktop needs more than the cache can give back, the server saves the slot, tells the client, and exits with code 75. The client (Shura's gateway) restarts it in a lighter layout, restores the slot and **continues the same answer** with `resume` in the chat request; a pause in the middle of a prompt continues from the prompt. | "VRAM governor" |
+| **Elastic expert cache** | Live resize over HTTP, hybrid and two-channel placement policies, a pinned source for the cold experts. | feature 6 |
 | **Loading that does not evict your browser** | `--load-mode dio` reads the weights without going through the page cache, drops the file pages after pinning the CPU experts, and caps pinned host memory. | feature 4 |
-| **Page-fault hunt** | A GPU page fault on long, growing sessions was traced to an out-of-bounds read in the q8_1 padding of the MoE matmul (`MUL_MAT_ID` ids path). Upstream has since rewritten that code; this fork carries upstream's version and keeps the reproducer in its tests. | [docs/SHURA.md](docs/SHURA.md), "Where we use upstream's version" |
+| **Kernels for one consumer GPU** | GQA-vectorised flash-attention decode, faster `MUL_MAT_ID` prefill, an optional ADD+RMS_NORM+MUL fusion, a per-op profiler and failure diagnostics. CUDA and HIP. | feature 7 |
+| **Page-fault hunt** | A GPU page fault on long, growing sessions was traced to an out-of-bounds read in the q8_1 padding of the MoE matmul (`MUL_MAT_ID` ids path). Upstream has since rewritten that code; this fork carries upstream's version and keeps the reproducer in its tests. | "Where we use upstream's version" |
 
 Where upstream already does something we had, we take upstream's version and drop ours (slot checkpoints, the `-1` id
-skip in `mul_mat_id`, flash attention for RDNA, shared-expert MMVQ). The list is in `docs/SHURA.md`.
+skip in `mul_mat_id`, flash attention for RDNA, shared-expert MMVQ). The list and the known issues are in
+[docs/SHURA.md](docs/SHURA.md).
 
 ## Measured
 
-One machine: AMD RX 7800 XT 16 GB, Ryzen 5 5600, 32 GB DDR4-3200, Fedora 44, KDE on Wayland, ROCm 7.2.4; model
-Tiel-Coder-35B-A3B (a Qwen3.5-class MoE, 8 of 256 experts active). Every number has a date. Numbers marked * were taken
-on the previous base of this fork and are re-measured on this build before publication (card REBASE2V in the Shura
-project).
+One machine: AMD RX 7800 XT 16 GB, Ryzen 5 5600, 32 GB DDR4-3200, Fedora 44, KDE on Wayland, ROCm 7.2.4. Models
+Tiel-Coder-35B-A3B and Occamy-1.0-35B-A3B (Qwen3.5-class MoE, 8 of 256 experts active). This build against the previous
+one (the same fork on an upstream of 2026-10-06), alternating pairs, medians of three, 2026-10-27/28.
 
-| What | Result | Date |
-|---|---|---|
-| Desktop takes +400 MiB of VRAM during decode | free VRAM back above 1.5 GiB after **0.24 s**; longest gap between tokens 51 ms | 2026-10-25 |
-| The same during a 100k-token prefill | back above 1.5 GiB after **0.29 s**, prefill continues | 2026-10-25 |
-| Desktop takes more than the cache can give back | checkpoint 0.6 s, exit, restart, restore 22 ms, the answer continues | 2026-10-25 |
-| 44-minute soak: 171 requests from 0.2k to 28k tokens plus 25 desktop jumps of 100–450 MiB | 15 cache shrinks, 12 regrowths, no pause needed, the buffer pool did not grow after warm-up | 2026-10-25 |
-| Decode, Tiel 35B-A3B, short prompt / 28k / 100k filled context | **75 / 71 / 49 tok/s** * | 2026-10-24 |
-| 40-minute long-session hammer: 170 requests, prompts up to 180,300 tokens, a cache resize on every request | 0 GPU page faults, 0 errors | 2026-10-24 |
-| Host memory of the server under a steady replay | flat on ROCm 7.2.4 (0.01 GiB/h); the same binary on ROCm 7.1.1 grew 4.5 GiB/h, a runtime leak, which is why we build against 7.2.x | 2026-10-24 |
+| What | Result |
+|---|---|
+| Prefill, 28k-token prompt, short-context layout | Tiel **+16.3 %** (1499 → 1742 tok/s), Occamy **+15.4 %** (1487 → 1716) |
+| Prefill, 100k-token prompt, long-context layout | Tiel **+7.9 %** (1281 → 1381 tok/s), Occamy **+7.2 %** (1285 → 1378) |
+| Decode | short-context within the noise (−1 % Tiel, +1 % Occamy); long-context layout +17 % Tiel, +9 % Occamy |
+| KL divergence against the previous build, 8 × 512 tokens | Tiel 0.0346 (the previous build against itself: 0.0343), Occamy 0.0185; gate 0.0385 |
+| The desktop takes **+1.7 GiB at once** while a 28k prefill runs, cache full | one cache trim, the running step interrupted, free VRAM below 1.5 GiB for **0.05–0.2 s** |
+| The same during decode | one trim, below 1.5 GiB for **0.1 s** |
+| The same with an empty cache (nothing left to give back) during a 100k prefill | prefill cut 14 ms after the decision, slot saved in 214 ms, exit 75; below 1.5 GiB for **0.85 s** |
+| Cache resize, 50 Hz trace of free VRAM, grow and shrink | dips below the lower of before/after: **0–9 MiB** (previous build: 238–1820 MiB) |
+| Cost of the interrupt check in a prefill | 2313 vs 2321 tok/s (8k), 2003 vs 2001 (28k): within the noise |
+| 40-minute hammer: 384 requests, new 28–34k prompts mixed with small ones, governor on † | 0 failures, 0 GPU errors, free VRAM never below 1595 MiB; server RSS settles (+11 MiB/h at the end) |
+| 20 loads in a row with `--load-mode dio` † | ready in 8.0–8.5 s each, page cache +24…60 MiB, no swap, the browser untouched |
 
-The benchmark scripts, the raw data and the method (alternating pairs, KL gate 0.0385 against the reference layout, a
-VRAM watchdog that stops any run leaving less than 1.5 GiB free) are published with Shura 1.0.
+† Measured on the commit before the last governor changes (8f177300e); everything else on the current `shura` branch.
+
+The benchmark scripts, the raw data and the method (a VRAM watchdog stops any run that leaves less than 1.5 GiB free
+for more than a second) are published with Shura 1.0.
 
 ## Build
 
@@ -87,6 +108,8 @@ build/bin/test-backend-ops test -o FLASH_ATTN_EXT
 build/bin/test-backend-ops test -o TURBO_WHT
 build/bin/test-moe-cache-policy
 build/bin/test-vram-governor
+# interrupting llama_decode, with a small model made by test-llama-archs:
+build/bin/test-llama-archs -a "^llama$" -o /tmp/models && build/bin/test-vram-abort /tmp/models/llama-dense.gguf
 ```
 
 ## Run
@@ -98,13 +121,14 @@ build/bin/llama-server -m model.gguf -ngl 99 -ncmoe 10 -fa on -c 32768 \
   -ctk q8_0 -ctv turbo4 --load-mode dio \
   --moe-cache-profile profile.csv --moe-cache-slots 20 --moe-cache-policy two-channel \
   --moe-cache-pinned-source --moe-cache-live-resize \
-  --vram-governor --vram-reserve-mib 1536 \
+  --vram-governor --vram-reserve-mib 1536 --vram-pause-after-ms 250 \
   --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.2
 ```
 
 `-ncmoe` is how many layers of experts stay on the CPU; the governor then uses whatever VRAM is left for the hot
 experts. `profile.csv` comes from `tools/moe-trace` (record a routing trace on your own prompts). Everything else is
-upstream's. `curl localhost:8080/vram` shows what the governor is doing.
+upstream's. `curl localhost:8080/vram` shows what the governor is doing; `POST /vram/policy {"buffer_mib": 512}` widens
+the working buffer at run time (Shura's gateway does it while a video plays or the browser is busy).
 
 ## Keeping up with upstream
 
@@ -115,6 +139,6 @@ to a newer upstream, with the things that broke on previous rebases, is [docs/SH
 
 ## License
 
-MIT, like llama.cpp. The upstream [LICENSE](LICENSE) and [AUTHORS](AUTHORS) are kept unchanged; the changes in this
-fork are © 2026 hikkian and are released under the same MIT license. Model weights are not included and are covered by
-their own licenses.
+MIT, like llama.cpp. The upstream [LICENSE](LICENSE) and [AUTHORS](AUTHORS) are kept unchanged. The parts that come
+from [thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp) are © Anirban Kar, the rest of this fork's changes
+© 2026 hikkian, all under the same MIT license. Model weights are not included and are covered by their own licenses.

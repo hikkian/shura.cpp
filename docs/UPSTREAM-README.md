@@ -1,3 +1,6 @@
+<!-- The README of ggml-org/llama.cpp at commit 74bca3950 (the upstream this fork is rebased on), unchanged except that links
+     relative to the repository root got a leading ../ because this copy lives in docs/. The fork's own README is ../README.md. -->
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
@@ -30,9 +33,9 @@ irm https://llama.app/install.ps1 | iex
 ```
 
 - Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
+- Run with Docker - see our [Docker documentation](../docs/docker.md)
 - Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+- Build from source by cloning this repository - check out [our build guide](../docs/build.md)
 
 Once installed:
 
@@ -77,45 +80,45 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 
 | Backend | Target devices |
 | --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
+| [BLAS](../docs/build.md#blas-build) | All |
+| [BLIS](../docs/backend/BLIS.md) | All |
+| [CANN](../docs/build.md#cann) | Ascend NPU |
+| [CUDA](../docs/build.md#cuda) | Nvidia GPU |
+| [HIP](../docs/build.md#hip) | AMD GPU |
+| [Hexagon](../docs/backend/snapdragon/README.md) | Snapdragon |
+| [IBM zDNN](../docs/backend/zDNN.md) | IBM Z & LinuxONE |
+| [MUSA](../docs/build.md#musa) | Moore Threads GPU |
+| [Metal](../docs/build.md#metal-build) | Apple Silicon |
+| [OpenCL](../docs/backend/OPENCL.md) | Adreno GPU |
+| [OpenVINO [In Progress]](../docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
 | [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+| [SYCL](../docs/backend/SYCL.md) | Intel GPU |
+| [VirtGPU](../docs/backend/VirtGPU.md) | VirtGPU APIR |
+| [Vulkan](../docs/build.md#vulkan) | GPU |
+| [WebGPU](../docs/build.md#webgpu) | All |
+| [ZenDNN](../docs/build.md#zendnn) | AMD CPU |
 
 ## Documentation
 
 #### Tools
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+- [cli](../tools/cli/README.md)
+- [completion](../tools/completion/README.md)
+- [server](../tools/server/README.md)
+- [GBNF grammars](../grammars/README.md)
 
 #### Development
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
+- [How to build](../docs/build.md)
+- [Running on Docker](../docs/docker.md)
+- [Build on Android](../docs/android.md)
+- [Multi-GPU usage](../docs/multi-gpu.md)
+- [Performance troubleshooting](../docs/development/token_generation_performance_tips.md)
 - [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+- [XCFramework](../docs/xcframework.md)
+- [Completions](../docs/completions.md)
+- [Models](../docs/models.md)
+- [Release process](../docs/release.md)
 
 ## Contributing
 

@@ -6305,7 +6305,7 @@ void server_routes::init_routes() {
         return res;
     };
 
-    // VRAMLOGIC1 endpoints (see reports/vramlogic1/API.md)
+    // VRAMLOGIC1 endpoints (see docs/SHURA.md, "VRAM governor")
     this->get_vram = [this](const server_http_req &) {
         auto res = create_response();
         if (!ctx_server.vram) {

@@ -1,4 +1,5 @@
-"""Render the shura.cpp wordmark candidates from banner.html to PNG (light and dark), next to this file.
+"""Render the shura.cpp wordmark candidates from banner.html to PNG (light and dark) into candidates/ next to this file.
+The chosen one (V2, the memory bar) is copied to wordmark-light.png and wordmark-dark.png.
 
 Needs Playwright with Chromium (`pip install playwright && playwright install chromium`). The fonts are system fonts:
 Montserrat, Source Code Pro, Droid Arabic Kufi.

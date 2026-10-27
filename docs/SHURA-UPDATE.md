@@ -13,7 +13,7 @@ git rebase -i upstream                                                   # one c
 
 Tips: `git config rerere.enabled true`. Conflicts where our block is a pure addition can be resolved by keeping both sides.
 When upstream implemented something we have (check the commit title against the PR list), take upstream's version and drop ours:
-write the dropped patch and the reason into `reports/REPORT-<card>.md`. Likely candidates to re-check each time:
+record the dropped patch and the reason in the Shura project's notes and in "Where we use upstream's version" of `SHURA.md`. Likely candidates to re-check each time:
 slot checkpoints, expert cache, `mul_mat_id` skip of `-1`, flash-attention changes, `fwht`, MTP export.
 
 ## 2. Check that the hooks survived
@@ -61,8 +61,8 @@ build/bin/test-vram-governor                          # decision core
 
 Probes are the same as for any release candidate of the stack: A/B pairs for Tiel and Occamy against the current build, KL against
 the reference (limit 0.0385), VRAM at idle and at the ends of the context range, a 40 minute hammer with no GPU page fault in
-`journalctl -k`, the governor jump test (+400 MiB taken from the card, reaction within 1 s), a 30 minute memory run. The scripts are in
-`reports/vramlogic1/scripts` and `reports/rocm72/scripts` of the stack repository. The VRAM watchdog (free below 1.5 GiB stops the run)
+`journalctl -k`, the governor jump test (+400 MiB taken from the card, reaction within 1 s), a 30 minute memory run. The scripts live in
+the Shura project (published with Shura 1.0). The VRAM watchdog (free below 1.5 GiB stops the run)
 stays on in every run.
 
 ## 6. Finish
