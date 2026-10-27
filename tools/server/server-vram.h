@@ -59,9 +59,13 @@ public:
     // the server retries the interrupted slice (llama_decode removed its positions from the memory).
     // VRAMLOGIC3: a pending pause stops a running prefill slice too (the server then rolls the slice back, saves and exits); a decode
     // step is short and is never cut for a pause, because its sampled token may already be on its way to the client.
+    // ABORTFIX1: never on a model with recurrent state (hybrid or recurrent memory, e.g. Qwen3.5): its state cannot be taken
+    // back to the start of an interrupted slice, so the retry failed ("Invalid input batch", HTTP 500). There a trim waits for
+    // the end of the slice and a pause for the end of the prompt slice, as before VRAMLOGIC2.
     static bool abort_callback(void * data) {
         if (data == nullptr) { return false; }
         const auto * v = static_cast<server_vram *>(data);
+        if (!v->rollback_safe_) { return false; }
         return v->abort_wanted_.load(std::memory_order_relaxed) ||
                (v->pause_pending_.load(std::memory_order_relaxed) && v->prefill_in_flight_.load(std::memory_order_relaxed));
     }
@@ -128,6 +132,7 @@ private:
     std::atomic<uint64_t> pool_overflow_{0};
     std::function<void(const std::string &, const std::string &)> pause_cb_;
     std::atomic<bool> pause_requested_{false};
+    bool rollback_safe_ = true;                    // ABORTFIX1: false for hybrid or recurrent memory (no interrupts there)
     std::atomic<bool> abort_wanted_{false};        // VRAMLOGIC2: set while an urgent trim waits for the cache lock
     std::atomic<bool> pause_pending_{false};       // VRAMLOGIC3: a pause task is posted and has not run yet
     std::atomic<bool> prefill_in_flight_{false};   // VRAMLOGIC3: the running llama_process is a prompt-only slice
