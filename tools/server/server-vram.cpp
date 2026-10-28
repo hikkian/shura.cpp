@@ -369,7 +369,7 @@ server_vram::json server_vram::policy_locked() const {
         {"grow_seconds", p.grow_seconds},
         {"pause_floor_mib", p.pause_floor_mib}, {"pause_after_ms", p.pause_after_ms}, {"pause_after_seconds", p.pause_after_ms / 1000.0},
         {"min_chunks", p.min_chunks},
-        {"max_chunks", p.max_chunks < 0 ? json(nullptr) : json(p.max_chunks)},
+        {"max_chunks", p.max_chunks < 0 ? json(nullptr) : json(p.max_chunks)}, {"snapshot_every_ms", p.snapshot_every_ms},
         {"prefill_yield", p.prefill_yield}, {"poll_ms", p.poll_ms}, {"poll_fast_ms", p.poll_fast_ms}, {"trim_abort", p.trim_abort},
         {"sleep_level", p.sleep_level},
     };
@@ -398,7 +398,7 @@ bool server_vram::set_policy(const json & body, std::string & err) {
     };
     static const std::set<std::string> known = {"reserve_mib", "buffer_mib", "hysteresis_mib", "grow_seconds", "pause_floor_mib",
         "min_chunks", "max_chunks", "prefill_yield", "poll_ms", "poll_fast_ms", "trim_abort", "pause_after_seconds", "pause_after_ms",
-        "sleep_level", "human_need", "note"};
+        "sleep_level", "human_need", "note", "snapshot_every_ms"};
     for (auto it = body.begin(); it != body.end(); ++it) {
         if (!known.count(it.key())) { err = "unknown field " + it.key(); return false; }
     }
@@ -406,7 +406,8 @@ bool server_vram::set_policy(const json & body, std::string & err) {
         !num("hysteresis_mib", 0, 1024, p.hysteresis_mib) ||
         !num("grow_seconds", 0, 600, p.grow_seconds) || !num("pause_floor_mib", 0, 2048, p.pause_floor_mib) ||
         !num("min_chunks", 0, 64, p.min_chunks) || !num("pause_after_ms", 0, 600000, p.pause_after_ms) || !num("poll_ms", 50, 1000, p.poll_ms) ||
-        !num("poll_fast_ms", 20, 1000, p.poll_fast_ms) || !num("sleep_level", 0, 1, p.sleep_level)) {
+        !num("poll_fast_ms", 20, 1000, p.poll_fast_ms) || !num("sleep_level", 0, 1, p.sleep_level) ||
+        !num("snapshot_every_ms", 0, 60000, p.snapshot_every_ms)) {
         return false;
     }
     if (body.contains("pause_after_seconds") && !body.contains("pause_after_ms")) {
@@ -448,6 +449,7 @@ bool server_vram::set_policy(const json & body, std::string & err) {
     std::lock_guard<std::mutex> lk(mu_);
     core_.note_policy(core_.policy, p, note, mono_s());
     core_.policy = p;
+    snapshot_every_ms_.store(p.snapshot_every_ms, std::memory_order_relaxed);
     if (human_need > -1) { human_need_ = human_need; }
     return true;
 }

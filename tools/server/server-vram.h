@@ -61,8 +61,9 @@ public:
     // step is short and is never cut for a pause, because its sampled token may already be on its way to the client.
     // ABORTFIX1: on a model with recurrent state (hybrid or recurrent memory, e.g. Qwen3.5) the positions of an interrupted
     // slice cannot simply be removed: the recurrent state already holds the later tokens, and a retry from the start of the slice
-    // failed ("Invalid input batch", HTTP 500). There the server snapshots the recurrent part before each prompt slice and
-    // restores it on a rollback; a slice without that snapshot (a decode step, a mixed batch) is never interrupted.
+    // failed ("Invalid input batch", HTTP 500). There the server keeps rollback points (the recurrent part of a slot and how many
+    // tokens it holds) during a long prefill and goes back to them; a slice without one (a decode step, a mixed batch, a short
+    // prompt) is never interrupted.
     static bool abort_callback(void * data) {
         if (data == nullptr) { return false; }
         const auto * v = static_cast<server_vram *>(data);
@@ -75,8 +76,10 @@ public:
     bool pause_pending() const { return pause_pending_.load(); }
     void set_prefill_in_flight(bool on) { prefill_in_flight_.store(on, std::memory_order_relaxed); }
     void note_pause_cut() { ++pause_cuts_; }
-    // ABORTFIX1: the model keeps recurrent state; the server then snapshots each prompt slice and says so for the running one
+    // ABORTFIX1: the model keeps recurrent state; the server then keeps rollback points during a long prefill and says when the
+    // running slice may be interrupted (every slot in it has one)
     bool recurrent_state() const { return recurrent_; }
+    int32_t snapshot_every_ms() const { return snapshot_every_ms_.load(std::memory_order_relaxed); }
     void set_slice_snapshot(bool on) { slice_snapshot_.store(on, std::memory_order_relaxed); }
     void note_snapshot(double ms, size_t bytes) { ++snapshots_; snapshot_us_ += (uint64_t) (ms * 1000.0); snapshot_bytes_ = bytes; }
     void note_rollback_failed() { ++rollback_failures_; }
@@ -139,7 +142,8 @@ private:
     std::function<void(const std::string &, const std::string &)> pause_cb_;
     std::atomic<bool> pause_requested_{false};
     bool recurrent_ = false;                       // ABORTFIX1: hybrid or recurrent memory (snapshot before an interruptible slice)
-    std::atomic<bool> slice_snapshot_{false};      // ABORTFIX1: the running prompt slice has its snapshot (it may be interrupted)
+    std::atomic<bool> slice_snapshot_{false};      // ABORTFIX1: every slot of the running prompt slice has a rollback point
+    std::atomic<int32_t> snapshot_every_ms_{3000}; // ABORTFIX1: mirror of policy.snapshot_every_ms for the server thread
     std::atomic<uint64_t> snapshots_{0};           // ABORTFIX1: snapshots taken, their total time and the size of the last
     std::atomic<uint64_t> snapshot_us_{0};
     std::atomic<uint64_t> snapshot_bytes_{0};

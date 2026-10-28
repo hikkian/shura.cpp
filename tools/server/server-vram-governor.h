@@ -39,6 +39,8 @@ struct vram_policy {
     int32_t fast_drop_mib   = 128;    // a drop of this much between two polls switches to the fast period for the next poll
     bool    trim_abort      = true;   // VRAMLOGIC2: an urgent trim may interrupt the running ubatch (the runtime decides how)
     int32_t sleep_level     = 0;      // MEMV2: 0 = awake, 1 = light sleep (the cache is released, the model stays in VRAM)
+    int32_t snapshot_every_ms = 3000; // ABORTFIX1: with recurrent state, a rollback point is saved this often during a long prefill
+                                      // (one costs ~25 ms for Qwen3.5-35B-A3B; an interrupt re-reads at most this much)
 
     int32_t target_mib() const { return reserve_mib + buffer_mib; }
 };

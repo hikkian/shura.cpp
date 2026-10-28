@@ -3760,9 +3760,9 @@ private:
 
                 batch.render(off, n_tokens);
                 bool ok = decode(n_batch, off);
-                if (pause_cut_) {
-                    pause_cut_ = false;
-                    return;   // VRAMLOGIC3: the pause task runs next; nothing of this batch is left to process
+                if (pause_cut_ || rolled_back_) {
+                    pause_cut_ = rolled_back_ = false;
+                    return;   // VRAMLOGIC3: the pause task runs next; ABORTFIX1: or the next pass reads the prompt on
                 }
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
@@ -4765,37 +4765,88 @@ private:
     }
 
     // ABORTFIX1: on a model with recurrent state the positions of a slice cannot be removed after the fact (the state already
-    // holds them), so before each prompt slice that may be interrupted the recurrent part of every slot in it is saved (as a
-    // context checkpoint saves it); a rollback restores it and then removes the attention positions from the slice's start.
-    std::map<int32_t, common_prompt_checkpoint> slice_snaps_;
+    // holds them). During a long prefill the server keeps a rollback point per slot instead: the recurrent part of the memory (as
+    // a context checkpoint saves it), the position and the number of tokens the slot held then. A point is saved before the first
+    // slice of a prompt that needs more than one slice, and again once snapshot_every_ms have passed: one costs ~25 ms on
+    // Qwen3.5-35B-A3B, and saving it before every slice cost 4-5 % of the prefill. An interrupt or a pause takes the slot back to
+    // its point and leaves update_slots; the next pass reads the prompt on from there. Only a batch of one text-only slot can be
+    // taken back this way (another slot's finished part of the batch would lose its logits), so only such a slice is interrupted.
+    struct rollback_point {
+        int       id_task  = -1;
+        llama_pos pos      = 0;
+        int64_t   n_tokens = 0;
+        int64_t   t_us     = 0;
+        common_prompt_checkpoint state;
+    };
+    std::map<int32_t, rollback_point> rb_points_;
+    bool rolled_back_ = false;   // ABORTFIX1: decode() took the batch back to a rollback point; update_slots returns at once
 
-    void snapshot_slice(int32_t off) {
-        slice_snaps_.clear();
-        const int64_t t0 = ggml_time_us();
-        size_t bytes = 0;
-        const int32_t n = (int32_t) batch.view.size();
-        for (int32_t i = off; i < off + n && i < batch.size(); ++i) {
-            const int32_t id_slot = batch.tokens[i].id_slot;
-            if (slice_snaps_.count(id_slot)) { continue; }
-            auto & snap = slice_snaps_[id_slot];
-            snap.update_tgt(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            if (ctx_dft != nullptr && ctx_dft != ctx_tgt) {
-                snap.update_dft(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            }
-            bytes += snap.size();
+    server_slot * slot_by_id(int32_t id) {
+        for (auto & slot : slots) {
+            if (slot.id == id) { return &slot; }
         }
-        vram->note_snapshot((ggml_time_us() - t0) / 1000.0, bytes);
+        return nullptr;
     }
 
-    // remove the positions from `pos` on for one slot, target and draft; with a snapshot of this slice, restore it first
-    bool remove_from(int32_t id_slot, llama_pos pos) {
-        const auto it = slice_snaps_.find(id_slot);
-        if (it != slice_snaps_.end()) {
-            if (!it->second.load_tgt(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
-                !it->second.load_dft(ctx_dft != ctx_tgt ? ctx_dft : nullptr, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-                return false;
-            }
+    // Before a prompt slice: keep, refresh or save the rollback point of its slot. True when the slice may be interrupted.
+    bool prepare_rollback_point(int32_t off) {
+        const int32_t id = batch.tokens[off].id_slot;
+        int32_t entries = 0;
+        for (int32_t i = 0; i < batch.size(); ++i) {
+            if (batch.tokens[i].id_slot != id) { return false; }        // more than one slot in the batch
+            if (i >= off) { ++entries; }
         }
+        server_slot * slot = slot_by_id(id);
+        if (slot == nullptr || slot->task == nullptr) { return false; }
+        const size_t n_list = slot->prompt.tokens.size();
+        if (slot->prompt.tokens.get_text_tokens().size() != n_list || (size_t) entries > n_list) { return false; }
+        const int64_t held = (int64_t) n_list - entries;                 // tokens in the memory before this slice
+        const int64_t now = ggml_time_us();
+        const int64_t every_us = (int64_t) vram->snapshot_every_ms() * 1000;
+        auto it = rb_points_.find(id);
+        const bool valid = it != rb_points_.end() && it->second.id_task == slot->task->id && it->second.n_tokens <= held;
+        if (valid && (every_us > 0 ? now - it->second.t_us < every_us : it->second.n_tokens == held)) {
+            return true;
+        }
+        // a prompt that ends within this slice is not worth a point: a trim waits for the end of the slice
+        if (!valid && (int64_t) slot->task->n_tokens() - held <= (int64_t) batch.view.size()) {
+            return false;
+        }
+        auto & p = rb_points_[id];
+        p.id_task  = slot->task->id;
+        p.pos      = batch.tokens[off].pos[0];
+        p.n_tokens = held;
+        p.t_us     = now;
+        p.state.update_tgt(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (ctx_dft != nullptr && ctx_dft != ctx_tgt) {
+            p.state.update_dft(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        vram->note_snapshot((ggml_time_us() - now) / 1000.0, p.state.size());
+        return true;
+    }
+
+    // Take the batch's slot back to its rollback point: memory (target and draft), its token list and the context checkpoints
+    // beyond; the batch ends at `off`.
+    bool rollback_to_point(int32_t off) {
+        const int32_t id = batch.tokens[off].id_slot;
+        server_slot * slot = slot_by_id(id);
+        auto it = rb_points_.find(id);
+        if (slot == nullptr || it == rb_points_.end()) { return false; }
+        const auto & p = it->second;
+        bool ok = p.state.load_tgt(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) &&
+                  p.state.load_dft(ctx_dft != ctx_tgt ? ctx_dft : nullptr, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        ok = ok && remove_from(id, p.pos);
+        if (ok) {
+            slot->prompt.tokens.keep_first(p.n_tokens);
+            const int64_t keep = p.n_tokens;
+            slot->prompt.checkpoints.remove_if([keep](const common_prompt_checkpoint & c) { return c.n_tokens > keep; });
+            batch.truncate(off);
+        }
+        return ok;
+    }
+
+    // remove the positions from `pos` on for one slot, target and draft
+    bool remove_from(int32_t id_slot, llama_pos pos) {
         bool ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, pos, -1);
         if (ctx_dft != nullptr && ctx_dft != ctx_tgt) {
             ok = llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, pos, -1) && ok;
@@ -4892,14 +4943,8 @@ private:
             prompt_only &= batch.tokens[i].is_prompt;
         }
         if (vram) { vram->set_prefill_in_flight(prompt_only); }   // VRAMLOGIC3: a pause may cut only a prompt slice
-        // ABORTFIX1: with recurrent state a prompt slice is interruptible only with its snapshot; anything else runs to its end
-        const bool snapshot = vram && vram->recurrent_state() && prompt_only;
-        if (snapshot) {
-            snapshot_slice(off);
-        } else {
-            slice_snaps_.clear();
-        }
-        if (vram) { vram->set_slice_snapshot(snapshot); }
+        // ABORTFIX1: with recurrent state a prompt slice is interruptible only with a rollback point; anything else runs to its end
+        if (vram) { vram->set_slice_snapshot(vram->recurrent_state() && prompt_only && prepare_rollback_point(off)); }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
@@ -4931,7 +4976,27 @@ private:
                     err = "Compute error.";
                 }
 
-                if (ret == 2 && vram && vram->pause_pending()) {
+                if (ret == 2 && vram && vram->recurrent_state()) {
+                    // ABORTFIX1: only a slice with a rollback point was interruptible; go back to the point and leave
+                    // update_slots. For a pause the queue runs the pause task next and its checkpoint holds the point; for a
+                    // trim the next pass reads the prompt on from the point (the resize holds the cache lock until it is done).
+                    const bool pause = vram->pause_pending();
+                    if (rollback_to_point(off)) {
+                        if (pause) {
+                            vram->note_pause_cut();
+                            pause_cut_ = true;
+                        } else {
+                            vram->note_ubatch_interrupted();
+                            rolled_back_ = true;
+                        }
+                        SRV_WRN("decode interrupted by the VRAM governor (%s): the slot went back to its rollback point\n",
+                                pause ? "pause" : "urgent cache trim");
+                        return false;
+                    }
+                    vram->note_rollback_failed();
+                    SRV_ERR("decode interrupted by the VRAM governor, but the slot could not go back to its rollback point (off = %d)\n", off);
+                    err = "Decode aborted.";
+                } else if (ret == 2 && vram && vram->pause_pending()) {
                     // VRAMLOGIC3: the governor asked for a pause while a prompt slice ran. Do not retry: roll back the rest of the
                     // batch (memory and the slots' token lists, which already hold its tokens), leave update_slots, and let the
                     // queue run the pause task next (it is at the front). The checkpoint then holds exactly what was processed.
