@@ -254,7 +254,7 @@ bool server_vram::apply_chunks(int32_t chunks, const std::string & why, double n
     // per node), the lock is handed to the waiting resize, and the server retries that slice afterwards. The flag is down
     // again before the retry can start computing, because the retry waits for this very lock.
     const bool interrupt = urgent && chunks < before && core_.policy.trim_abort;
-    if (interrupt) { abort_wanted_.store(true, std::memory_order_relaxed); }
+    if (interrupt) { request_us_.store(ggml_time_us()); abort_wanted_.store(true, std::memory_order_relaxed); }
     {
         int32_t f = 0, t = 0, u = 0;
         release_baseline_free_ = read_card(f, t, u) ? f : -1;   // VRAMLOGIC3: wait_released() measures against this
@@ -358,6 +358,7 @@ bool server_vram::request_pause(const std::string & reason, const std::string & 
     }
     pause_cb_(reason, checkpoint.empty() ? "vram-pause.bin" : checkpoint);
     // VRAMLOGIC3: only now (the task is in the queue, at its front): a running prefill slice may stop, and the queue runs the pause next
+    request_us_.store(ggml_time_us());
     pause_pending_.store(true);
     return true;
 }

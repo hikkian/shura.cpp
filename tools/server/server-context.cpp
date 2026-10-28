@@ -4989,8 +4989,8 @@ private:
                             vram->note_ubatch_interrupted();
                             rolled_back_ = true;
                         }
-                        SRV_WRN("decode interrupted by the VRAM governor (%s): the slot went back to its rollback point\n",
-                                pause ? "pause" : "urgent cache trim");
+                        SRV_WRN("decode interrupted by the VRAM governor (%s): the slot went back to its rollback point (%s)\n",
+                                pause ? "pause" : "urgent cache trim", vram->interrupt_timing_and_reset().c_str());
                         return false;
                     }
                     vram->note_rollback_failed();

@@ -1,5 +1,9 @@
 #pragma once
 
+#include "ggml.h"
+#include <cstdio>
+#include <string>
+
 // VRAMLOGIC1: runtime of the VRAM governor inside llama-server (thread, sysfs, expert-cache actuator, /vram JSON).
 // The decision logic is in server-vram-governor.h.
 
@@ -67,9 +71,25 @@ public:
     static bool abort_callback(void * data) {
         if (data == nullptr) { return false; }
         const auto * v = static_cast<server_vram *>(data);
+        const bool wanted = v->abort_wanted_.load(std::memory_order_relaxed) || v->pause_pending_.load(std::memory_order_relaxed);
+        if (wanted) { v->checks_since_request_.fetch_add(1, std::memory_order_relaxed); }
         if (v->recurrent_ && !v->slice_snapshot_.load(std::memory_order_relaxed)) { return false; }
-        return v->abort_wanted_.load(std::memory_order_relaxed) ||
+        const bool stop = v->abort_wanted_.load(std::memory_order_relaxed) ||
                (v->pause_pending_.load(std::memory_order_relaxed) && v->prefill_in_flight_.load(std::memory_order_relaxed));
+        if (stop) {
+            int64_t none = 0;
+            v->first_stop_us_.compare_exchange_strong(none, ggml_time_us(), std::memory_order_relaxed);
+        }
+        return stop;
+    }
+    // ABORTFIX2: how long an interrupt took, for the log: request -> the first check that said stop -> decode returned
+    std::string interrupt_timing_and_reset() {
+        const int64_t now = ggml_time_us(), req = request_us_.exchange(0), first = first_stop_us_.exchange(0);
+        const int64_t checks = checks_since_request_.exchange(0);
+        char buf[160];
+        snprintf(buf, sizeof(buf), "requested %.0f ms ago, first stop %.0f ms after the request, %lld checks of the flag",
+                 req ? (now - req) / 1000.0 : -1.0, req && first ? (first - req) / 1000.0 : -1.0, (long long) checks);
+        return buf;
     }
     uint64_t n_ubatch_interrupts() const { return ubatch_interrupts_.load(); }
     void note_ubatch_interrupted() { ++ubatch_interrupts_; }
@@ -142,6 +162,9 @@ private:
     std::function<void(const std::string &, const std::string &)> pause_cb_;
     std::atomic<bool> pause_requested_{false};
     bool recurrent_ = false;                       // ABORTFIX1: hybrid or recurrent memory (snapshot before an interruptible slice)
+    mutable std::atomic<int64_t> request_us_{0};          // ABORTFIX2: when a trim or a pause raised its flag (ggml_time_us)
+    mutable std::atomic<int64_t> first_stop_us_{0};       // ABORTFIX2: when the abort callback first said stop
+    mutable std::atomic<int64_t> checks_since_request_{0};
     std::atomic<bool> slice_snapshot_{false};      // ABORTFIX1: every slot of the running prompt slice has a rollback point
     std::atomic<int32_t> snapshot_every_ms_{3000}; // ABORTFIX1: mirror of policy.snapshot_every_ms for the server thread
     std::atomic<uint64_t> snapshots_{0};           // ABORTFIX1: snapshots taken, their total time and the size of the last
