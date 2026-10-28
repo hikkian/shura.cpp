@@ -39,8 +39,10 @@ Endpoints: `GET /vram`, `POST /vram/policy`, `POST /vram/pause`, `GET /vram/jour
 **Stopping a long prefill.** An urgent trim or a pause interrupts the running prefill step. The CUDA/HIP backend checks
 the abort callback in large batches (upstream checks it only on the CPU backend), `llama_decode` checks it between
 micro-batches, and the server rolls the interrupted part back and runs it again. The check's cost is within the noise.
-On models with recurrent or hybrid state (Qwen3.5 / Qwen3-Next style, which includes the reference models) this is
-switched off for now: the trim or pause waits for the end of the current slice. See Known issues.
+On models with recurrent or hybrid state (Qwen3.5 / Qwen3-Next style, which includes the reference models) the
+positions of an interrupted slice cannot simply be removed, so during a long prefill the server keeps a rollback point
+every 3 s (the recurrent state and how many tokens the slot held) and goes back to it; the request then reads up to 3 s
+of its prompt again. The points cost at most 1 % of the prefill.
 
 **Pause with a checkpoint, and resume.** When the desktop needs more than the cache can give, the server saves the slot,
 tells the client and exits with code 75. The client (Shura's gateway) restarts it in a lighter layout, restores the slot
@@ -73,11 +75,12 @@ build against the previous one (the same fork on an upstream of 2026-10-06), alt
 | Prefill, 100k-token prompt, long-context layout | Tiel **+7.9 %** (1281 → 1381 tok/s), Occamy **+7.2 %** (1285 → 1378) |
 | Decode | short-context within the noise (−1 % Tiel, +1 % Occamy); long-context layout +17 % Tiel, +9 % Occamy |
 | KL divergence against the previous build, 8 × 512 tokens | Tiel 0.0346 (the previous build against itself: 0.0343), Occamy 0.0185; gate 0.0385 |
-| The desktop takes **+1.7 GiB at once** while a 28k prefill runs, cache full | one cache trim, the running step interrupted, free VRAM below 1.5 GiB for **0.05–0.2 s** (dense models; hybrid models wait for the slice, see Known issues) |
+| The desktop takes **+1.7 GiB at once** while a 26k-token chat request is read, cache full (3 moments, Tiel and Occamy) | 6 of 6 answered (HTTP 200), the running step interrupted and rolled back, free VRAM below 1.5 GiB for **0.05–0.2 s**; the request takes up to 3 s longer |
 | The same during decode | one trim, below 1.5 GiB for **0.1 s** |
-| The same with an empty cache (nothing left to give back) during a 100k prefill | prefill cut 14 ms after the decision, slot saved in 214 ms, exit 75; below 1.5 GiB for **0.85 s** (measured before the hybrid-model switch-off; hybrid models now finish the slice first) |
+| A pause in the middle of a 26k-token prompt (nothing left to give back) | the slot goes back to its rollback point and is saved, exit 75; restart, restore in 35–64 ms, the answer continues (HTTP 200) |
 | Cache resize, 50 Hz trace of free VRAM, grow and shrink | dips below the lower of before/after: **0–9 MiB** (previous build: 238–1820 MiB) |
 | Cost of the interrupt check in a prefill | 2313 vs 2321 tok/s (8k), 2003 vs 2001 (28k): within the noise |
+| Cost of the rollback points (models with recurrent state), governor on | 2334 → 2310 tok/s (8k, −1.0 %), 2014 → 2011 (28k, −0.17 %) |
 | 40-minute hammer: 384 requests, new 28–34k prompts mixed with small ones, governor on † | 0 failures, 0 GPU errors, free VRAM never below 1595 MiB; server RSS settles (+11 MiB/h at the end) |
 | 20 loads in a row with `--load-mode dio` † | ready in 8.0–8.5 s each, page cache +24…60 MiB, no swap, the browser untouched |
 
@@ -146,10 +149,6 @@ it while a video plays or the browser is busy).
   cases left in GPU memory. The quantized types the models use do not show it.
 * **Upstream: `MUL_MAT_ID` with an offset ids view** (`iq3_xxs`, `n = 8`) fails in 8 of 10 runs on ROCm on plain upstream
   74bca3950 too. Our graphs never pass offset ids views.
-* **Interrupting a prefill is off on models with recurrent or hybrid state.** Rolling back an interrupted slice did
-  not restore the recurrent state, and the retried slice failed with HTTP 500 (found on 2026-10-28). Until a proper
-  rollback lands, such models finish the current slice before a trim or pause (`GET /vram` → `cache.interrupts`
-  is `off_recurrent_state`); on the reference machine that keeps free VRAM below the floor for 0.1–0.6 s in a long prefill.
 * **Decode steps run as HIP/CUDA graphs and are not interrupted.** An urgent trim during decode waits for the current
   step, about 13 ms on the reference machine. Backends other than CPU and CUDA/HIP stop only between micro-batches.
 * The CUDA build is not measured on this base.
