@@ -59,8 +59,24 @@ public:
         last.uploads.reserve(experts);
         epoch = 0;
         timing = {};
+        if (lfu) set_frequency(true, half_life);
         return commit_resize(preview_resize(slots));
     }
+
+    // MEMV2 (LFU): order the misses to upload and choose the slot to give up by how often this session routes to each expert
+    // (counts halved every `half_life_tokens`) instead of the profile's fixed rank and the slot's age. The counts start from the
+    // profile (at most one routing's worth), so the first plans equal the static ones and the session takes over within a
+    // half-life. A miss rarer than the weakest resident does not evict it: it goes to a transient slot, or to the CPU.
+    void set_frequency(bool on, double half_life_tokens = 256.0) {
+        lfu = on;
+        half_life = std::max(1.0, half_life_tokens);
+        freq.assign(n_experts, 0.0);
+        if (!on) return;
+        const double top = seed_order.empty() ? 1.0 : double(seed_order.size());
+        for (int expert = 0; expert < n_experts; ++expert) freq[expert] = rank_value[expert] / top;
+    }
+    bool frequency_on() const { return lfu; }
+    double frequency(int32_t expert) const { return lfu && expert >= 0 && expert < n_experts ? freq[expert] : 0.0; }
 
     std::vector<int32_t> preview_resize(int slots) const {
         if (slots < 0 || slots > n_experts) return {};
@@ -117,8 +133,13 @@ public:
         last.hits = last.uploaded = last.cpu = last.cpu_unique = 0;
         last.uploads.clear();
         int protected_count = 0;
+        if (lfu) {
+            const double decay = std::pow(0.5, double(tokens) / half_life);
+            for (double & f : freq) f *= decay;
+        }
         for (int32_t expert : ids) {
             ++counts[expert];
+            if (lfu) freq[expert] += 1.0;
             const int slot = expert_to_slot[expert];
             if (slot >= 0) {
                 ++last.hits;
@@ -134,6 +155,7 @@ public:
             if (counts[expert] > 0 && !initial_hits[expert]) candidates.push_back(expert);
         }
         std::sort(candidates.begin(), candidates.end(), [&](int32_t a, int32_t b) {
+            if (lfu && freq[a] != freq[b]) return freq[a] > freq[b];
             return rank_value[a] != rank_value[b] ? rank_value[a] > rank_value[b] : a < b;
         });
         const int capacity = n_slots > 0 ? n_slots - protected_count + transient_slots : 0;
@@ -160,9 +182,15 @@ public:
             int victim = -1;
             for (int slot = 0; slot < n_slots; ++slot) {
                 if (protected_slots[slot]) continue;
-                if (victim < 0 || slot_to_expert[slot] < 0 ||
+                if (lfu) {
+                    if (victim < 0 || slot_to_expert[slot] < 0 ||
+                            (slot_to_expert[victim] >= 0 && freq[slot_to_expert[slot]] < freq[slot_to_expert[victim]])) victim = slot;
+                } else if (victim < 0 || slot_to_expert[slot] < 0 ||
                         (slot_to_expert[victim] >= 0 && ages[slot] < ages[victim])) victim = slot;
                 if (slot_to_expert[slot] < 0) break;
+            }
+            if (lfu && victim >= 0 && slot_to_expert[victim] >= 0 && freq[expert] < freq[slot_to_expert[victim]]) {
+                victim = -1;   // the resident is used more often: keep it, the miss takes a transient slot if one is free
             }
             if (victim >= 0) {
                 const int32_t old = slot_to_expert[victim];
@@ -228,5 +256,8 @@ private:
     std::vector<uint8_t> initial_hits, protected_slots;
     std::vector<uint64_t> ages;
     std::array<costs, 9> timing;
+    bool lfu = false;
+    double half_life = 256.0;
+    std::vector<double> freq;
     plan last;
 };

@@ -1,4 +1,5 @@
 #include "../src/llama-moe-cache-policy.h"
+#include "../src/llama-moe-cache-two-channel-policy.h"
 
 #include <cassert>
 #include <cstdint>
@@ -81,6 +82,72 @@ int main() {
     lazy_zero.commit_resize(20);
     assert(lazy_zero.pinned_slots() == 15);
     assert(lazy_zero.slots() == 20);
+
+    // MEMV2 (LFU) in the two-channel policy: the session's frequency decides which miss is uploaded and which resident stays
+    {
+#define LFU_CHECK(c) do { if (!(c)) { std::cerr << "FAIL line " << __LINE__ << ": " #c "\n"; return 1; } } while (0)
+        auto warm = [](llama_moe_channel_policy & p) {
+            // three timed plans so the cost model may upload (the first sample is skipped); uploads are cheap here
+            for (int i = 0; i < 3; ++i) {
+                LFU_CHECK(p.make_plan({14, 15}, 1, 2));
+                p.observe(400.0, 40.0);
+            }
+            return 0;
+        };
+        llama_moe_channel_policy lfu;
+        LFU_CHECK(lfu.initialize(16, 4, ranking(16)));
+        lfu.set_frequency(true, 32.0);
+        LFU_CHECK(lfu.frequency_on());
+        // the seed is the profile's order: expert 0 is the most frequent, 15 the least
+        LFU_CHECK(lfu.frequency(0) > lfu.frequency(1) && lfu.frequency(1) > lfu.frequency(15) && lfu.frequency(15) > 0.0);
+        if (warm(lfu)) return 1;
+        // a session that keeps routing to 10 and 11: they become residents
+        for (int i = 0; i < 40; ++i) {
+            LFU_CHECK(lfu.make_plan({10, 11}, 1, 2));
+            lfu.observe(400.0, 40.0);
+        }
+        auto resident = [](const llama_moe_channel_policy & p, int32_t e) {
+            for (int32_t x : p.slots()) if (x == e) return true;
+            return false;
+        };
+        LFU_CHECK(resident(lfu, 10) && resident(lfu, 11));
+        // a one-off miss rarer than every resident does not evict one: it is served from a transient slot
+        const auto before = lfu.slots();
+        LFU_CHECK(lfu.make_plan({3, 13}, 1, 2));
+        for (const auto & up : lfu.latest().uploads) {
+            if (up.expert == 13) LFU_CHECK(!up.persistent);
+        }
+        LFU_CHECK(resident(lfu, 10) && resident(lfu, 11));
+        // the counts halve every half-life: 64 tokens of other experts leave 10 at about a quarter of what it had
+        const double f10 = lfu.frequency(10);
+        for (int i = 0; i < 64; ++i) {
+            LFU_CHECK(lfu.make_plan({4, 5}, 1, 2));
+            lfu.observe(400.0, 40.0);
+        }
+        LFU_CHECK(lfu.frequency(10) < f10 * 0.26 && lfu.frequency(10) > f10 * 0.24);
+
+        // the same session under the plain policy: the one-off miss takes a resident's slot (least recently used)
+        llama_moe_channel_policy lru;
+        LFU_CHECK(lru.initialize(16, 4, ranking(16)));
+        if (warm(lru)) return 1;
+        for (int i = 0; i < 40; ++i) {
+            LFU_CHECK(lru.make_plan({10, 11}, 1, 2));
+            lru.observe(400.0, 40.0);
+        }
+        LFU_CHECK(lru.make_plan({3, 13}, 1, 2));
+        bool persisted = false;
+        for (const auto & up : lru.latest().uploads) persisted |= up.expert == 13 && up.persistent;
+        LFU_CHECK(persisted);
+        LFU_CHECK(!lru.frequency_on() && lru.frequency(10) == 0.0);
+
+        // a copy (the runtime's resize stages one) keeps the learned counts
+        llama_moe_channel_policy staged = lfu;
+        LFU_CHECK(staged.frequency(10) == lfu.frequency(10));
+        LFU_CHECK(staged.commit_resize(staged.preview_resize(6)));
+        LFU_CHECK(staged.frequency(10) == lfu.frequency(10));
+        std::cout << "LFU: frequent experts stay resident, one-off misses go transient, counts halve per half-life\n";
+#undef LFU_CHECK
+    }
 
     std::cout << "test-moe-cache-policy: all tests OK\n";
     return 0;

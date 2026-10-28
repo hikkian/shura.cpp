@@ -1262,6 +1262,15 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     return buft_list;
 }
 
+// MEMV2 (LFU): LLAMA_MOE_CACHE_LFU=1 orders the two-channel cache by the session's routing frequency (half-life in tokens from
+// LLAMA_MOE_CACHE_LFU_HALF_LIFE, 256 by default). Off unless set: it is switched on only after a measured gain.
+static void llama_moe_channel_frequency_from_env(llama_moe_channel_policy & policy) {
+    const char * on = getenv("LLAMA_MOE_CACHE_LFU");
+    if (on == nullptr || atoi(on) == 0) return;
+    const char * hl = getenv("LLAMA_MOE_CACHE_LFU_HALF_LIFE");
+    policy.set_frequency(true, hl != nullptr && atof(hl) > 0 ? atof(hl) : 256.0);
+}
+
 struct llama_moe_channel_runtime {
     llama_moe_channel_policy policy;
     ggml_backend_event_ptr begin;
@@ -2754,6 +2763,7 @@ void llama_model_base::init_moe_expert_cache() {
             if (!runtime.policy.initialize(int(n_expert), int(S), pimpl->moe_cache_rankings.at(il))) {
                 throw std::runtime_error("invalid two-channel cache seed");
             }
+            llama_moe_channel_frequency_from_env(runtime.policy);
             runtime.begin.reset(pimpl->moe_event_new_timed(dev));
             runtime.end.reset(pimpl->moe_event_new_timed(dev));
             runtime.ids.reserve(64);
@@ -3362,6 +3372,7 @@ bool llama_model_base::resize_moe_expert_cache(int32_t n_slots, int32_t & old_sl
             auto runtime = pimpl->moe_channels.find(il);
             if (runtime == pimpl->moe_channels.end()) {
                 if (!staged.initialize(int(n_expert), 0, pimpl->moe_cache_rankings.at(il))) return false;
+                llama_moe_channel_frequency_from_env(staged);
                 if (!pimpl->moe_event_new_timed || !pimpl->moe_event_elapsed) return false;
                 ggml_backend_event_ptr begin{pimpl->moe_event_new_timed(dev)};
                 ggml_backend_event_ptr end{pimpl->moe_event_new_timed(dev)};
