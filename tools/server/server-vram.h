@@ -111,7 +111,15 @@ private:
     bool read_card(int32_t & free_mib, int32_t & total_mib, int32_t & used_mib);
     int32_t read_proc_vram_mib();
     void refresh_geometry(vram_cache_geometry & g);
+    // VRAMFIX5: the governor's resize runs without mu_ (GET /vram and /vram/policy answer meanwhile); resize_mu_ keeps one resize at
+    // a time. Lock order: the manual endpoint holds mu_ and takes resize_mu_; the governor never holds resize_mu_ while it waits for
+    // mu_. A trim that did not interrupt is watched while it waits for the cache lock (see resize_unlocked).
     bool apply_chunks(int32_t chunks, const std::string & why, double now_s, bool urgent = false);
+    struct resize_plan { int32_t chunks = 0, before = 0, reserve_mib = 0, watch_ms = 50; bool urgent = false, trim_abort = true; };
+    bool resize_unlocked(const resize_plan & plan, int32_t & old_slots, int32_t & new_slots, bool & interrupted);
+    void finish_resize_locked(const resize_plan & plan, const std::string & why, double ms, bool ok, int32_t old_slots,
+                              int32_t new_slots, bool interrupted, double now_s);
+    int32_t sim_delta_now() const;
     // VRAMLOGIC3: inside a resize, after the old bank is freed: wait until the card shows the VRAM back (sysfs), at most release_wait_ms
     static void release_wait_cb(size_t released_bytes, void * data) { static_cast<server_vram *>(data)->wait_released(released_bytes); }
     void wait_released(size_t released_bytes);
@@ -153,7 +161,7 @@ private:
     int32_t window_min_free_ = INT32_MAX;
     int32_t proc_vram_mib_ = 0;
     double  human_need_ = -1;       // MEMV2: what the gateway last said about the desk, 0..1 (-1 = never said), informational
-    uint64_t last_resize_ms_ = 0;
+    std::atomic<uint64_t> last_resize_ms_{0};
     double   uptime0_s_ = 0;
 
     std::atomic<bool> ready_{false}; // warm-up finished
@@ -178,14 +186,17 @@ private:
     std::atomic<int32_t> release_baseline_free_{-1};   // VRAMLOGIC3: card free VRAM just before a governor resize (-1 = no wait:
                                                        // a resize outside apply_chunks, e.g. the legacy slots endpoint)
     int32_t release_wait_ms_ = 250;                // the longest wait for a released bank to show on the card
-    double  last_release_wait_ms_ = 0;             // the last wait and how much came back in it (for the log and /vram)
-    int32_t last_release_seen_mib_ = 0;
+    std::atomic<double>  last_release_wait_ms_{0}; // the last wait and how much came back in it (for the log and /vram)
+    std::atomic<int32_t> last_release_seen_mib_{0};
+    std::mutex resize_mu_;                         // VRAMFIX5: one resize at a time
+    std::atomic<bool> resizing_{false};            // VRAMFIX5: a resize is running (for /vram)
+    std::atomic<uint64_t> escalations_{0};         // VRAMFIX5: trims that became interrupting while they waited
     std::atomic<uint64_t> ubatch_interrupts_{0};   // how many ubatches the server retried because of it
     std::atomic<bool> stop_{false};
     std::thread thread_;
     bool test_hooks_ = false;
-    int32_t sim_delta_mib_ = 0;
-    double  sim_until_s_ = 0;
+    std::atomic<int32_t> sim_delta_mib_{0};
+    std::atomic<double>  sim_until_s_{0};
     std::string sysfs_card_;
     std::string marker_dir_;
 };

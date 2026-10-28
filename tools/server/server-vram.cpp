@@ -243,18 +243,39 @@ int32_t server_vram::read_proc_vram_mib() {
     return (int32_t) (kib / 1024);
 }
 
-bool server_vram::apply_chunks(int32_t chunks, const std::string & why, double now_s, bool urgent) {
-    const int32_t before = geom_.chunks;
-    const int32_t slots = chunks * chunk_slots_;
-    int32_t old_slots = 0, new_slots = 0;
+int32_t server_vram::sim_delta_now() const {
+    return sim_until_s_.load() > mono_s() ? sim_delta_mib_.load() : 0;
+}
+
+// VRAMLOGIC2: the resize takes the cache lock, which a running ubatch holds until it ends. An urgent trim (the card is already below
+// the floor) raises the abort flag: the ubatch stops at its next graph node (CPU splits check the callback per node), the lock is
+// handed to the waiting resize, and the server retries that slice afterwards. The flag is down again before the retry can start
+// computing, because the retry waits for this very lock.
+// VRAMFIX5: a trim decided between the floor and the target does not interrupt; while it waits for the lock, a watcher reads the
+// card every watch_ms and raises the flag after all if free VRAM falls below the floor (the desk kept growing). Runs without mu_.
+bool server_vram::resize_unlocked(const resize_plan & plan, int32_t & old_slots, int32_t & new_slots, bool & interrupted) {
+    std::lock_guard<std::mutex> one(resize_mu_);
+    const int32_t slots = plan.chunks * chunk_slots_;
     size_t released = 0, allocated = 0;
-    const double t0 = mono_s();
-    // VRAMLOGIC2: the resize takes the cache lock, which a running ubatch holds until it ends. An urgent trim (the card is
-    // already below the floor) raises the abort flag: the ubatch stops at its next graph node (CPU splits check the callback
-    // per node), the lock is handed to the waiting resize, and the server retries that slice afterwards. The flag is down
-    // again before the retry can start computing, because the retry waits for this very lock.
-    const bool interrupt = urgent && chunks < before && core_.policy.trim_abort;
+    const bool trim = plan.chunks < plan.before;
+    const bool interrupt = plan.urgent && trim && plan.trim_abort;
     if (interrupt) { request_us_.store(ggml_time_us()); abort_wanted_.store(true, std::memory_order_relaxed); }
+    std::atomic<bool> done{false}, escalated{false};
+    std::thread watcher;
+    if (trim && !interrupt && plan.trim_abort) {
+        watcher = std::thread([&] {
+            while (!done.load()) {
+                int32_t f = 0, t = 0, u = 0;
+                if (read_card(f, t, u) && f + sim_delta_now() < plan.reserve_mib) {
+                    request_us_.store(ggml_time_us());
+                    abort_wanted_.store(true, std::memory_order_relaxed);
+                    escalated.store(true);
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(std::max(10, plan.watch_ms)));
+            }
+        });
+    }
     {
         int32_t f = 0, t = 0, u = 0;
         release_baseline_free_ = read_card(f, t, u) ? f : -1;   // VRAMLOGIC3: wait_released() measures against this
@@ -262,17 +283,37 @@ bool server_vram::apply_chunks(int32_t chunks, const std::string & why, double n
         last_release_seen_mib_ = 0;
     }
     const bool ok = llama_model_moe_cache_resize(model_, slots, &old_slots, &new_slots, &released, &allocated);
+    done.store(true);
+    if (watcher.joinable()) { watcher.join(); }
     release_baseline_free_ = -1;
-    if (interrupt) { abort_wanted_.store(false, std::memory_order_relaxed); }
-    const double ms = (mono_s() - t0) * 1000.0;
+    interrupted = interrupt || escalated.load();
+    if (interrupted) { abort_wanted_.store(false, std::memory_order_relaxed); }
+    if (escalated.load()) { ++escalations_; }
+    return ok;
+}
+
+void server_vram::finish_resize_locked(const resize_plan & plan, const std::string & why, double ms, bool ok, int32_t old_slots,
+                                       int32_t new_slots, bool interrupted, double now_s) {
     last_resize_ms_ = (uint64_t) ms;
     refresh_geometry(geom_);
     LOG_INF("vram governor: cache %d -> %d chunks (%d -> %d slots, %s%s) in %.0f ms, free %d MiB%s; old bank showed %d MiB back after %.0f ms\n",
-            before, geom_.chunks, old_slots, new_slots, why.c_str(), interrupt ? ", urgent" : "", ms, last_free_mib_, ok ? "" : " [resize failed]",
-            last_release_seen_mib_, last_release_wait_ms_);
+            plan.before, geom_.chunks, old_slots, new_slots, why.c_str(), interrupted ? (plan.urgent ? ", urgent" : ", escalated") : "", ms,
+            last_free_mib_, ok ? "" : " [resize failed]", last_release_seen_mib_.load(), last_release_wait_ms_.load());
     if (!ok) {
         core_.reset_calm(now_s);
     }
+}
+
+// a resize under mu_ (the manual endpoint): the same work, one lock for the whole call
+bool server_vram::apply_chunks(int32_t chunks, const std::string & why, double now_s, bool urgent) {
+    resize_plan plan;
+    plan.chunks = chunks; plan.before = geom_.chunks; plan.urgent = urgent; plan.trim_abort = core_.policy.trim_abort;
+    plan.reserve_mib = core_.policy.reserve_mib; plan.watch_ms = core_.policy.poll_fast_ms;
+    int32_t old_slots = 0, new_slots = 0;
+    bool interrupted = false;
+    const double t0 = mono_s();
+    const bool ok = resize_unlocked(plan, old_slots, new_slots, interrupted);
+    finish_resize_locked(plan, why, (mono_s() - t0) * 1000.0, ok, old_slots, new_slots, interrupted, now_s);
     return ok;
 }
 
@@ -308,25 +349,40 @@ void server_vram::loop() {
         if (!read_card(free_mib, total_mib, used_mib)) { continue; }
         const double now = mono_s();
         std::string pause_why;
+        vram_action act;
+        resize_plan plan;
         {
         std::lock_guard<std::mutex> lk(mu_);
-        if (sim_until_s_ > now) { free_mib += sim_delta_mib_; }
+        free_mib += sim_delta_now();
         last_free_mib_ = free_mib;
         window_min_free_ = std::min(window_min_free_, free_mib);
 
         vram_inputs in;
         in.now_s = now; in.free_mib = free_mib; in.ready = core_ready_.load(); in.busy = busy_ ? busy_() : false; in.big_prefill = big_prefill_ ? big_prefill_() : false;
         refresh_geometry(geom_);
-        const vram_action act = core_.step(in, geom_);
+        act = core_.step(in, geom_);
         if (act.kind == vram_action_kind::SET_CHUNKS && act.chunks != geom_.chunks) {
-            const int32_t before = geom_.chunks;
-            apply_chunks(act.chunks, act.reason, now, act.urgent);
-            core_.note_applied(act, before, geom_.chunks, now);
+            plan.chunks = act.chunks; plan.before = geom_.chunks; plan.urgent = act.urgent;
+            plan.trim_abort = core_.policy.trim_abort; plan.reserve_mib = core_.policy.reserve_mib;
+            plan.watch_ms = core_.policy.poll_fast_ms;
+            resizing_ = true;
         } else if (act.kind == vram_action_kind::PAUSE) {
             pause_why = act.reason;
             LOG_WRN("vram governor: pause requested (%s), free %d MiB with the cache at its minimum\n",
                     act.reason.c_str(), free_mib);
         }
+        }
+        if (resizing_.load()) {
+            // VRAMFIX5: the resize itself runs without mu_, so /vram and /vram/policy answer while it waits for a ubatch
+            int32_t old_slots = 0, new_slots = 0;
+            bool interrupted = false;
+            const double t0 = mono_s();
+            const bool ok = resize_unlocked(plan, old_slots, new_slots, interrupted);
+            const double ms = (mono_s() - t0) * 1000.0;
+            std::lock_guard<std::mutex> lk(mu_);
+            finish_resize_locked(plan, act.reason, ms, ok, old_slots, new_slots, interrupted, now);
+            core_.note_applied(act, plan.before, geom_.chunks, now);
+            resizing_ = false;
         }
         if (!pause_why.empty()) {
             request_pause(pause_why, "");
@@ -481,7 +537,7 @@ server_vram::json server_vram::set_chunks_manual(int32_t chunks, std::string & e
     if (chunks < 0 || chunks > geom_.max_chunks) { err = "chunks out of range"; return json::object(); }
     const bool ok = chunks == geom_.chunks || apply_chunks(chunks, "manual", mono_s());
     if (!ok) { err = "resize failed"; }
-    return {{"chunks", geom_.chunks}, {"slots", geom_.chunks * chunk_slots_}, {"resize_ms", last_resize_ms_}};
+    return {{"chunks", geom_.chunks}, {"slots", geom_.chunks * chunk_slots_}, {"resize_ms", last_resize_ms_.load()}};
 }
 
 void server_vram::simulate(int32_t free_delta_mib, double seconds) {
@@ -552,10 +608,11 @@ server_vram::json server_vram::status() {
         {"cache", {{"enabled", geom_.chunks > 0}, {"chunk_slots", geom_.chunk_slots}, {"chunk_mib", geom_.chunk_mib},
                    {"chunks", geom_.chunks}, {"slots", geom_.chunks * geom_.chunk_slots}, {"mib", cache_mib},
                    {"target_chunks", geom_.chunks}, {"max_chunks", core_.policy.max_chunks < 0 ? json(nullptr) : json(core_.policy.max_chunks)},
-                   {"last_resize_ms", last_resize_ms_}, {"ubatch_interrupts", ubatch_interrupts_.load()}, {"recurrent_state", recurrent_}, {"slice_snapshots", snapshots_.load()},
+                   {"last_resize_ms", last_resize_ms_.load()}, {"ubatch_interrupts", ubatch_interrupts_.load()}, {"recurrent_state", recurrent_}, {"slice_snapshots", snapshots_.load()},
                    {"slice_snapshot_ms", snapshots_.load() ? (double) snapshot_us_.load() / 1000.0 / (double) snapshots_.load() : 0.0},
                    {"slice_snapshot_mib", (double) snapshot_bytes_.load() / 1048576.0}, {"rollback_failures", rollback_failures_.load()}, {"pause_cuts", pause_cuts_.load()},
-                   {"last_release_wait_ms", std::round(last_release_wait_ms_)}, {"last_release_seen_mib", last_release_seen_mib_}}},
+                   {"last_release_wait_ms", std::round(last_release_wait_ms_.load())}, {"last_release_seen_mib", last_release_seen_mib_.load()},
+                   {"resizing", resizing_.load()}, {"escalations", escalations_.load()}}},
         {"policy", policy_locked()},
         {"journal", {{"last_id", core_.journal.last_id()}, {"yields", core_.journal.totals.yields}, {"yielded_mib", core_.journal.totals.yielded_mib},
                      {"recovered_max_s", std::round(core_.journal.totals.recovered_max_s * 100.0) / 100.0}}},
