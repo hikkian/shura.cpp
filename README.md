@@ -149,6 +149,9 @@ it while a video plays or the browser is busy).
   cases left in GPU memory. The quantized types the models use do not show it.
 * **Upstream: `MUL_MAT_ID` with an offset ids view** (`iq3_xxs`, `n = 8`) fails in 8 of 10 runs on ROCm on plain upstream
   74bca3950 too. Our graphs never pass offset ids views.
+* **A pause during a very long prefill is slower on hybrid models.** With an empty cache (nothing left to give back) and a
+  100k-token prompt, the pause takes 293 ms to interrupt the slice on Tiel and free VRAM stays below the floor for about
+  1.15 s (measured 2026-10-28). Being worked on; dense models and prompts of a few tens of thousands of tokens are not affected.
 * **Decode steps run as HIP/CUDA graphs and are not interrupted.** An urgent trim during decode waits for the current
   step, about 13 ms on the reference machine. Backends other than CPU and CUDA/HIP stop only between micro-batches.
 * The CUDA build is not measured on this base.
