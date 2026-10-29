@@ -323,6 +323,7 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 llama_build_and_test(test-moe-cache-policy.cpp)
 llama_build_and_test(test-vram-governor.cpp)
+llama_build_and_test(test-pinned-fallback.cpp  LABEL "main backend"  LINK ggml)   # PINFAIL1: needs a CUDA/HIP device, skips without
 llama_build(test-vram-abort.cpp)   # VRAMLOGIC3: needs a model argument (see the file); not run by ctest
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately

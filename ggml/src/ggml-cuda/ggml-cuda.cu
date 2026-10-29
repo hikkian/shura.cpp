@@ -499,6 +499,175 @@ static void ggml_backend_cuda_host_stats(uint64_t * pinned_bytes, uint64_t * den
     if (denied)       { *denied       = g_host_pinned_denied.load(); }
 }
 
+// SHURA (PINFAIL1): pinned host memory that does not fit is refused up front. REPORT-VRAMLITE1: with 4.6 GiB of MemAvailable and a 9 GiB pinned
+// expert pool, the kernel logged ~3300 "SVM mapping failed, exceeds resident system memory limit" lines per start (one oversized allocation,
+// not a retry loop of ours), hipHostMalloc still returned success, and the first kernel of the MTP draft context faulted inside libamdhip64
+// (ihipLaunchKernel_validate), which left a core dump and a crash dialog on the desktop. Each pinned allocation is now checked against
+// MemAvailable and the TTM limit first; a refused one is served from pageable memory (one WARN), and when even that would not fit the
+// allocation fails with a message. A fault inside the GPU runtime ends the process with a diagnosis (exit 70) instead of a crash dump.
+// Test knobs: SHURA_FAKE_PIN_FAIL=1 (every pinned allocation fails) or =after=<MiB> (fails once that much is pinned),
+// SHURA_FAKE_MEM_AVAILABLE_MIB=<MiB>. Tuning: SHURA_PIN_RESERVE_MIB (default 1024), SHURA_PIN_LIMIT_MIB (default TTM limit - 1 GiB),
+// SHURA_PIN_CHECK=0 turns the budget check off, SHURA_NO_FAULT_GUARD=1 keeps the default crash behaviour.
+#if defined(__linux__)
+#    include <dlfcn.h>
+#    include <signal.h>
+#    include <ucontext.h>
+#    include <unistd.h>
+#endif
+
+static uint64_t ggml_cuda_env_mib(const char * name, uint64_t def_mib) {
+    const char * v = getenv(name);
+    return (v != nullptr && *v != '\0') ? strtoull(v, nullptr, 10) : def_mib;
+}
+
+static uint64_t ggml_cuda_mem_available_bytes() {
+    if (getenv("SHURA_FAKE_MEM_AVAILABLE_MIB") != nullptr) {
+        return ggml_cuda_env_mib("SHURA_FAKE_MEM_AVAILABLE_MIB", 0) << 20;
+    }
+#if defined(__linux__)
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f == nullptr) {
+        return 0;
+    }
+    char line[256];
+    unsigned long long kb = 0;
+    uint64_t res = 0;
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            res = (uint64_t) kb << 10;
+            break;
+        }
+    }
+    fclose(f);
+    return res;
+#else
+    return 0;
+#endif
+}
+
+// pages the TTM allows the GPU driver to hold for all processes; 0 = unknown
+static uint64_t ggml_cuda_ttm_limit_bytes() {
+#if defined(__linux__)
+    static const uint64_t limit = [] {
+        FILE * f = fopen("/sys/module/ttm/parameters/pages_limit", "r");
+        if (f == nullptr) {
+            return (uint64_t) 0;
+        }
+        unsigned long long pages = 0;
+        const bool ok = fscanf(f, "%llu", &pages) == 1;
+        fclose(f);
+        return ok ? (uint64_t) pages * (uint64_t) sysconf(_SC_PAGESIZE) : (uint64_t) 0;
+    }();
+    return limit;
+#else
+    return 0;
+#endif
+}
+
+enum ggml_cuda_pin_verdict {
+    GGML_CUDA_PIN_OK,
+    GGML_CUDA_PIN_DENIED,    // use pageable memory
+    GGML_CUDA_PIN_NO_MEMORY, // pageable memory would not fit either
+};
+
+static ggml_cuda_pin_verdict ggml_cuda_pin_check(size_t size, std::string & why) {
+    const uint64_t pinned = g_host_pinned_bytes.load();
+    const uint64_t reserve = ggml_cuda_env_mib("SHURA_PIN_RESERVE_MIB", 1024) << 20;
+    const uint64_t avail = ggml_cuda_mem_available_bytes();
+    char buf[256];
+
+    bool denied = false;
+    const char * fake = getenv("SHURA_FAKE_PIN_FAIL");
+    if (fake != nullptr && *fake != '\0' && strcmp(fake, "0") != 0) {
+        if (strncmp(fake, "after=", 6) == 0) {
+            denied = pinned + size > (strtoull(fake + 6, nullptr, 10) << 20);
+            why = "SHURA_FAKE_PIN_FAIL limit";
+        } else {
+            denied = true;
+            why = "SHURA_FAKE_PIN_FAIL";
+        }
+    }
+    if (!denied && ggml_cuda_env_mib("SHURA_PIN_CHECK", 1) != 0) {
+        uint64_t limit = ggml_cuda_env_mib("SHURA_PIN_LIMIT_MIB", 0) << 20;
+        if (limit == 0 && ggml_cuda_ttm_limit_bytes() > (1ull << 30)) {
+            limit = ggml_cuda_ttm_limit_bytes() - (1ull << 30);
+        }
+        if (avail != 0 && size + reserve > avail) {
+            snprintf(buf, sizeof(buf), "%.2f GiB + %.2f GiB reserve > MemAvailable %.2f GiB",
+                     size / 1073741824.0, reserve / 1073741824.0, avail / 1073741824.0);
+            why = buf;
+            denied = true;
+        } else if (limit != 0 && pinned + size > limit) {
+            snprintf(buf, sizeof(buf), "%.2f GiB pinned + %.2f GiB > the GPU driver's system memory limit %.2f GiB",
+                     pinned / 1073741824.0, size / 1073741824.0, limit / 1073741824.0);
+            why = buf;
+            denied = true;
+        }
+    }
+    if (!denied) {
+        return GGML_CUDA_PIN_OK;
+    }
+    // pageable memory is the fallback; when it would not fit either (the system would swap the desktop out), say so
+    if (size >= (256ull << 20) && avail != 0 && size + reserve / 2 > avail) {
+        snprintf(buf, sizeof(buf), "%s; even unpinned it does not fit (MemAvailable %.2f GiB)", why.c_str(), avail / 1073741824.0);
+        why = buf;
+        return GGML_CUDA_PIN_NO_MEMORY;
+    }
+    return GGML_CUDA_PIN_DENIED;
+}
+
+#if defined(__linux__) && defined(__x86_64__)
+static void ggml_cuda_runtime_fault_write(const char * s) {
+    size_t n = 0;
+    while (s[n] != '\0') { n++; }
+    if (write(2, s, n) < 0) { /* nothing to do */ }
+}
+
+// a fault whose instruction is inside the GPU runtime (not in this code) is reported and ends the process; any other fault keeps its crash dump
+static void ggml_cuda_runtime_fault_handler(int sig, siginfo_t * si, void * uctx) {
+    GGML_UNUSED(si);
+    const void * rip = (const void *) ((ucontext_t *) uctx)->uc_mcontext.gregs[REG_RIP];
+    Dl_info info;
+    if (dladdr(rip, &info) != 0 && info.dli_fname != nullptr &&
+        (strstr(info.dli_fname, "libamdhip64") != nullptr || strstr(info.dli_fname, "libhsa-runtime") != nullptr ||
+         strstr(info.dli_fname, "libcudart") != nullptr || strstr(info.dli_fname, "libcuda.so") != nullptr)) {
+        char num[24];
+        size_t i = sizeof(num) - 1;
+        num[i] = '\0';
+        uint64_t mib = g_host_pinned_bytes.load() >> 20;
+        do { num[--i] = (char) ('0' + mib % 10); mib /= 10; } while (mib != 0 && i > 0);
+        ggml_cuda_runtime_fault_write("\nfatal: fault inside the GPU runtime (");
+        ggml_cuda_runtime_fault_write(info.dli_fname);
+        ggml_cuda_runtime_fault_write("), pinned host memory in this process: ");
+        ggml_cuda_runtime_fault_write(num + i);
+        ggml_cuda_runtime_fault_write(" MiB.\nIf `journalctl -k` shows \"SVM mapping failed, exceeds resident system memory limit\", the pinned memory\n"
+                                      "did not fit the GPU driver's system memory limit: use a smaller expert pool (more layers on the GPU), close other\n"
+                                      "programs, or drop --moe-cache-pinned-source. Exiting with code 70.\n");
+        _exit(70);
+    }
+    GGML_UNUSED(sig); // SA_RESETHAND: returning re-runs the fault with the default action
+}
+
+static void ggml_cuda_install_runtime_fault_guard() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char * off = getenv("SHURA_NO_FAULT_GUARD");
+        if (off != nullptr && *off != '\0' && strcmp(off, "0") != 0) {
+            return;
+        }
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = ggml_cuda_runtime_fault_handler;
+        sa.sa_flags     = SA_SIGINFO | SA_RESETHAND;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, nullptr);
+        sigaction(SIGBUS, &sa, nullptr);
+    });
+}
+#else
+static void ggml_cuda_install_runtime_fault_guard() {}
+#endif
+
 static void ggml_backend_cuda_pool_freeze(bool frozen) { g_pool_frozen.store(frozen); }
 
 static void ggml_backend_cuda_pool_stats(uint64_t * overflows, uint64_t * pool_bytes) {
@@ -1421,13 +1590,34 @@ static void * ggml_cuda_host_malloc(size_t size) {
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * ptr = nullptr;
     const uint64_t max_pinned = g_host_pinned_max_bytes.load();
-    if (max_pinned > 0 && g_pool_frozen.load() && g_host_pinned_bytes.load() + size > max_pinned) {
+    std::string why;
+    const ggml_cuda_pin_verdict verdict = ggml_cuda_pin_check(size, why);
+    if (verdict != GGML_CUDA_PIN_OK) {
+        ++g_host_pinned_denied;
+        if (verdict == GGML_CUDA_PIN_NO_MEMORY) {
+            GGML_LOG_ERROR("%s: cannot pin %.2f MiB of host memory (%s)\n", __func__, size / 1048576.0, why.c_str());
+            return nullptr;
+        }
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("%s: not pinning %.2f MiB of host memory (%s): using pageable memory, transfers from it are slower "
+                          "(further refusals are counted in pinned_denied)\n", __func__, size / 1048576.0, why.c_str());
+        }
+    } else if (max_pinned > 0 && g_pool_frozen.load() && g_host_pinned_bytes.load() + size > max_pinned) {
         // RAMGUARD1f: over the pinned-memory limit after warm-up: pageable memory instead of unbounded growth of pinned buffers
         ++g_host_pinned_denied;
     } else {
         ptr = ggml_cuda_host_malloc(size);
         if (ptr != nullptr) {
             g_host_pinned_bytes += size;
+            ggml_cuda_install_runtime_fault_guard();
+        } else if (!ggml_cuda_pinned_memory_disabled()) {
+            ++g_host_pinned_denied;
+            static std::atomic<bool> warned_alloc{false};
+            if (!warned_alloc.exchange(true)) {
+                GGML_LOG_WARN("%s: the GPU runtime refused to pin %.2f MiB of host memory: using pageable memory\n",
+                              __func__, size / 1048576.0);
+            }
         }
     }
 

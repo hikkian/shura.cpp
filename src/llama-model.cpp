@@ -2060,7 +2060,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         for (auto & buf : bufs) {
             if (!ml.no_alloc && ml.moe_cache_pinned_buft == buft && ggml_backend_buffer_get_type(buf.get()) != buft) {
-                throw std::runtime_error("pinned expert allocation fell back to pageable memory");
+                // PINFAIL1: pinning was refused (not enough memory for it): the expert source stays in pageable memory, slower to copy from
+                LLAMA_LOG_WARN("%s: %.2f MiB of expert sources could not be pinned and are in pageable memory (--moe-cache-pinned-source "
+                               "is partly off; expert cache fills are slower)\n", __func__, ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
             }
             // indicate that this buffer contains weights
             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
