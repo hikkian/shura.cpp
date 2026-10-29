@@ -2999,6 +2999,37 @@ private:
         return true;
     }
 
+    // A2PORT1: what a save of this slot will write, for the gateway's admission check (RAM/tmpfs space) before it asks for the save.
+    // The file is the llama state of the sequence plus the prompt tokens, then the context-checkpoint appendix, then the draft appendix;
+    // the margin covers headers and growth between the estimate and the save. /slots reports the parts too, to see what dominates.
+    void add_slot_save_estimate(json & res, const server_slot & slot) const {
+        const size_t state_bytes = llama_state_seq_get_size(ctx_tgt, slot.id);
+        const size_t token_bytes = slot.prompt.tokens.size() * sizeof(llama_token);
+        size_t checkpoint_bytes = 0;
+        if (!slot.prompt.checkpoints.empty()) {
+            checkpoint_bytes = 3 * sizeof(uint32_t);
+            for (const auto & cur : slot.prompt.checkpoints) {
+                checkpoint_bytes += sizeof(cur.n_tokens) + sizeof(cur.pos_min) + sizeof(cur.pos_max) +
+                    3 * sizeof(uint64_t) + cur.data_tgt.size() + cur.data_dft.size() + cur.data_spec.size();
+            }
+        }
+        size_t draft_bytes = 0;
+        if (ctx_dft != nullptr) {
+            draft_bytes += llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+        std::vector<uint8_t> data_spec;
+        common_speculative_get_state(spec.get(), slot.id, data_spec);
+        draft_bytes += data_spec.size();
+        if (draft_bytes > 0) {
+            draft_bytes += 2 * sizeof(uint32_t) + 2 * sizeof(uint64_t);
+        }
+        res["n_context_checkpoints"]           = slot.prompt.checkpoints.size();
+        res["n_context_checkpoint_bytes"]      = checkpoint_bytes;
+        res["n_slot_save_state_bytes"]         = state_bytes + token_bytes;
+        res["n_slot_save_draft_bytes"]         = draft_bytes;
+        res["n_slot_save_estimated_bytes"]     = state_bytes + token_bytes + checkpoint_bytes + draft_bytes + (64ull << 20);
+    }
+
     // returns the number of bytes consumed, 0 if there is no usable draft state
     // the draft starts empty unless the file holds a draft state that fits the draft context
     size_t load_slot_draft(const std::string & filepath, size_t offset, server_slot & slot) const {
@@ -3253,7 +3284,9 @@ private:
                             n_idle_slots++;
                         }
 
-                        slots_data.push_back(slot.to_json(slots_debug == 0));
+                        json slot_json = slot.to_json(slots_debug == 0);
+                        add_slot_save_estimate(slot_json, slot);
+                        slots_data.push_back(std::move(slot_json));
                     }
                     SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
 
