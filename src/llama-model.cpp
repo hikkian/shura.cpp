@@ -3088,27 +3088,34 @@ bool llama_model_base::moe_expert_cache_split(ggml_backend_sched_t sched, ggml_b
         il = int(layer);
     }
     if (!output) return true;
+    // EXPLAYOUTD1: a failed callback is the whole graph's -1; say which condition refused
+    const auto fail = [&](const char * why) {
+        LLAMA_LOG_ERROR("%s: two-channel split of layer %d (%s %s): %s\n", __func__, il, cpu ? "cpu" : "gpu",
+                before ? "before" : "after", why);
+        return false;
+    };
     auto found = pimpl->moe_channels.find(il);
-    if (found == pimpl->moe_channels.end()) return false;
+    if (found == pimpl->moe_channels.end()) return fail("the layer has no channel runtime");
     auto & runtime = found->second;
     if (!cpu) {
-        if (!runtime.active || runtime.gpu_ended) return false;
+        if (!runtime.active || runtime.gpu_ended) return fail("the GPU part ended without an active plan, or twice");
         ggml_backend_event_record(runtime.end.get(), backend);
         runtime.gpu_ended = true;
         return true;
     }
     if (!before) {
-        if (!runtime.active) return false;
+        if (!runtime.active) return fail("the CPU part ended without an active plan");
         runtime.cpu_us = double(std::max<int64_t>(1, ggml_time_us() - runtime.start_us));
         runtime.cpu_compute_us = double(elapsed_us);
         runtime.cpu_ready = true;
         return true;
     }
-    if (runtime.active || output->op != GGML_OP_MUL_MAT_ID) return false;
+    if (runtime.active) return fail("the layer is already active");
+    if (output->op != GGML_OP_MUL_MAT_ID) return fail("the cold output is not a MUL_MAT_ID");
     ggml_tensor * ids = output->src[2];
     if (!ids || !ids->data || !ids->buffer || !ggml_backend_buffer_is_host(ids->buffer) ||
             ids->type != GGML_TYPE_I32 || ids->ne[0] < 1 || ids->ne[0] > 8 ||
-            ids->ne[1] < 1 || ids->ne[1] > 8) return false;
+            ids->ne[1] < 1 || ids->ne[1] > 8) return fail("the expert ids are not a small host I32 tensor");
     auto & layer = layers[il];
     ggml_tensor * sources[] = {moe_cache_gate(layer), layer.ffn_up_exps, layer.ffn_down_exps};
     ggml_tensor * targets[] = {layer.ffn_gate_exps_hot, layer.ffn_up_exps_hot, layer.ffn_down_exps_hot};
@@ -3117,11 +3124,11 @@ bool llama_model_base::moe_expert_cache_split(ggml_backend_sched_t sched, ggml_b
         if (!sources[projection]->data ||
                 !sources[projection]->buffer || !ggml_backend_buffer_is_host(sources[projection]->buffer) ||
                 sources[projection]->nb[2] != targets[projection]->nb[2] ||
-                targets[projection]->ne[2] != runtime.policy.capacity()) return false;
+                targets[projection]->ne[2] != runtime.policy.capacity()) return fail("an expert source is not host memory or does not match its cache bank");
     }
     ggml_backend_t gpu = ggml_backend_sched_get_tensor_backend(sched, layer.moe_map_hot);
     if (!gpu || ggml_backend_get_device(gpu) != ggml_backend_buft_get_device(
-            ggml_backend_buffer_get_type(layer.ffn_gate_exps_hot->buffer))) return false;
+            ggml_backend_buffer_get_type(layer.ffn_gate_exps_hot->buffer))) return fail("the hot map is not on the device of the cache bank");
     runtime.ids.resize(ids->ne[0] * ids->ne[1]);
     size_t index = 0;
     for (int64_t token = 0; token < ids->ne[1]; ++token) {
@@ -3129,7 +3136,7 @@ bool llama_model_base::moe_expert_cache_split(ggml_backend_sched_t sched, ggml_b
             runtime.ids[index++] = *(const int32_t *) ((const char *) ids->data + token*ids->nb[1] + k*ids->nb[0]);
         }
     }
-    if (!runtime.policy.make_plan(runtime.ids, int(ids->ne[1]), int(ids->ne[0]))) return false;
+    if (!runtime.policy.make_plan(runtime.ids, int(ids->ne[1]), int(ids->ne[0]))) return fail("the cache policy refused to plan");
     const auto & plan = runtime.policy.latest();
     runtime.active = true;
     runtime.cpu_ready = runtime.gpu_ended = false;
