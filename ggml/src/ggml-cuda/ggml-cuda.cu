@@ -507,7 +507,7 @@ static void ggml_backend_cuda_host_stats(uint64_t * pinned_bytes, uint64_t * den
 // allocation fails with a message. A fault inside the GPU runtime ends the process with a diagnosis (exit 70) instead of a crash dump.
 // Test knobs: SHURA_FAKE_PIN_FAIL=1 (every pinned allocation fails) or =after=<MiB> (fails once that much is pinned),
 // SHURA_FAKE_MEM_AVAILABLE_MIB=<MiB>. Tuning: SHURA_PIN_RESERVE_MIB (default 1024), SHURA_PIN_LIMIT_MIB (default TTM limit - 1 GiB),
-// SHURA_PIN_CHECK=0 turns the budget check off, SHURA_NO_FAULT_GUARD=1 keeps the default crash behaviour.
+// SHURA_PIN_CHECK=0 turns the budget check off, SHURA_NO_FAULT_HANDLER=1 keeps the default crash behaviour.
 #if defined(__linux__)
 #    include <dlfcn.h>
 #    include <signal.h>
@@ -623,35 +623,46 @@ static void ggml_cuda_runtime_fault_write(const char * s) {
     if (write(2, s, n) < 0) { /* nothing to do */ }
 }
 
+// async-signal-safe number output: decimal or 0x-hex
+static void ggml_cuda_runtime_fault_write_num(uint64_t v, bool hex) {
+    char num[24];
+    size_t i = sizeof(num) - 1;
+    num[i] = '\0';
+    const uint64_t base = hex ? 16 : 10;
+    do { num[--i] = "0123456789abcdef"[v % base]; v /= base; } while (v != 0 && i > 2);
+    if (hex) { num[--i] = 'x'; num[--i] = '0'; }
+    ggml_cuda_runtime_fault_write(num + i);
+}
+
 // a fault whose instruction is inside the GPU runtime (not in this code) is reported and ends the process; any other fault keeps its crash dump
 static void ggml_cuda_runtime_fault_handler(int sig, siginfo_t * si, void * uctx) {
-    GGML_UNUSED(si);
     const void * rip = (const void *) ((ucontext_t *) uctx)->uc_mcontext.gregs[REG_RIP];
     Dl_info info;
     if (dladdr(rip, &info) != 0 && info.dli_fname != nullptr &&
         (strstr(info.dli_fname, "libamdhip64") != nullptr || strstr(info.dli_fname, "libhsa-runtime") != nullptr ||
          strstr(info.dli_fname, "libcudart") != nullptr || strstr(info.dli_fname, "libcuda.so") != nullptr)) {
-        char num[24];
-        size_t i = sizeof(num) - 1;
-        num[i] = '\0';
-        uint64_t mib = g_host_pinned_bytes.load() >> 20;
-        do { num[--i] = (char) ('0' + mib % 10); mib /= 10; } while (mib != 0 && i > 0);
-        ggml_cuda_runtime_fault_write("\nfatal: fault inside the GPU runtime (");
+        ggml_cuda_runtime_fault_write("\nfatal: signal ");
+        ggml_cuda_runtime_fault_write_num((uint64_t) sig, false);
+        ggml_cuda_runtime_fault_write(" at address ");
+        ggml_cuda_runtime_fault_write_num((uint64_t) (uintptr_t) si->si_addr, true);
+        ggml_cuda_runtime_fault_write(" inside the GPU runtime: ");
         ggml_cuda_runtime_fault_write(info.dli_fname);
-        ggml_cuda_runtime_fault_write("), pinned host memory in this process: ");
-        ggml_cuda_runtime_fault_write(num + i);
+        ggml_cuda_runtime_fault_write(" + ");
+        ggml_cuda_runtime_fault_write_num((uint64_t) ((const char *) rip - (const char *) info.dli_fbase), true);
+        ggml_cuda_runtime_fault_write("; pinned host memory in this process: ");
+        ggml_cuda_runtime_fault_write_num(g_host_pinned_bytes.load() >> 20, false);
         ggml_cuda_runtime_fault_write(" MiB.\nIf `journalctl -k` shows \"SVM mapping failed, exceeds resident system memory limit\", the pinned memory\n"
                                       "did not fit the GPU driver's system memory limit: use a smaller expert pool (more layers on the GPU), close other\n"
-                                      "programs, or drop --moe-cache-pinned-source. Exiting with code 70.\n");
+                                      "programs, or drop --moe-cache-pinned-source. Exiting with code 70 (SHURA_NO_FAULT_HANDLER=1 keeps the crash dump).\n");
         _exit(70);
     }
-    GGML_UNUSED(sig); // SA_RESETHAND: returning re-runs the fault with the default action
+    // SA_RESETHAND: returning re-runs the fault with the default action
 }
 
 static void ggml_cuda_install_runtime_fault_guard() {
     static std::once_flag once;
     std::call_once(once, [] {
-        const char * off = getenv("SHURA_NO_FAULT_GUARD");
+        const char * off = getenv("SHURA_NO_FAULT_HANDLER");
         if (off != nullptr && *off != '\0' && strcmp(off, "0") != 0) {
             return;
         }

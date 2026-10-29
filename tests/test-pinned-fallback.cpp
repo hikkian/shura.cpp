@@ -43,30 +43,36 @@ static bool usable(ggml_backend_buffer_t buf) {
 #if defined(__linux__)
 struct dim3_like { unsigned x, y, z; };
 
-// child: pins memory (which installs the guard), then makes the GPU runtime fault; returns the wait status
-static int run_child(bool runtime_fault, ggml_backend_buffer_type_t host_buft) {
+// child process (this binary started with an argument): pins memory, which installs the fault handler, then faults
+static int child_main(const char * mode, ggml_backend_buffer_type_t host_buft) {
+    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(host_buft, 4 * MiB);
+    if (b == nullptr) {
+        return 3;
+    }
+    if (strcmp(mode, "runtime") == 0) {
+        using launch_t = int (*)(const void *, dim3_like, dim3_like, void **, size_t, void *);
+        launch_t launch = (launch_t) dlsym(RTLD_DEFAULT, "hipLaunchKernel");
+        if (launch == nullptr) {
+            launch = (launch_t) dlsym(RTLD_DEFAULT, "cudaLaunchKernel");
+        }
+        if (launch == nullptr) {
+            return 4;
+        }
+        launch((const void *) 0x1234, {1, 1, 1}, {1, 1, 1}, nullptr, 0, nullptr);
+        return 5; // the runtime rejected the bogus handle without faulting: nothing to test
+    }
+    volatile int * p = nullptr; // a fault in this code
+    *p = 1;
+    return 6;
+}
+
+// runs this binary as a child in the given mode; returns the wait status
+static int run_child(const char * self, const char * mode) {
     fflush(nullptr);
     const pid_t pid = fork();
     if (pid == 0) {
-        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(host_buft, 4 * MiB);
-        if (b == nullptr) {
-            _exit(3);
-        }
-        if (runtime_fault) {
-            using launch_t = int (*)(const void *, dim3_like, dim3_like, void **, size_t, void *);
-            launch_t launch = (launch_t) dlsym(RTLD_DEFAULT, "hipLaunchKernel");
-            if (launch == nullptr) {
-                launch = (launch_t) dlsym(RTLD_DEFAULT, "cudaLaunchKernel");
-            }
-            if (launch == nullptr) {
-                _exit(4);
-            }
-            launch((const void *) 0x1234, {1, 1, 1}, {1, 1, 1}, nullptr, 0, nullptr);
-            _exit(5); // the runtime rejected the bogus handle without faulting: nothing to test
-        }
-        volatile int * p = nullptr;
-        *p = 1;
-        _exit(6);
+        execl(self, self, mode, (char *) nullptr);
+        _exit(7);
     }
     int status = 0;
     waitpid(pid, &status, 0);
@@ -74,7 +80,7 @@ static int run_child(bool runtime_fault, ggml_backend_buffer_type_t host_buft) {
 }
 #endif
 
-int main() {
+int main(int argc, char ** argv) {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
@@ -82,6 +88,14 @@ int main() {
         printf("test-pinned-fallback: no GPU with host buffers, skipped\n");
         return 0;
     }
+#if defined(__linux__)
+    if (argc > 1) {
+        return child_main(argv[1], host_buft);
+    }
+#else
+    GGML_UNUSED(argc);
+    GGML_UNUSED(argv);
+#endif
     host_stats_t stats = (host_stats_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_host_stats");
     if (stats == nullptr) {
         printf("test-pinned-fallback: not a CUDA/HIP device, skipped\n");
@@ -148,15 +162,19 @@ int main() {
     unsetenv("SHURA_FAKE_MEM_AVAILABLE_MIB");
 
 #if defined(__linux__)
-    // 7. a fault inside the GPU runtime: exit code 70 with a message; a fault in this code: still a crash
+    // 7. a fault inside the GPU runtime: exit code 70 with a message; a fault in this code: still a crash; the handler can be turned off
     {
-        const int st = run_child(true, host_buft);
+        const int st = run_child(argv[0], "runtime");
         if (WIFEXITED(st) && WEXITSTATUS(st) == 5) {
-            printf("test-pinned-fallback: the runtime rejects a bogus kernel handle without faulting, fault guard not exercised\n");
+            printf("test-pinned-fallback: the runtime rejects a bogus kernel handle without faulting, fault handler not exercised\n");
         } else {
             CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 70);
+            setenv("SHURA_NO_FAULT_HANDLER", "1", 1);
+            const int st_off = run_child(argv[0], "runtime");
+            CHECK(WIFSIGNALED(st_off) && WTERMSIG(st_off) == SIGSEGV);
+            unsetenv("SHURA_NO_FAULT_HANDLER");
         }
-        const int st2 = run_child(false, host_buft);
+        const int st2 = run_child(argv[0], "own");
         CHECK(WIFSIGNALED(st2) && WTERMSIG(st2) == SIGSEGV);
     }
 #endif
