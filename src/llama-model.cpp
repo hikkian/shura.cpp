@@ -1277,6 +1277,7 @@ struct llama_moe_channel_runtime {
     ggml_backend_event_ptr end;
     std::vector<int32_t> ids;
     bool active = false;
+    bool empty = false;      // no token reaches this layer's experts in this graph (last layer of a ubatch without outputs)
     bool gpu_ended = false;
     bool cpu_ready = false;
     int64_t start_us = 0;
@@ -3098,12 +3099,14 @@ bool llama_model_base::moe_expert_cache_split(ggml_backend_sched_t sched, ggml_b
     if (found == pimpl->moe_channels.end()) return fail("the layer has no channel runtime");
     auto & runtime = found->second;
     if (!cpu) {
+        if (runtime.empty) return true;
         if (!runtime.active || runtime.gpu_ended) return fail("the GPU part ended without an active plan, or twice");
         ggml_backend_event_record(runtime.end.get(), backend);
         runtime.gpu_ended = true;
         return true;
     }
     if (!before) {
+        if (runtime.empty) return true;
         if (!runtime.active) return fail("the CPU part ended without an active plan");
         runtime.cpu_us = double(std::max<int64_t>(1, ggml_time_us() - runtime.start_us));
         runtime.cpu_compute_us = double(elapsed_us);
@@ -3113,9 +3116,22 @@ bool llama_model_base::moe_expert_cache_split(ggml_backend_sched_t sched, ggml_b
     if (runtime.active) return fail("the layer is already active");
     if (output->op != GGML_OP_MUL_MAT_ID) return fail("the cold output is not a MUL_MAT_ID");
     ggml_tensor * ids = output->src[2];
+    // EXPLAYOUTD1: the last layer of a ubatch that needs no logits is computed for ZERO rows (inp_out_ids is empty), so its expert ids have
+    // ne[1] == 0. There is nothing to plan, upload or time: let both sides pass through. (With -ncmoe the last layers are on the GPU and never
+    // got here; with every layer on the CPU tier the very first ubatch of a perplexity chunk or a prefill failed the whole graph with -1.)
+    if (ids && ids->ne[1] == 0) {
+        runtime.empty = true;
+        return true;
+    }
     if (!ids || !ids->data || !ids->buffer || !ggml_backend_buffer_is_host(ids->buffer) ||
             ids->type != GGML_TYPE_I32 || ids->ne[0] < 1 || ids->ne[0] > 8 ||
-            ids->ne[1] < 1 || ids->ne[1] > 8) return fail("the expert ids are not a small host I32 tensor");
+            ids->ne[1] < 1 || ids->ne[1] > 8) {
+        LLAMA_LOG_ERROR("%s: layer %d ids: tensor=%s op=%s data=%p buffer=%p host=%d type=%d ne=[%lld,%lld] view_src=%s\n", __func__, il,
+                ids ? ids->name : "(null)", ids ? ggml_op_name(ids->op) : "-", ids ? ids->data : nullptr, ids ? (void *) ids->buffer : nullptr,
+                ids && ids->buffer ? (int) ggml_backend_buffer_is_host(ids->buffer) : -1, ids ? (int) ids->type : -1,
+                ids ? (long long) ids->ne[0] : -1, ids ? (long long) ids->ne[1] : -1, ids && ids->view_src ? ids->view_src->name : "-");
+        return fail("the expert ids are not a small host I32 tensor");
+    }
     auto & layer = layers[il];
     ggml_tensor * sources[] = {moe_cache_gate(layer), layer.ffn_up_exps, layer.ffn_down_exps};
     ggml_tensor * targets[] = {layer.ffn_gate_exps_hot, layer.ffn_up_exps_hot, layer.ffn_down_exps_hot};
@@ -3194,6 +3210,7 @@ bool llama_model_base::finish_moe_expert_cache_channels(bool success) {
     uint64_t cpu_us = 0, gpu_us = 0;
     for (auto & item : pimpl->moe_channels) {
         auto & runtime = item.second;
+        runtime.empty = false;
         if (!runtime.active) continue;
         float ms = 0;
         if (success) {
