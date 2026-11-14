@@ -1543,6 +1543,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     //   neither (qwen35 / qwen35moe): a single trained MTP head.
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
+    int32_t draft_window  = 0;       // SHURA: SHURA_MTP_WINDOW (0 = the whole context)
+
+    // SHURA: keep only the last draft_window positions of seq_id in the draft KV before a decode that starts at pos
+    void trim_window(llama_seq_id seq_id, llama_pos pos) {
+        if (draft_window > 0 && pos > draft_window) {
+            llama_memory_seq_rm(llama_get_memory(this->params.ctx_dft), seq_id, 0, pos - draft_window);
+        }
+    }
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
@@ -1620,6 +1628,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+        // SHURA (REBASE1): SHURA_MTP_WINDOW=N: the MTP draft attends only to the last N positions (its own KV is trimmed before
+        // every decode; the draft context is created with room for N + a batch). The target's verification stays full, so the
+        // answer does not change, only the acceptance; on a long context each draft step no longer reads the whole KV.
+        if (const char * w = getenv("SHURA_MTP_WINDOW"); w != nullptr && !is_mem_shared) {
+            draft_window = std::max(0, atoi(w));
+        }
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
@@ -1785,6 +1799,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {   // SHURA: the draft window
+                    if (i_batch_beg[seq_id] >= 0) {
+                        trim_window(seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0]);
+                    }
+                }
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
@@ -1905,6 +1924,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {   // SHURA: the draft window
+                if (drafting[seq_id]) {
+                    trim_window(seq_id, dparams[seq_id].pos0);
+                }
+            }
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
@@ -2846,6 +2870,14 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+    // SHURA (REBASE1): with an MTP draft window the draft KV holds the window plus one batch (trimmed before every decode)
+    if (const char * w = getenv("SHURA_MTP_WINDOW"); w != nullptr && atoi(w) > 0 && spec_mtp && !has_draft) {
+        const uint32_t need = (uint32_t) atoi(w) + (uint32_t) std::max(params.n_batch, params.n_ubatch) + 256;
+        if (need < cparams.n_ctx) {
+            cparams.n_ctx = need;
+            LOG_INF("%s: MTP draft window %d: the draft context holds %u tokens\n", __func__, atoi(w), need);
+        }
+    }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
