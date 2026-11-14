@@ -355,6 +355,21 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Number of tokens in the reasoning budget (-1 = disabled)"));
 
+    add((new field_num("reasoning_budget_soft_tokens", params.sampling.reasoning_budget_soft_tokens))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Soft target of the reasoning block in tokens: below it the budget sampler never intervenes, from it on ThinkBrake may end the thought at a sentence end (-1 = off)"));
+
+    add((new field_num("reasoning_budget_grace_tokens", params.sampling.reasoning_budget_grace_tokens))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("At the reasoning budget, wait up to this many more tokens for a sentence end before forcing the message and the end tag (0 = cut at once)"));
+
+    add((new field_bool("reasoning_brake_shadow", params.sampling.reasoning_brake_shadow))
+        ->set_desc("Shadow mode: evaluate ThinkBrake and the reasoning budget and report in timings/usage where they would have fired, without forcing anything"));
+
+    add((new field_num("think_brake_margin", params.sampling.think_brake_margin))
+        ->set_hard_limits(-1, 1000)
+        ->set_desc("ThinkBrake margin tau: end the thought at a sentence end when (logit of the best token - logit of the end tag) / temperature <= tau (< 0 = off)"));
+
     add((new field_str("reasoning_budget_start_tag"))
         ->set_desc("Token string marking the start of the reasoning budget section")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

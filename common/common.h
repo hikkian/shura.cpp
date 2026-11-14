@@ -302,6 +302,11 @@ struct common_params_sampling {
     std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
     std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
+    // THINK3b (effort levels, docs/EFFORT.md): soft target, ThinkBrake and the grace window at the ceiling
+    int32_t                   reasoning_budget_soft_tokens  = -1;    // soft target of a thinking block; -1 = off (also turns ThinkBrake off)
+    int32_t                   reasoning_budget_grace_tokens = 48;    // at the ceiling, wait up to this many tokens for a sentence end; 0 = cut at once
+    float                     think_brake_margin            = 0.1f;  // ThinkBrake margin tau (arXiv 2510.00546: 0.1 for Qwen3 / R1-7B); < 0 = off
+    bool                      reasoning_brake_shadow        = false; // FRESH1 shadow mode: evaluate ThinkBrake and the ceiling, report them, force nothing
 
     bool backend_sampling = false;
 

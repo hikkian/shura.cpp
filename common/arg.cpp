@@ -3887,6 +3887,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET"));
     add_opt(common_arg(
+        {"--reasoning-budget-soft"}, "N",
+        "soft target of a thinking block in tokens: below it the budget sampler never intervenes; from it on, ThinkBrake may end the thought at a sentence end (default: -1 = off)",
+        [](common_params & params, int value) {
+            if (value < -1) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_budget_soft_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_SOFT"));
+    add_opt(common_arg(
+        {"--reasoning-budget-grace"}, "N",
+        "when the reasoning budget runs out, wait up to N more tokens for a sentence end before forcing the message and the end tag (default: 48, 0 = cut at once)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_budget_grace_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_GRACE"));
+    add_opt(common_arg(
+        {"--reasoning-brake-shadow"},
+        "shadow mode for ThinkBrake and the reasoning budget: evaluate them and report in timings/usage where they would have fired, but force nothing (output identical to running without them)",
+        [](common_params & params) {
+            params.sampling.reasoning_brake_shadow = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BRAKE_SHADOW"));
+    add_opt(common_arg(
+        {"--think-brake-margin"}, "TAU",
+        "ThinkBrake (arXiv 2510.00546): end the thought at a sentence end when (logit of the best token - logit of the end tag) / temperature <= TAU; needs --reasoning-budget-soft (default: 0.1, negative = off)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.think_brake_margin = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BRAKE_MARGIN"));
+    add_opt(common_arg(
         {"--reasoning-budget-message"}, "MESSAGE",
         "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)",
         [](common_params & params, const std::string & value) {

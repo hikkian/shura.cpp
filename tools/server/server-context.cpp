@@ -16,6 +16,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "reasoning-budget.h"
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
@@ -426,6 +427,20 @@ struct server_slot {
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
+
+    // THINK3b: copy the reasoning-budget sampler's counters into the stats sent with a result
+    void update_reasoning_stats() {
+        common_reasoning_budget_info info;
+        stats.rb_active = smpl && common_sampler_reasoning_budget_info(smpl.get(), &info);
+        if (!stats.rb_active) {
+            return;
+        }
+        stats.rb_shadow           = info.shadow;
+        stats.rb_reasoning_tokens = info.reasoning_tokens;
+        stats.rb_brake_fired      = info.brake_hit;
+        stats.rb_budget_hit       = info.ceiling_hit;
+        stats.rb_first_fire_token = info.first_fire_token;
+    }
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -2451,6 +2466,7 @@ private:
 
         // populate timings if this is final response or timings_per_token is enabled
         if (slot.stop != STOP_TYPE_NONE || slot.task->params.timings_per_token) {
+            slot.update_reasoning_stats();
             res->stats = slot.stats;
         }
 
@@ -2490,6 +2506,7 @@ private:
             res->content     = std::move(slot.generated);
             res->tokens      = std::move(slot.generated_tokens);
         }
+        slot.update_reasoning_stats();
         res->stats           = slot.stats;
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);

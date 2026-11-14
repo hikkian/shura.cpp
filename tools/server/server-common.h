@@ -431,6 +431,14 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // THINK3b: the reasoning-budget sampler's view of the thinking block (only when the request had that sampler)
+    bool    rb_active             = false;
+    bool    rb_shadow             = false; // brake/ceiling below mean "would have fired"
+    int32_t rb_reasoning_tokens   = 0;
+    bool    rb_brake_fired        = false;
+    bool    rb_budget_hit         = false;
+    int32_t rb_first_fire_token   = -1;
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

@@ -312,18 +312,27 @@ struct common_sampler * common_sampler_init(
     }
 
     // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
-    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
-        rbudget = common_reasoning_budget_init(
+    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_budget_soft_tokens >= 0 || params.reasoning_brake_shadow || params.reasoning_control)) {
+        common_reasoning_budget_opts rb_opts;
+        rb_opts.soft_tokens       = params.reasoning_budget_soft_tokens;
+        rb_opts.brake_margin      = params.think_brake_margin;
+        rb_opts.brake_temperature = params.temp > 0.0f ? params.temp : 1.0f;
+        rb_opts.grace_tokens      = params.reasoning_budget_grace_tokens;
+        rb_opts.shadow            = params.reasoning_brake_shadow;
+        rbudget = common_reasoning_budget_init_ex(
             vocab,
             {params.reasoning_budget_start},
             params.reasoning_budget_end,
             params.reasoning_budget_forced,
-            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
+            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens,
+            REASONING_BUDGET_IDLE,
+            rb_opts);
 
         for (const auto & token : prefill_tokens) {
             llama_sampler_accept(rbudget, token);
             LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
         }
+        common_reasoning_budget_mark_generation_start(rbudget);
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
@@ -858,6 +867,15 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     }
 
     return common_reasoning_budget_force(gsmpl->rbudget);
+}
+
+bool common_sampler_reasoning_budget_info(const struct common_sampler * gsmpl, struct common_reasoning_budget_info * out) {
+    if (!gsmpl || !gsmpl->rbudget) {
+        return false;
+    }
+    *out = common_reasoning_budget_get_info(gsmpl->rbudget);
+    out->shadow = gsmpl->params.reasoning_brake_shadow;
+    return true;
 }
 
 // helpers

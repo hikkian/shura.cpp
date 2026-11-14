@@ -372,12 +372,17 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
 }
 
 json server_task_result_cmpl_final::usage_json_oaicompat() {
-    return json {
+    json usage = json {
         {"completion_tokens", n_decoded},
         {"prompt_tokens",     n_prompt_tokens},
         {"total_tokens",      n_decoded + n_prompt_tokens},
         {"prompt_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
     };
+    if (stats.rb_active) {
+        // THINK3b: thinking tokens counted by the reasoning-budget sampler (OpenAI's field), the rest is in timings.reasoning_budget
+        usage["completion_tokens_details"] = json { {"reasoning_tokens", stats.rb_reasoning_tokens} };
+    }
+    return usage;
 }
 
 json server_task_result_cmpl_final::to_json_oaicompat() {

@@ -96,6 +96,11 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
+// THINK3b: what the reasoning-budget sampler saw (thinking tokens, ThinkBrake / ceiling, first intervention).
+// Returns false when the sampler has no reasoning-budget sampler (then nothing was counted).
+struct common_reasoning_budget_info;
+bool common_sampler_reasoning_budget_info(const struct common_sampler * gsmpl, struct common_reasoning_budget_info * out);
+
 // helpers
 
 // access the internal list of current candidate tokens

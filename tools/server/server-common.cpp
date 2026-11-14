@@ -166,6 +166,16 @@ json server_slot_stats::to_json() const {
         base["draft_n_accepted"] = n_draft_accepted;
     }
 
+    if (rb_active) {
+        base["reasoning_tokens"] = rb_reasoning_tokens;
+        base["reasoning_budget"] = json {
+            {"brake_fired",      rb_brake_fired},
+            {"budget_hit",       rb_budget_hit},
+            {"first_fire_token", rb_first_fire_token},
+            {"shadow",           rb_shadow},
+        };
+    }
+
     return base;
 }
 

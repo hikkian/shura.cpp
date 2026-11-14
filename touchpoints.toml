@@ -246,3 +246,31 @@ note = "with the other --vram-* flags and --moe-cache-cpu-share-table"
 feature = "mtp-lora"
 file = "tools/server/server-context.cpp"
 probe = "an MTP draft context shares the target model, so it gets the same adapters"
+
+# ---- step 7: THINK3b on upstream's reasoning-budget sampler ----
+
+[[hook]]
+feature = "think3b"
+file = "common/reasoning-budget.cpp"
+probe = "if (match >= 0 || ctx->force_pos >= ctx->forcing_seq().size())"
+note = "upstream's end-tag-from-the-prompt rule (#31374) kept together with the THINK3b forcing sequence"
+
+[[hook]]
+feature = "think3b"
+file = "common/sampling.cpp"
+probe = "common_sampler_reasoning_budget_info"
+
+[[hook]]
+feature = "think3b"
+file = "tools/server/server-context.cpp"
+probe = "void update_reasoning_stats()"
+
+[[hook]]
+feature = "think3b"
+file = "tools/server/server-schema.cpp"
+probe = "think_brake_margin"
+
+[[hook]]
+feature = "think3b"
+file = "tools/server/server-common.cpp"
+probe = "reasoning_budget"
