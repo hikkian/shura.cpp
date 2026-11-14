@@ -89,7 +89,7 @@ note = "constructor argument; empty state instead of the 'too small' exception"
 [[hook]]
 feature = "moe-cache"
 file = "src/llama-context.cpp"
-probe = "cparams.moe_cache_size > 0 || cparams.moe_cache_resizable"
+probe = "cparams.moe_cache_size > 0 || (cparams.moe_cache_resizable && model.hparams.n_expert > 0)"
 
 [[hook]]
 feature = "moe-cache"
