@@ -119,7 +119,7 @@ static __global__ void flash_attn_ext_vec(
     // it with the Q of all packed heads. (The turbo4 V shuffle of the shura branch is gone with the TurboQuant types.)
     constexpr bool V_shfl = false;
     // REBASE1: also K q4_0 (the long 262k profile, K/V q4_0): the thread unpacks its q4_0 block into the same 8 ints
-    constexpr bool K_blk = ncols2 > 1 && (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0) && D == 256 && nthreads_KQ == 8;
+    constexpr bool K_blk = ncols2 > 1 && (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0 || type_K == GGML_TYPE_Q5_0) && D == 256 && nthreads_KQ == 8;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -352,6 +352,25 @@ static __global__ void flash_attn_ext_vec(
                     K_blk_i32[m + QI4_0] = (v >> 4) & 0x0F0F0F0F;
                 }
                 K_blk_d = __half2float(K_b->d);
+            } else if constexpr (K_blk && type_K == GGML_TYPE_Q5_0) {
+                // q5_0: as q4_0, plus the fifth bit of element i from qh bit i; offset -16
+                const block_q5_0 * K_b = ((const block_q5_0 *) (K + i_KQ*nb11)) + (threadIdx.x % nthreads_KQ);
+                int qh;
+                ggml_cuda_memcpy_1<sizeof(int), 2>(&qh, K_b->qh);
+#pragma unroll
+                for (int m = 0; m < int(QI5_0); ++m) {
+                    int v;
+                    ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_b->qs + 4*m);
+                    int lo = v & 0x0F0F0F0F;
+                    int hi = (v >> 4) & 0x0F0F0F0F;
+                    const int bl = qh >> (4*m);
+                    const int bh = qh >> (4*m + 16);
+                    lo |= ((bl << 4) & 0x00000010) | ((bl << 11) & 0x00001000) | ((bl << 18) & 0x00100000) | ((bl << 25) & 0x10000000);
+                    hi |= ((bh << 4) & 0x00000010) | ((bh << 11) & 0x00001000) | ((bh << 18) & 0x00100000) | ((bh << 25) & 0x10000000);
+                    K_blk_i32[m]         = lo;
+                    K_blk_i32[m + QI5_0] = hi;
+                }
+                K_blk_d = __half2float(K_b->d);
             }
 
 #pragma unroll
@@ -372,6 +391,8 @@ static __global__ void flash_attn_ext_vec(
                     const float2 qds = Q_sh_ds[j][threadIdx.x % nthreads_KQ];
                     if constexpr (type_K == GGML_TYPE_Q4_0) {
                         sum = K_blk_d * (qds.x * float(sumi) - 8.0f * qds.y);
+                    } else if constexpr (type_K == GGML_TYPE_Q5_0) {
+                        sum = K_blk_d * (qds.x * float(sumi) - 16.0f * qds.y);
                     } else {
                         sum = K_blk_d * qds.x * float(sumi);
                     }
@@ -652,7 +673,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
 }
 
 
-// SHURA (gqavec2, REBASE1): the GQA-packed decode path applies (HIP, GGML_HIP_FA_GQA_VEC=1, head 256, K q8_0 or q4_0, V q8_0 or q4_0,
+// SHURA (gqavec2, REBASE1): the GQA-packed decode path applies (HIP, GGML_HIP_FA_GQA_VEC=1, head 256, K and V q8_0, q4_0 or q5_0,
 // GQA 4 or 8, no ALiBi, no softcap, up to 3 tokens = the MTP verify batch). The kernel choice must ask this too: for 3 tokens with
 // GQA 8 it would otherwise pick the WMMA kernel on RDNA3, which converts the whole quantized KV to f16 at every step.
 static inline bool ggml_cuda_fattn_gqa_vec_applies(const ggml_tensor * dst) {
@@ -668,7 +689,8 @@ static inline bool ggml_cuda_fattn_gqa_vec_applies(const ggml_tensor * dst) {
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
     const int gqa_ratio = Q->ne[2] / K->ne[2];
-    return Q->ne[0] == 256 && (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0) && (V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0) &&
+    return Q->ne[0] == 256 && (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q5_0) &&
+        (V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q5_0) &&
         Q->ne[1] <= 3 && max_bias == 0.0f && logit_softcap == 0.0f && (gqa_ratio == 8 || gqa_ratio == 4);
 #else
     GGML_UNUSED(dst);
@@ -687,7 +709,8 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 #if defined(GGML_USE_HIP)
     // GQA-packed decode path (opt-in): one block handles all Q heads of one KV head, K/V rows are read and unpacked once.
     // SHURA (gqavec2; REBASE1: the V types of shura.cpp 1.0, q8_0 and q4_0, instead of turbo4)
-    if constexpr (D == 256 && (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0) && (type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_Q4_0)) {
+    if constexpr (D == 256 && (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0 || type_K == GGML_TYPE_Q5_0) &&
+                  (type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_Q4_0 || type_V == GGML_TYPE_Q5_0)) {
         const ggml_tensor * K = dst->src[1];
         const int gqa_ratio = Q->ne[2] / K->ne[2];
         // REBASE1: up to 3 tokens, the MTP verify batch (draft n_max 2 + 1) of the long profile; the shura branch stopped at 2
