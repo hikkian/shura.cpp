@@ -30,6 +30,7 @@ const char * llama_build_info(void) {
 }
 
 void llama_print_build_info(const char * llama_version, FILE * stream) {
+    fprintf(stream, "shura.cpp 1.0 (based on llama.cpp v1.0.0)\n");   // SHURA
     fprintf(stream, "version: %s (build %d, commit %s)\n", llama_version, llama_build_number(), llama_commit());
     fprintf(stream, "built with %s for %s\n", llama_compiler(), llama_build_target());
 }

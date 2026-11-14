@@ -1,0 +1,24 @@
+shura.cpp: sources and licenses
+
+shura.cpp 1.0 is released under the MIT License. It is llama.cpp v1.0.0 with the parts of Shura that upstream does not have,
+added where possible on top of upstream's own mechanisms. It combines code from these sources, all under the MIT License:
+
+1. llama.cpp (https://github.com/ggml-org/llama.cpp)
+   Copyright (c) 2023-2026 The ggml authors. The upstream LICENSE and AUTHORS files are kept unchanged. The base of shura.cpp 1.0
+   is the tag v1.0.0. The MoE expert cache (src/llama-moe-cache.cpp, its graph and scheduler parts, docs/moe-cache.md and
+   scripts/moe-cache-tune.py) is upstream's; shura.cpp adds live resize, an empty state and statistics to it.
+
+2. thecodacus/llama.cpp, branch `perf` (https://github.com/thecodacus/llama.cpp), by Anirban Kar
+   The starting point of the earlier versions of this fork (up to the `shura` branch). Its MoE expert cache, scheduler prefetch,
+   tools/moe-trace and qwen4exp conversion are in the history of those versions; they are not part of the 1.0 tree unless a part
+   is listed in docs/SHURA.md as brought back.
+
+3. TheTom/llama-cpp-turboquant, branch `feature/turboquant-kv-cache` (https://github.com/TheTom/llama-cpp-turboquant)
+   The TurboQuant KV cache types of the earlier versions. In 1.0 they are present only if docs/SHURA.md says so.
+
+4. Changes written for Shura, Copyright (c) 2026 hikkian
+   The VRAM governor and its endpoints, pause with a checkpoint and resume, live resize of the expert cache with rollback, the
+   pinned memory limit, the abort check of the CUDA/HIP backend, the reasoning-budget extensions (THINK3b), the diagnostics and
+   the tests for them, listed in docs/SHURA.md.
+
+Model weights are not part of this repository and are covered by their own licenses.
