@@ -517,12 +517,14 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
 
     std::vector<uint16_t> log_probs;
+    // SHURA: SHURA_PPL_STREAM=1 writes the base log-probs batch by batch (memory independent of n_ctx), one sequence per chunk
+    const bool ppl_stream = getenv("SHURA_PPL_STREAM") != nullptr && n_seq == 1 && !params.logits_file.empty();
     if (!params.logits_file.empty()) {
         logits_stream.write((const char *)&n_vocab, sizeof(n_vocab));
         logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
         logits_stream.write((const char *)tokens.data(), n_chunk*n_ctx*sizeof(tokens[0]));
         const int nv = 2*((n_vocab + 1)/2) + 4;
-        log_probs.resize(size_t(n_ctx) * nv);
+        log_probs.resize(size_t(ppl_stream ? n_batch : n_ctx) * nv);
     }
 
     // We get the logits for all the tokens in the context window (params.n_ctx)
@@ -584,7 +586,16 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                 return {tokens, -1, logit_history, prob_history};
             }
 
-            if (num_batches > 1 && n_outputs > 0) {
+            if (ppl_stream && n_outputs > 0) {
+                // SHURA: the rows of this batch at once; the last position of the chunk has no next token
+                const int row0   = std::max(first, j*n_batch);
+                const int n_rows = n_outputs - ((j*n_batch + batch_size == (int) n_ctx) ? 1 : 0);
+                if (n_rows > 0) {
+                    process_logits(logits_stream, n_vocab, llama_get_logits(ctx), tokens.data() + start + row0, n_rows,
+                            workers, log_probs, nll, nll2);
+                    count += n_rows;
+                }
+            } else if (num_batches > 1 && n_outputs > 0) {
                 const auto * batch_logits = llama_get_logits(ctx);
                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
             }
@@ -608,7 +619,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
             llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
-            if (!params.logits_file.empty()) {
+            if (ppl_stream) {
+                // SHURA: already processed batch by batch
+            } else if (!params.logits_file.empty()) {
                 process_logits(logits_stream, n_vocab, all_logits,
                         tokens_data, n_ctx - 1 - first,
                         workers, log_probs, nll, nll2);
@@ -619,7 +632,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                         logit_history.data() + start + seq*n_ctx + first,
                         prob_history.data()  + start + seq*n_ctx + first);
             }
-            count += n_ctx - first - 1;
+            if (!ppl_stream) {
+                count += n_ctx - first - 1;
+            }
 
             // perplexity is e^(average negative log-likelihood)
             if (params.ppl_output_type == 0) {
@@ -1735,7 +1750,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     common_batch batch(ctx);
 
-    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - n_ctx/2) * nv);
+    // SHURA: SHURA_PPL_STREAM=1 reads the base log-probs and computes the divergence batch by batch (memory independent of n_ctx)
+    const bool kld_stream = getenv("SHURA_PPL_STREAM") != nullptr && n_seq == 1;
+    std::vector<uint16_t> log_probs_uint16(size_t(kld_stream ? n_batch : n_ctx - 1 - n_ctx/2) * nv);
     std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> logits;
@@ -1816,7 +1833,21 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
                 return;
             }
 
-            if (num_batches > 1 && n_outputs > 0) {
+            if (kld_stream && n_outputs > 0) {
+                // SHURA: the rows of this batch at once, against the same rows of the base file
+                const int row0   = std::max(first, j*n_batch);
+                const int n_rows = n_outputs - ((j*n_batch + batch_size == (int) n_ctx) ? 1 : 0);
+                if (n_rows > 0) {
+                    if (in.read((char *)log_probs_uint16.data(), size_t(n_rows)*nv*sizeof(uint16_t)).fail()) {
+                        LOG_ERR("%s: failed reading log-probs for chunk %d\n", __func__, i);
+                        return;
+                    }
+                    process_logits(n_vocab, llama_get_logits(ctx), tokens.data() + start + row0, n_rows,
+                            workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
+                    kld_ptr    += n_rows;
+                    p_diff_ptr += n_rows;
+                }
+            } else if (num_batches > 1 && n_outputs > 0) {
                 const auto * batch_logits = llama_get_logits(ctx);
                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
             }
@@ -1839,6 +1870,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
         // Read log probs for each sequence in the batch
         for (int seq = 0; seq < n_seq_batch; seq++) {
+            if (!kld_stream) {
             if (in.read((char *)log_probs_uint16.data(), log_probs_uint16.size()*sizeof(uint16_t)).fail()) {
                 LOG_ERR("%s: failed reading log-probs for chunk %d\n", __func__, i + seq);
                 return;
@@ -1850,6 +1882,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
                     workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
             p_diff_ptr += n_ctx - 1 - first;
             kld_ptr    += n_ctx - 1 - first;
+            }
 
             LOG("%4d", i + seq + 1);
 

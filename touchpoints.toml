@@ -288,3 +288,9 @@ feature = "sched-prefetch"
 file = "ggml/src/ggml-backend.cpp"
 probe = "GGML_SCHED_PREFETCH_EXPERTS"
 note = "sched fields, prefetch init/disable, the host-weight copy loop of ggml_backend_sched_compute_splits (full-tensor upload through a second backend instance for large-batch MUL_MAT_ID), sched_free, sched_synchronize"
+
+[[hook]]
+feature = "perplexity-stream"
+file = "tools/perplexity/perplexity.cpp"
+probe = "SHURA_PPL_STREAM"
+note = "the KL-divergence base file and the KL divergence batch by batch (memory independent of n_ctx); one sequence per chunk"
