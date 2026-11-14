@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -63,6 +64,20 @@ public:
     uint64_t generation() const;
     // false if the cache was created without a CPU part (cpu_share == 0)
     bool     set_cpu_share(float share);
+
+    // ---- SHURA: live resize (design §3.3 В, Г, З). Only through llama_context, which holds the micro-batch lock and has
+    // synchronized the backends: nothing running or queued may read the banks. ----
+    bool     resizable() const;
+    // returns false if the layout did not change; on an allocation failure the previous size, then the empty state
+    bool     resize(size_t size);
+    // called between the release of the old banks and the allocation of the new ones, with the bytes released
+    void     set_release_wait(void (*fn)(size_t freed_bytes, void * data), void * data);
+    // test hook: the next n allocations of a non-empty layout fail
+    void     set_test_fail_allocs(int32_t n);
+    // the host copy of expert e of layer il changed: the cached copy is read again
+    bool     invalidate(int32_t il, int32_t e);
+    // tests: the LRU lists, slot maps and (contents) the banks agree with each other and with the host experts
+    bool     self_check(bool contents, std::string & why) const;
 
 private:
     struct impl;

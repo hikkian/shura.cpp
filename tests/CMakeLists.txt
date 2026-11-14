@@ -352,6 +352,7 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 llama_build_and_test(test-abort-backtrace.cpp)   # SHURA (HEAPBUG1)
 llama_build(test-vram-abort.cpp)   # SHURA (VRAMLOGIC3): needs a model argument (see the file); not run by ctest
+llama_build(test-moe-cache-resize.cpp)   # SHURA (REBASE1): needs a GPU and a small MoE model (see the file); not run by ctest
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)

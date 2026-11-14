@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -600,6 +601,10 @@ struct llama_moe_cache::impl {
         snap_host_bytes = host_bytes;
 
         apply_layout(n_slots);
+
+        if (const char * fail = getenv("GGML_MOE_CACHE_TEST_FAIL_RESIZE_ALLOCS_ONCE"); fail != nullptr) {
+            test_fail_allocs = std::max(0, atoi(fail)); // the next n allocations of a resize fail (test hook)
+        }
     }
 
     // SHURA: the slots of each group for a cache of size bytes (0 = the group is off), as upstream's constructor computed them
@@ -1018,6 +1023,282 @@ struct llama_moe_cache::impl {
         res.copy_hits    = stats_copy.hits;    res.copy_bytes   = stats_copy.bytes;
     }
 
+    // ---- SHURA: live resize (design §3.3 В, Г, З). The caller (llama_context) holds the micro-batch lock and has synchronized
+    // the scheduler: no graph is running or queued that reads the banks, and no asynchronous upload into them is pending. ----
+
+    std::vector<int32_t> current_slots() const {
+        std::vector<int32_t> res(groups.size(), 0);
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            res[ig] = groups[ig].n_slots;
+        }
+        return res;
+    }
+
+    // free the device banks and their contexts; the layers read the host experts until the next apply_layout()
+    size_t release_banks() {
+        size_t freed = 0;
+        bindings.clear();
+        for (group & g : groups) {
+            g.banks.clear();
+            for (int32_t il : g.layers) {
+                layers[il].ig = -1;
+            }
+        }
+        for (device & d : devices) {
+            if (d.buf) {
+                freed += d.buf_size;
+            }
+            d.buf.reset();
+            d.ctx.reset();
+            d.buf_size = 0;
+        }
+        return freed;
+    }
+
+    // the test hook: GGML_MOE_CACHE_TEST_FAIL_RESIZE_ALLOCS_ONCE=n at creation, or set_test_fail_allocs(n): the next n allocations of
+    // a non-empty layout fail as if the device were out of memory
+    std::atomic<int32_t> test_fail_allocs{0};
+
+    void apply_layout_checked(const std::vector<int32_t> & n_slots) {
+        const bool any = std::any_of(n_slots.begin(), n_slots.end(), [](int32_t n) { return n > 0; });
+        if (any && test_fail_allocs.load() > 0) {
+            test_fail_allocs--;
+            LLAMA_LOG_WARN("%s: test hook: failing this MoE cache allocation (%d more)\n", __func__, test_fail_allocs.load());
+            throw std::runtime_error("test hook: forced MoE cache allocation failure");
+        }
+        try {
+            apply_layout(n_slots);
+        } catch (...) {
+            release_banks();
+            throw;
+        }
+    }
+
+    // called after the banks were released and before the new ones are allocated, with the bytes freed: the VRAM governor waits
+    // there until the card shows the memory as free (on ROCm the release is accounted later than the free call returns)
+    void (*release_wait)(size_t freed_bytes, void * data) = nullptr;
+    void * release_wait_data = nullptr;
+
+    // change the size: returns false if the layout did not change. On an allocation failure the previous size is allocated again;
+    // if that fails too the cache is empty (the layers read the host experts) and the server goes on.
+    bool resize(size_t size) {
+        if (!resizable) {
+            LLAMA_LOG_WARN("%s: the MoE cache was created without --moe-cache-live-resize\n", __func__);
+            return false;
+        }
+        if (groups.empty()) {
+            return false;
+        }
+        const std::vector<int32_t> old_slots = current_slots();
+        const std::vector<int32_t> new_slots = layout(size);
+        if (new_slots == old_slots) {
+            return false;
+        }
+        const int64_t t0 = ggml_time_us();
+        const size_t old_size = snap_size.load();
+        const size_t freed = release_banks();
+        if (release_wait != nullptr && freed > 0) {
+            release_wait(freed, release_wait_data);
+        }
+        const int64_t t_wait = ggml_time_us();
+        const char * outcome = "resized";
+        try {
+            apply_layout_checked(new_slots);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_WARN("%s: MoE cache allocation of %.2f MiB failed (%s), restoring %.2f MiB\n", __func__,
+                size/1024.0/1024.0, err.what(), old_size/1024.0/1024.0);
+            outcome = "restored the previous size";
+            try {
+                apply_layout_checked(old_slots);
+            } catch (const std::exception & err2) {
+                LLAMA_LOG_WARN("%s: MoE cache allocation of the previous size failed too (%s), the cache is empty\n", __func__, err2.what());
+                outcome = "empty after two failed allocations";
+                apply_layout(std::vector<int32_t>(groups.size(), 0)); // allocates nothing
+            }
+        }
+        const size_t n_warm = warm_fill();
+        LLAMA_LOG_INFO("%s: MoE cache %s: %.2f -> %.2f MiB, %d slots, %zu experts warm, waited %.1f ms for the release, %.1f ms in all\n",
+            __func__, outcome, old_size/1024.0/1024.0, snap_size.load()/1024.0/1024.0, snap_slots.load(), n_warm,
+            (t_wait - t0)/1000.0, (ggml_time_us() - t0)/1000.0);
+        return true;
+    }
+
+    // after a layout change all slots are empty: fill them with the experts of each group by their decayed CRF over all the experts
+    // of its layers (also the ones that were not cached), hottest last so that they sit at the recently used end of their class
+    size_t warm_fill() {
+        if (no_alloc) {
+            return 0;
+        }
+        size_t n_total = 0;
+        struct cand {
+            float   crf;
+            int32_t key;
+        };
+        std::vector<cand> cands;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (g.n_slots == 0) {
+                continue;
+            }
+            moe_cache_lru & lru = g.lru;
+            cands.clear();
+            for (int32_t il : g.layers) {
+                for (int32_t e = 0; e < lru.n_expert; ++e) {
+                    const int32_t key = lru.make_key(il, e);
+                    if (lru.last_use[key] < 0 || lru.crf[key] <= 0.0f) {
+                        continue;
+                    }
+                    cands.push_back({ lru.decayed_crf(il, key), key });
+                }
+            }
+            const size_t n = std::min(cands.size(), (size_t) g.n_slots);
+            std::partial_sort(cands.begin(), cands.begin() + n, cands.end(), [](const cand & a, const cand & b) {
+                return a.crf != b.crf ? a.crf > b.crf : a.key < b.key;
+            });
+            ggml_backend_t backend = devices[g.id].backend;
+            for (size_t i = n; i-- > 0; ) {
+                const int32_t key = cands[i].key;
+                const int32_t il  = lru.key_layer(key);
+                const int32_t e   = lru.key_expert(key);
+                const int32_t s   = (int32_t) (n - 1 - i); // slots 0.. in order
+                lru.key_of[s] = key;
+                lru.slot_map[il][e] = s;
+                lru.move(s, lru.class_of(key));
+                lru.n_filled++;
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    ggml_backend_tensor_set_async(backend, g.banks[ip], (const uint8_t *) w->data + e*w->nb[2], s*w->nb[2], w->nb[2]);
+                }
+            }
+            if (n > 0) {
+                ggml_backend_synchronize(backend);
+            }
+            n_total += n;
+        }
+        return n_total;
+    }
+
+    // design §3.3 З: the host copy of expert e of w changed (a patch map): the cached copy is read again from the host
+    bool invalidate(const ggml_tensor * w, int32_t e) {
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return false;
+        }
+        const binding & b = it->second;
+        const layer & l = layers[b.il];
+        if (l.ig < 0) {
+            return false;
+        }
+        group & g = groups[l.ig];
+        if (e < 0 || e >= g.lru.n_expert) {
+            return false;
+        }
+        const int32_t s = g.lru.slot_map[b.il][e];
+        if (s >= g.n_slots) {
+            return true; // not cached: the next upload reads the host copy
+        }
+        ggml_backend_t backend = devices[g.id].backend;
+        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+            const ggml_tensor * x = l.experts[ip];
+            ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) x->data + e*x->nb[2], s*x->nb[2], x->nb[2]);
+        }
+        ggml_backend_synchronize(backend);
+        return true;
+    }
+
+    // tests: the LRU lists, the slot maps and (optionally) the bank contents agree with each other and with the host experts
+    bool self_check(bool contents, std::string & why) const {
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group & g = groups[ig];
+            const moe_cache_lru & lru = g.lru;
+            if (lru.n_slots != g.n_slots) {
+                why = "lru slots != group slots";
+                return false;
+            }
+            int32_t filled = 0;
+            int32_t in_lists = 0;
+            for (int c = 0; c < moe_cache_lru::n_class; ++c) {
+                for (int32_t s = lru.head[c]; s >= 0; s = lru.next[s]) {
+                    if (lru.list_of[s] != c) {
+                        why = "slot in the wrong class list";
+                        return false;
+                    }
+                    if (++in_lists > g.n_slots) {
+                        why = "a cycle in the class lists";
+                        return false;
+                    }
+                }
+            }
+            if (in_lists != g.n_slots) {
+                why = "class lists do not hold every slot";
+                return false;
+            }
+            for (int32_t s = 0; s < g.n_slots; ++s) {
+                const int32_t key = lru.key_of[s];
+                if (key < 0) {
+                    continue;
+                }
+                filled++;
+                if (lru.slot_map[lru.key_layer(key)][lru.key_expert(key)] != s) {
+                    why = "slot map does not point back to the slot";
+                    return false;
+                }
+            }
+            if (filled != lru.n_filled) {
+                why = "n_filled does not match the slots";
+                return false;
+            }
+            for (int32_t il : g.layers) {
+                const int32_t * slots = lru.slot_map[il];
+                for (int32_t e = 0; e < lru.n_expert; ++e) {
+                    const int32_t s = slots[e];
+                    if (s < g.n_slots && lru.key_of[s] != lru.make_key(il, e)) {
+                        why = "slot map points to a slot of another expert";
+                        return false;
+                    }
+                    if (g.n_slots == 0 && s != lru.empty) {
+                        why = "a group that is off has a cached expert";
+                        return false;
+                    }
+                }
+                if (!contents || g.n_slots == 0) {
+                    continue;
+                }
+                const layer & l = layers[il];
+                std::vector<uint8_t> buf;
+                for (int32_t e = 0; e < lru.n_expert; ++e) {
+                    const int32_t s = slots[e];
+                    if (s >= g.n_slots) {
+                        continue;
+                    }
+                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                        const ggml_tensor * w = l.experts[ip];
+                        buf.resize(w->nb[2]);
+                        ggml_backend_tensor_get(g.banks[ip], buf.data(), s*w->nb[2], w->nb[2]);
+                        if (memcmp(buf.data(), (const uint8_t *) w->data + e*w->nb[2], w->nb[2]) != 0) {
+                            why = "bank slot differs from the host expert";
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    // all expert tensors of layer il
+    bool invalidate_layer(int32_t il, int32_t e) {
+        if (il < 0 || il >= (int32_t) layers.size()) {
+            return false;
+        }
+        bool ok = !layers[il].experts.empty();
+        for (const ggml_tensor * w : layers[il].experts) {
+            ok = invalidate(w, e) && ok;
+        }
+        return ok;
+    }
+
     void log_stats() const {
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
@@ -1085,6 +1366,31 @@ uint64_t llama_moe_cache::generation() const {
 
 bool llama_moe_cache::set_cpu_share(float share) {
     return pimpl->set_cpu_share(share);
+}
+
+bool llama_moe_cache::resize(size_t size) {
+    return pimpl->resize(size);
+}
+
+void llama_moe_cache::set_release_wait(void (*fn)(size_t freed_bytes, void * data), void * data) {
+    pimpl->release_wait      = fn;
+    pimpl->release_wait_data = data;
+}
+
+void llama_moe_cache::set_test_fail_allocs(int32_t n) {
+    pimpl->test_fail_allocs = std::max(0, n);
+}
+
+bool llama_moe_cache::invalidate(int32_t il, int32_t e) {
+    return pimpl->invalidate_layer(il, e);
+}
+
+bool llama_moe_cache::self_check(bool contents, std::string & why) const {
+    return pimpl->self_check(contents, why);
+}
+
+bool llama_moe_cache::resizable() const {
+    return pimpl->resizable;
 }
 
 llama_moe_cache::info llama_moe_cache::get_info() const {

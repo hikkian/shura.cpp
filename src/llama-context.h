@@ -13,7 +13,9 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
@@ -217,6 +219,13 @@ struct llama_context {
     llama_moe_cache *       get_moe_cache()       { return moe_cache.get(); }
     const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); }
 
+    // SHURA (design §3.3 Д): from another thread (the VRAM governor). They take the micro-batch lock, which the decoding thread
+    // holds for each micro-batch and yields between micro-batches to a waiting caller, and synchronize the backends first.
+    size_t moe_cache_resize(size_t size);           // returns the size after the call
+    bool   moe_cache_resize_pending() const;        // a resize waits for the lock (an abort callback may stop a long micro-batch)
+    bool   moe_cache_invalidate(int32_t il, int32_t e);
+    bool   moe_cache_self_check(bool contents, std::string & why);
+
     //
     // training
     //
@@ -349,6 +358,14 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    // SHURA (design §3.3 Д): the micro-batch lock of a resizable expert cache (recursive: sched_reserve takes it too)
+    mutable std::recursive_mutex moe_mu;
+    std::atomic<int32_t> moe_waiters{0};
+    uint64_t moe_gen_reserved = 0; // the cache generation the scheduler was last reserved for (decoding thread, under the lock)
+    size_t   moe_size_before  = 0; // the size before the last resize: the rollback target if the lazy reserve fails
+    bool     moe_reserve_after_resize(); // under the lock
+    void     moe_sync_backends();        // ggml_backend_synchronize of every backend, without touching the scheduler state
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

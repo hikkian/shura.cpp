@@ -1756,6 +1756,19 @@ extern "C" {
     // share of the misses computed on the CPU once the cache is full; false if the cache was created without a CPU part
     LLAMA_API bool llama_moe_cache_set_cpu_share(struct llama_context * ctx, float share);
 
+    // live resize (needs moe_cache_resizable): waits for the current micro-batch, synchronizes, releases the banks, calls the
+    // release wait, allocates the new size (on failure the previous size, then empty) and warms it from the decayed use counters.
+    // Returns the device bytes of the cache after the call. Called from another thread than the decoding one.
+    LLAMA_API size_t llama_moe_cache_resize(struct llama_context * ctx, size_t size);
+    // a resize waits for the micro-batch lock: an abort callback may return true to stop a long micro-batch sooner
+    LLAMA_API bool   llama_moe_cache_resize_pending(const struct llama_context * ctx);
+    LLAMA_API void   llama_moe_cache_set_release_wait(struct llama_context * ctx, void (*fn)(size_t freed_bytes, void * data), void * data);
+    // the host copy of expert e of layer il changed: the cached copy is read again
+    LLAMA_API bool   llama_moe_cache_invalidate(struct llama_context * ctx, int32_t il, int32_t e);
+    // tests
+    LLAMA_API void   llama_moe_cache_test_fail_allocs(struct llama_context * ctx, int32_t n);
+    LLAMA_API bool   llama_moe_cache_self_check(struct llama_context * ctx, bool contents, char * why, size_t why_size);
+
 #ifdef __cplusplus
 }
 #endif

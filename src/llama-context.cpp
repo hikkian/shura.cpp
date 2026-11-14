@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -792,6 +794,13 @@ void llama_context::sched_reserve() {
         return;
     }
 
+    // SHURA: the reserve builds graphs that read the expert cache bindings: not while a resize changes them
+    std::unique_lock<std::recursive_mutex> moe_lock(moe_mu, std::defer_lock);
+    if (moe_cache && cparams.moe_cache_resizable) {
+        moe_lock.lock();
+    }
+    const uint64_t moe_gen = moe_cache ? moe_cache->generation() : 0;
+
     sched_need_reserve = false;
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
@@ -952,6 +961,8 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    moe_gen_reserved = moe_gen; // SHURA: the compute buffers fit this layout of the expert cache
 }
 
 void llama_context::synchronize() {
@@ -1817,6 +1828,20 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // SHURA (design §3.3 Д): one micro-batch at a time against a resizable expert cache; a waiting resize gets the lock first
+    std::unique_lock<std::recursive_mutex> moe_lock;
+    if (moe_cache && cparams.moe_cache_resizable) {
+        for (int i = 0; i < 20000 && moe_waiters.load() > 0; i++) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        moe_lock = std::unique_lock<std::recursive_mutex>(moe_mu);
+        if (moe_cache->generation() != moe_gen_reserved && !moe_reserve_after_resize()) {
+            LLAMA_LOG_ERROR("%s: no compute buffers for any size of the MoE cache\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -3077,7 +3102,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params res_params = {
         /*.model       =*/ &model,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -3101,6 +3126,8 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+    res_params.moe_cache_gen = moe_cache ? moe_cache->generation() : 0; // SHURA
+    return res_params;
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
@@ -5182,6 +5209,110 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+// SHURA: live resize of the expert cache (design §3.3 В, Г, Д)
+
+void llama_context::moe_sync_backends() {
+    for (auto & backend : backends) {
+        ggml_backend_synchronize(backend.get());
+    }
+}
+
+// the lazy reserve after a layout change (design §3.3 Г): if the compute buffers do not fit, the previous size, then the empty state
+bool llama_context::moe_reserve_after_resize() {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        sched_need_reserve = true;
+        try {
+            sched_reserve();
+            return true;
+        } catch (const std::exception & err) {
+            LLAMA_LOG_WARN("%s: reserve after the MoE cache resize failed: %s\n", __func__, err.what());
+            moe_sync_backends();
+            if (attempt == 0 && moe_size_before != moe_cache->device_size()) {
+                const size_t target = moe_size_before;
+                moe_size_before = moe_cache->device_size();
+                moe_cache->resize(target);
+            } else if (!moe_cache->empty()) {
+                moe_size_before = moe_cache->device_size();
+                moe_cache->resize(0);
+            } else {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+size_t llama_context::moe_cache_resize(size_t size) {
+    if (!moe_cache || !cparams.moe_cache_resizable) {
+        return moe_cache ? moe_cache->device_size() : 0;
+    }
+    moe_waiters++;
+    std::unique_lock<std::recursive_mutex> lock(moe_mu);
+    moe_waiters--;
+    moe_sync_backends(); // design §3.3 В step 1: no graph and no upload may still use the banks
+    const size_t before = moe_cache->device_size();
+    if (moe_cache->resize(size)) {
+        moe_size_before = before; // the reserve runs on the decoding thread at its next micro-batch (generation changed)
+    }
+    return moe_cache->device_size();
+}
+
+bool llama_context::moe_cache_resize_pending() const {
+    return moe_waiters.load() > 0;
+}
+
+bool llama_context::moe_cache_invalidate(int32_t il, int32_t e) {
+    if (!moe_cache) {
+        return false;
+    }
+    std::unique_lock<std::recursive_mutex> lock(moe_mu);
+    moe_sync_backends();
+    return moe_cache->invalidate(il, e);
+}
+
+bool llama_context::moe_cache_self_check(bool contents, std::string & why) {
+    if (!moe_cache) {
+        why = "no MoE cache";
+        return false;
+    }
+    std::unique_lock<std::recursive_mutex> lock(moe_mu);
+    moe_sync_backends();
+    return moe_cache->self_check(contents, why);
+}
+
+size_t llama_moe_cache_resize(struct llama_context * ctx, size_t size) {
+    return ctx ? ctx->moe_cache_resize(size) : 0;
+}
+
+bool llama_moe_cache_resize_pending(const struct llama_context * ctx) {
+    return ctx && ctx->moe_cache_resize_pending();
+}
+
+void llama_moe_cache_set_release_wait(struct llama_context * ctx, void (*fn)(size_t freed_bytes, void * data), void * data) {
+    if (llama_moe_cache * mc = ctx ? ctx->get_moe_cache() : nullptr) {
+        mc->set_release_wait(fn, data);
+    }
+}
+
+bool llama_moe_cache_invalidate(struct llama_context * ctx, int32_t il, int32_t e) {
+    return ctx && ctx->moe_cache_invalidate(il, e);
+}
+
+void llama_moe_cache_test_fail_allocs(struct llama_context * ctx, int32_t n) {
+    if (llama_moe_cache * mc = ctx ? ctx->get_moe_cache() : nullptr) {
+        mc->set_test_fail_allocs(n);
+    }
+}
+
+bool llama_moe_cache_self_check(struct llama_context * ctx, bool contents, char * why, size_t why_size) {
+    std::string w;
+    const bool ok = ctx && ctx->moe_cache_self_check(contents, w);
+    if (why && why_size > 0) {
+        snprintf(why, why_size, "%s", w.c_str());
+    }
+    return ok;
 }
 
 // SHURA: the expert cache from other threads

@@ -138,3 +138,46 @@ feature = "governor"
 file = "tests/CMakeLists.txt"
 probe = "test-vram-abort.cpp"
 note = "built, not run by ctest: needs a model (test-llama-archs -a llama -o DIR)"
+
+# ---- step 4: expert cache live resize (design §3.3 В, Г, Д, З) ----
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-moe-cache.cpp"
+probe = "bool resize(size_t size)"
+note = "release banks -> release wait -> allocate (test hook, rollback to the old size, then empty) -> warm fill"
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-moe-cache.cpp"
+probe = "GGML_MOE_CACHE_TEST_FAIL_RESIZE_ALLOCS_ONCE"
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-graph.h"
+probe = "moe_cache_gen != other.moe_cache_gen"
+note = "llm_graph_params::allow_reuse; the field is set in llama_context::graph_params"
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-context.cpp"
+probe = "moe_reserve_after_resize()"
+note = "process_ubatch: micro-batch lock with yield to a waiting resize, lazy reserve with rollback"
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-context.cpp"
+probe = "moe_gen_reserved = moe_gen;"
+note = "end of sched_reserve; sched_reserve takes the micro-batch lock (recursive)"
+
+[[hook]]
+feature = "moe-cache"
+file = "include/llama.h"
+probe = "llama_moe_cache_resize"
+note = "also resize_pending, set_release_wait, invalidate, test_fail_allocs, self_check"
+
+[[hook]]
+feature = "moe-cache"
+file = "tests/CMakeLists.txt"
+probe = "test-moe-cache-resize.cpp"
+note = "built, not run by ctest: needs a GPU and a small MoE model (test-llama-archs -a qwen35moe -o DIR)"
