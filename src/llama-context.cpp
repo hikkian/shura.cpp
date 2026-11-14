@@ -5286,6 +5286,11 @@ size_t llama_moe_cache_resize(struct llama_context * ctx, size_t size) {
     return ctx ? ctx->moe_cache_resize(size) : 0;
 }
 
+size_t llama_moe_cache_size_for_tokens(const struct llama_context * ctx, int64_t n_tokens) {
+    const llama_moe_cache * mc = ctx ? ctx->get_moe_cache() : nullptr;
+    return mc ? mc->size_for_tokens(n_tokens) : 0;
+}
+
 bool llama_moe_cache_resize_pending(const struct llama_context * ctx) {
     return ctx && ctx->moe_cache_resize_pending();
 }

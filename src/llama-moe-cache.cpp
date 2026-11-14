@@ -608,7 +608,7 @@ struct llama_moe_cache::impl {
     }
 
     // SHURA: the slots of each group for a cache of size bytes (0 = the group is off), as upstream's constructor computed them
-    std::vector<int32_t> layout(size_t size) const {
+    std::vector<int32_t> layout(size_t size, bool quiet = false) const {
         std::vector<int32_t> res(groups.size(), 0);
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             const group & g = groups[ig];
@@ -624,7 +624,7 @@ struct llama_moe_cache::impl {
                 n++;
             }
             if (n < n_expert_used) {
-                if (size > 0) {
+                if (size > 0 && !quiet) {
                     LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
                 }
                 n = 0;
@@ -765,6 +765,42 @@ struct llama_moe_cache::impl {
 
     bool empty() const {
         return snap_groups_on.load() == 0;
+    }
+
+    // SHURA (design §3.4): the smallest size at which every group serves ubatches of n_tokens from the cache (a smaller cache is
+    // silently not used for them: get_slot_map() returns nullptr); n_tokens <= 0: the size that caches every expert
+    size_t size_for_tokens(int64_t n_tokens) const {
+        if (groups.empty() || split_sum == 0.0) {
+            return 0;
+        }
+        std::vector<int32_t> need(groups.size(), 0);
+        double bytes = 0.0;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group & g = groups[ig];
+            const device & d = devices[g.id];
+            if (d.host_bytes == 0 || d.split == 0.0) {
+                continue;
+            }
+            const int64_t n_expert  = g.ref[0]->ne[2];
+            const int64_t max_slots = (int64_t) g.layers.size()*n_expert;
+            int64_t r = n_tokens <= 0 ? max_slots : std::max<int64_t>(n_expert_used, std::min<int64_t>(n_tokens*n_expert_used, n_expert));
+            r = std::min(r, max_slots);
+            need[ig] = (int32_t) r;
+            bytes = std::max(bytes, (double) alloc_size(g, (int32_t) r)*split_sum/d.split*(double) d.host_bytes/(double) g.host_bytes);
+        }
+        size_t size = (size_t) std::ceil(bytes) + 1;
+        for (int i = 0; i < 4096; ++i) { // the layout rounds down: step up until every group gets its slots
+            const std::vector<int32_t> n = layout(size, true);
+            bool ok = true;
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                ok = ok && n[ig] >= need[ig];
+            }
+            if (ok) {
+                break;
+            }
+            size += 1024*1024;
+        }
+        return size;
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -1387,6 +1423,10 @@ bool llama_moe_cache::invalidate(int32_t il, int32_t e) {
 
 bool llama_moe_cache::self_check(bool contents, std::string & why) const {
     return pimpl->self_check(contents, why);
+}
+
+size_t llama_moe_cache::size_for_tokens(int64_t n_tokens) const {
+    return pimpl->size_for_tokens(n_tokens);
 }
 
 bool llama_moe_cache::resizable() const {

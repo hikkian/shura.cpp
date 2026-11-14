@@ -1760,6 +1760,8 @@ extern "C" {
     // release wait, allocates the new size (on failure the previous size, then empty) and warms it from the decayed use counters.
     // Returns the device bytes of the cache after the call. Called from another thread than the decoding one.
     LLAMA_API size_t llama_moe_cache_resize(struct llama_context * ctx, size_t size);
+    // the smallest cache size at which ubatches of n_tokens read every expert from the cache (<= 0: the size that caches all)
+    LLAMA_API size_t llama_moe_cache_size_for_tokens(const struct llama_context * ctx, int64_t n_tokens);
     // a resize waits for the micro-batch lock: an abort callback may return true to stop a long micro-batch sooner
     LLAMA_API bool   llama_moe_cache_resize_pending(const struct llama_context * ctx);
     LLAMA_API void   llama_moe_cache_set_release_wait(struct llama_context * ctx, void (*fn)(size_t freed_bytes, void * data), void * data);

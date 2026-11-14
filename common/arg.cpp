@@ -2767,6 +2767,105 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) { params.moe_cache_resizable = true; }
     ).set_env("LLAMA_ARG_MOE_CACHE_LIVE_RESIZE"));
     add_opt(common_arg(
+        {"--vram-governor"},
+        "VRAM governor: owns the expert cache and keeps free card VRAM at or above --vram-reserve-mib (requires --moe-cache-live-resize)",
+        [](common_params & params) {
+            params.vram_governor = true;
+            params.moe_cache_resizable = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VRAM_GOVERNOR"));
+    add_opt(common_arg(
+        {"--vram-reserve-mib"}, "N",
+        string_format("free card VRAM kept for the desktop, MiB (default: %d)", 1536),
+        [](common_params & params, int value) {
+            params.vram_reserve_mib = value;
+            // the gateway starts the governor by passing the reserve; --vram-governor is the explicit form
+            params.vram_governor = true;
+            params.moe_cache_resizable = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VRAM_RESERVE_MIB"));
+    add_opt(common_arg(
+        {"--warmup-shapes"}, "LIST",
+        "governor warm-up shapes, comma separated (prefill_ub, decode_draft, vision); the server always runs the prefill and the draft decode",
+        [](common_params & params, const std::string & value) { params.vram_warmup_shapes = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-buffer-mib"}, "N",
+        string_format("working buffer above the reserve, MiB: the cache is trimmed as soon as free VRAM drops below reserve + buffer, so a desk burst up to the buffer never reaches the reserve (default: %d)", 256),
+        [](common_params & params, int value) { params.vram_buffer_mib = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-poll-fast-ms"}, "N",
+        string_format("governor polling period while free VRAM is below reserve + buffer or falling, ms (default: %d)", 50),
+        [](common_params & params, int value) { params.vram_poll_fast_ms = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-no-trim-abort"},
+        "an urgent cache trim (free VRAM below the reserve) waits for the end of the running ubatch instead of interrupting it",
+        [](common_params & params) { params.vram_trim_abort = false; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-hysteresis-mib"}, "N",
+        string_format("the cache grows only into room above reserve + buffer + this value, MiB (default: %d)", 256),
+        [](common_params & params, int value) { params.vram_hysteresis_mib = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-grow-seconds"}, "N",
+        string_format("calm seconds after a trim before the cache grows again (default: %d)", 30),
+        [](common_params & params, int value) { params.vram_grow_seconds = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-pause-floor-mib"}, "N",
+        string_format("with the cache at its minimum, free VRAM below this for two polls pauses the server with a checkpoint, MiB (default: %d)", 768),
+        [](common_params & params, int value) { params.vram_pause_floor_mib = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-pause-after-seconds"}, "N",
+        string_format("with the cache at its minimum, free VRAM below the reserve for this many seconds pauses the server (0 = off, default: %d)", 2),
+        [](common_params & params, int value) { params.vram_pause_after_ms = value * 1000; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-pause-after-ms"}, "N",
+        "the same in milliseconds, for a pause sooner than a second (0 = off)",
+        [](common_params & params, int value) { params.vram_pause_after_ms = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-min-chunks"}, "N",
+        "the governor never trims the cache below this many chunks (default: 0)",
+        [](common_params & params, int value) { params.vram_min_chunks = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-poll-ms"}, "N",
+        string_format("governor polling period, ms (default: %d)", 200),
+        [](common_params & params, int value) { params.vram_poll_ms = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-chunk-mib"}, "N",
+        string_format("expert cache MiB per governor step; the first step is the smallest size that serves the verify batch (default: %d)", 52),
+        [](common_params & params, int value) { params.vram_chunk_mib = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--moe-cache-cpu-share-table"}, "LIST",
+        "CPU share of the cache misses by cache size, \"size_mib:share,...\" (e.g. from scripts/moe-cache-tune.py at two or three sizes); "
+        "the governor switches it after every resize (needs --moe-cache-cpu-share > 0 at start)",
+        [](common_params & params, const std::string & value) { params.moe_cache_cpu_share_table = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-sysfs-card"}, "PATH|auto",
+        "amdgpu sysfs device directory with mem_info_vram_used/total (default: auto)",
+        [](common_params & params, const std::string & value) { params.vram_sysfs_card = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-pause-dir"}, "DIR",
+        "directory for governor pause checkpoints",
+        [](common_params & params, const std::string & value) { params.vram_pause_dir = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--vram-test-hooks"},
+        "enable POST /vram/simulate and POST /moe-cache/chunks (stand only)",
+        [](common_params & params) { params.vram_test_hooks = true; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--moe-cache-cpu-share"}, "F",
         string_format("share of the MoE cache misses that the CPU computes from the host experts instead of uploading them to the GPU once the cache is full, from 0 to 1 (default: %.2f)", (double) params.moe_cache_cpu_share),
         [](common_params & params, const std::string & value) {

@@ -71,7 +71,7 @@ note = "moe_cache_lru: slots rebuilt, CRF/last use/clocks kept; init() calls it"
 [[hook]]
 feature = "moe-cache"
 file = "src/llama-moe-cache.cpp"
-probe = "std::vector<int32_t> layout(size_t size) const"
+probe = "std::vector<int32_t> layout(size_t size, bool quiet = false) const"
 note = "the slot computation of upstream's constructor, as a function; device split fixed at creation"
 
 [[hook]]
@@ -181,3 +181,68 @@ feature = "moe-cache"
 file = "tests/CMakeLists.txt"
 probe = "test-moe-cache-resize.cpp"
 note = "built, not run by ctest: needs a GPU and a small MoE model (test-llama-archs -a qwen35moe -o DIR)"
+
+# ---- step 5: the VRAM governor on the new cache API (design §3.4) ----
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server-vram.cpp"
+probe = "llama_moe_cache_resize(ctx_, bytes)"
+note = "the actuator; chunk 1 = llama_moe_cache_size_for_tokens(verify batch), then --vram-chunk-mib steps; CPU share table after a resize"
+
+[[hook]]
+feature = "governor"
+file = "src/llama-moe-cache.cpp"
+probe = "size_t size_for_tokens(int64_t n_tokens) const"
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server-context.cpp"
+probe = "void start_vram()"
+note = "server_context_impl members; started after init() in load_model; fixed parts leave the cache out (moe_cache)"
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server-context.cpp"
+probe = "case SERVER_TASK_TYPE_VRAM_PAUSE:"
+note = "before SERVER_TASK_TYPE_SLOT_SAVE: save slots + sidecar, error to clients, exit 75"
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server-context.cpp"
+probe = "busy_flag.store(all_idle ? 0 : 1);"
+note = "update_slots, before `if (all_idle)`"
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server-context.cpp"
+probe = "if (ret == 2 && vram && vram->pause_pending())"
+note = "decode(): an interrupted slice is rolled back for a pause or retried (rewind_slice / rewind_for_pause)"
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server-context.cpp"
+probe = "VRAMLOGIC1 resume: continue a request"
+note = "handle_completions_impl; task.resume_base_text, seeded in server-queue.cpp post_tasks"
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server-context.cpp"
+probe = "this->get_vram = [this]"
+note = "init_routes; registered in server.cpp server_register_routes when --vram-governor"
+
+[[hook]]
+feature = "governor"
+file = "tools/server/server.cpp"
+probe = "--vram-governor and --moe-cache-live-resize require a single-model server bound to loopback"
+
+[[hook]]
+feature = "governor"
+file = "common/arg.cpp"
+probe = '{"--vram-chunk-mib"}'
+note = "with the other --vram-* flags and --moe-cache-cpu-share-table"
+
+[[hook]]
+feature = "mtp-lora"
+file = "tools/server/server-context.cpp"
+probe = "an MTP draft context shares the target model, so it gets the same adapters"

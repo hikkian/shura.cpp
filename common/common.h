@@ -617,6 +617,24 @@ struct common_params {
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
     bool   moe_cache_resizable = false; // SHURA: --moe-cache-live-resize
+    std::string moe_cache_cpu_share_table = ""; // SHURA: "size_mib:share,..." switched by the VRAM governor
+    // SHURA (VRAMLOGIC1-3, REBASE1): VRAM governor
+    bool        vram_governor = false;
+    int32_t     vram_reserve_mib = 1536;
+    int32_t     vram_buffer_mib = 256;
+    int32_t     vram_poll_fast_ms = 50;
+    bool        vram_trim_abort = true;
+    int32_t     vram_hysteresis_mib = 256;
+    int32_t     vram_grow_seconds = 30;
+    int32_t     vram_pause_floor_mib = 768;
+    int32_t     vram_pause_after_ms = 2000;
+    int32_t     vram_min_chunks = 0;
+    int32_t     vram_poll_ms = 200;
+    int32_t     vram_chunk_mib = 52;
+    bool        vram_test_hooks = false;
+    std::string vram_sysfs_card = "auto";
+    std::string vram_warmup_shapes = "prefill_ub,decode_draft,vision";
+    std::string vram_pause_dir = "";
     int32_t host_pinned_max_mib = 0;  // SHURA: pinned host buffers beyond this (after warm-up) fall back to pageable memory; 0 = no limit
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;

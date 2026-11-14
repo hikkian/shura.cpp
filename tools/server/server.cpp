@@ -116,6 +116,17 @@ static server_role_type server_role_detect(const common_params & params, server_
 
 // adjust the params for the role; returns false on a configuration error
 static bool server_prepare_params(common_params & params, server_role_type role_type) {
+    if (params.vram_governor || params.moe_cache_resizable) {
+        // SHURA: the governor's endpoints change the memory of the model process: a single-model server on loopback only
+        bool loopback_only = !params.hostnames.empty();
+        for (const auto & host : params.hostnames) {
+            loopback_only = loopback_only && (host == "127.0.0.1" || host == "localhost" || host == "::1");
+        }
+        if (role_type == SERVER_ROLE_ROUTER || !loopback_only) {
+            SRV_ERR("%s\n", "--vram-governor and --moe-cache-live-resize require a single-model server bound to loopback");
+            return false;
+        }
+    }
     if (role_type != SERVER_ROLE_ROUTER) {
         // validate batch size for embeddings
         // embeddings require all tokens to be processed in a single ubatch
@@ -170,7 +181,7 @@ static bool server_prepare_params(common_params & params, server_role_type role_
 }
 
 // the API of every server; a router points the handlers in routes at its proxies before calling this
-static void server_register_routes(server_http_context & ctx_http, server_routes & routes) {
+static void server_register_routes(server_http_context & ctx_http, server_routes & routes, const common_params & params) {
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
@@ -184,6 +195,17 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
+    if (params.vram_governor) {   // SHURA (VRAMLOGIC1)
+        ctx_http.get ("/vram",                ex_wrapper(routes.get_vram));
+        ctx_http.get ("/vram/policy",         ex_wrapper(routes.get_vram_policy));
+        ctx_http.get ("/vram/journal",        ex_wrapper(routes.get_vram_journal));
+        ctx_http.post("/vram/policy",         ex_wrapper(routes.post_vram_policy));
+        ctx_http.post("/vram/pause",          ex_wrapper(routes.post_vram_pause));
+        if (params.vram_test_hooks) {
+            ctx_http.post("/moe-cache/chunks", ex_wrapper(routes.post_moe_cache_chunks));
+            ctx_http.post("/vram/simulate",    ex_wrapper(routes.post_vram_simulate));
+        }
+    }
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
@@ -559,7 +581,7 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
     ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
 
-    server_register_routes(ctx_http, routes);
+    server_register_routes(ctx_http, routes, params);
     server_register_stream_routes(ctx_http,
         models_routes->router_stream_get,
         models_routes->router_streams_lookup,
@@ -661,7 +683,7 @@ static int server_run_instance(common_params & params, server_role & role, commo
         return 1;
     }
 
-    server_register_routes(ctx_http, routes);
+    server_register_routes(ctx_http, routes, params);
     server_register_stream_routes(ctx_http,
         server_stream_make_get_handler(),
         server_stream_make_lookup_handler(),
@@ -704,7 +726,7 @@ static int server_run_instance(common_params & params, server_role & role, commo
     }
 
     routes.update_meta(ctx_server);
-    if (params.host_pinned_max_mib > 0) {
+    if (params.host_pinned_max_mib > 0 && !params.vram_governor) {
         // SHURA (RAMGUARD1f): the load and its warm-up are done: freeze the GPU pools (later growth is logged) and cap pinned host
         // buffers created from now on; beyond the cap they use pageable memory
         for (size_t i = 0; i < ggml_backend_dev_count(); i++) {

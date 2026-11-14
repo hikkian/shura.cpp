@@ -68,6 +68,8 @@ public:
     // ---- SHURA: live resize (design §3.3 В, Г, З). Only through llama_context, which holds the micro-batch lock and has
     // synchronized the backends: nothing running or queued may read the banks. ----
     bool     resizable() const;
+    // the smallest size at which every group serves ubatches of n_tokens from the cache (<= 0: the size that caches every expert)
+    size_t   size_for_tokens(int64_t n_tokens) const;
     // returns false if the layout did not change; on an allocation failure the previous size, then the empty state
     bool     resize(size_t size);
     // called between the release of the old banks and the allocation of the new ones, with the bytes released

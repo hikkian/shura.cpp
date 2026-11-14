@@ -16,6 +16,9 @@ add_library(${TARGET} STATIC
     server-decision.cpp
     server-decision.h
     server-context.cpp
+    server-vram.cpp
+    server-vram.h
+    server-vram-governor.h
     server-context.h
     server-realtime.cpp
     server-realtime.h
