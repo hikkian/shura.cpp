@@ -1,0 +1,97 @@
+# shura.cpp 1.0: build checks for the fork's own changes on top of llama.cpp v1.0.0. Upstream's workflows stay as they are; this
+# one runs on the `shura-v1` branch (and `shura` once 1.0 replaces it) and on pull requests to them.
+#
+# cpu:  the hook points into upstream files, a CPU build, the tests of the fork's parts (governor decision core, SIGABRT
+#       backtraces, reasoning budget), the llama_decode interrupt test on a small generated model.
+# hip:  compiles for gfx1101 in ROCm's container (the desktop: RX 7800 XT). Nothing runs on a GPU here.
+# cuda: compiles for sm_86 in NVIDIA's container (the laptop: RTX 3050). Nothing runs on a GPU here.
+
+name: shura
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [shura, shura-v1]
+  pull_request:
+    branches: [shura, shura-v1]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build libssl-dev python3
+
+      - name: Hook points into upstream files
+        run: python3 scripts/shura-touchpoints.py
+
+      - name: Build
+        run: |
+          cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
+                -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF
+          cmake --build build --target llama-server llama-perplexity test-vram-governor test-abort-backtrace \
+                test-reasoning-effort test-llama-archs test-vram-abort
+
+      - name: Tests of the fork's parts
+        run: |
+          build/bin/test-vram-governor
+          build/bin/test-abort-backtrace
+          build/bin/test-reasoning-effort
+
+      - name: Interrupting llama_decode (small generated model)
+        run: |
+          mkdir -p models
+          build/bin/test-llama-archs -a "^llama$" -o models
+          build/bin/test-vram-abort models/llama-dense.gguf
+
+  hip:
+    runs-on: ubuntu-22.04
+    container: rocm/dev-ubuntu-22.04:7.2.1
+    timeout-minutes: 120
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential cmake ninja-build rocblas-dev hipblas-dev libssl-dev
+
+      - name: Build (compile only, gfx1101)
+        run: |
+          cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" -DGGML_HIP=ON -DGPU_TARGETS=gfx1101 \
+                -DGGML_HIP_NO_VMM=ON -DLLAMA_CURL=OFF -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q8_0-q4_0;q4_0-q4_0;q4_0-q8_0;f16-f16;bf16-bf16"
+          cmake --build build --target llama-server test-moe-cache-resize
+
+  cuda:
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    timeout-minutes: 120
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential cmake ninja-build libssl-dev git
+
+      - name: Build (compile only, sm_86)
+        run: |
+          cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+                -DLLAMA_CURL=OFF -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q8_0-q4_0;q4_0-q4_0;q4_0-q8_0;f16-f16;bf16-bf16"
+          cmake --build build --target llama-server test-moe-cache-resize
