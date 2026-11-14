@@ -633,6 +633,31 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     launch_fattn<D, cols_per_block, ncols2>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
 }
 
+
+// SHURA (gqavec2, REBASE1): the GQA-packed decode path applies (HIP, GGML_HIP_FA_GQA_VEC=1, head 256, K q8_0, V q8_0 or q4_0,
+// GQA 4 or 8, no ALiBi, no softcap, up to 3 tokens = the MTP verify batch). The kernel choice must ask this too: for 3 tokens with
+// GQA 8 it would otherwise pick the WMMA kernel on RDNA3, which converts the whole quantized KV to f16 at every step.
+static inline bool ggml_cuda_fattn_gqa_vec_applies(const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = []() { const char * e = getenv("GGML_HIP_FA_GQA_VEC"); return e && e[0] == '1'; }();
+    if (!enabled) {
+        return false;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    float max_bias, logit_softcap;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    return Q->ne[0] == 256 && K->type == GGML_TYPE_Q8_0 && (V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0) &&
+        Q->ne[1] <= 3 && max_bias == 0.0f && logit_softcap == 0.0f && (gqa_ratio == 8 || gqa_ratio == 4);
+#else
+    GGML_UNUSED(dst);
+    return false;
+#endif // GGML_USE_HIP
+}
+
 template <int D, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -645,13 +670,10 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     // GQA-packed decode path (opt-in): one block handles all Q heads of one KV head, K/V rows are read and unpacked once.
     // SHURA (gqavec2; REBASE1: the V types of shura.cpp 1.0, q8_0 and q4_0, instead of turbo4)
     if constexpr (D == 256 && type_K == GGML_TYPE_Q8_0 && (type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_Q4_0)) {
-        static const bool gqa_vec_enabled = []() { const char * e = getenv("GGML_HIP_FA_GQA_VEC"); return e && e[0] == '1'; }();
         const ggml_tensor * K = dst->src[1];
         const int gqa_ratio = Q->ne[2] / K->ne[2];
-        float max_bias_v;
-        memcpy(&max_bias_v, (const float *) dst->op_params + 1, sizeof(float));
         // REBASE1: up to 3 tokens, the MTP verify batch (draft n_max 2 + 1) of the long profile; the shura branch stopped at 2
-        if (gqa_vec_enabled && Q->ne[1] <= 3 && logit_softcap == 0.0f && max_bias_v == 0.0f && (gqa_ratio == 8 || gqa_ratio == 4)) {
+        if (ggml_cuda_fattn_gqa_vec_applies(dst)) {
             constexpr bool use_logit_softcap = false;
             if (gqa_ratio == 8) {
                 ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 8, type_K, type_V, use_logit_softcap>(ctx, dst);

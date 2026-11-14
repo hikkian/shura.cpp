@@ -757,6 +757,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
+    // SHURA (REBASE1): the GQA-packed vec path (see ggml_cuda_fattn_gqa_vec_applies) before the WMMA and tile kernels, which would
+    // convert the quantized KV to f16
+    if (can_use_vector_kernel && ggml_cuda_fattn_gqa_vec_applies(dst)) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {

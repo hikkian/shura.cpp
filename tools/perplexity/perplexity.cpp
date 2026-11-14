@@ -509,7 +509,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     std::vector<float> logits;
     if (num_batches > 1) {
-        logits.reserve(size_t(n_ctx) * n_vocab);
+        if (getenv("SHURA_PPL_STREAM") == nullptr || atoi(getenv("SHURA_PPL_STREAM")) == 0) { // SHURA: not needed when streaming
+            logits.reserve(size_t(n_ctx) * n_vocab);
+        }
     }
 
     LOG_INF("%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
@@ -518,7 +520,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     std::vector<uint16_t> log_probs;
     // SHURA: SHURA_PPL_STREAM=1 writes the base log-probs batch by batch (memory independent of n_ctx), one sequence per chunk
-    const bool ppl_stream = getenv("SHURA_PPL_STREAM") != nullptr && n_seq == 1 && !params.logits_file.empty();
+    const bool ppl_stream = (getenv("SHURA_PPL_STREAM") != nullptr && atoi(getenv("SHURA_PPL_STREAM")) != 0) && n_seq == 1 && !params.logits_file.empty();
     if (!params.logits_file.empty()) {
         logits_stream.write((const char *)&n_vocab, sizeof(n_vocab));
         logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
@@ -1751,13 +1753,15 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     common_batch batch(ctx);
 
     // SHURA: SHURA_PPL_STREAM=1 reads the base log-probs and computes the divergence batch by batch (memory independent of n_ctx)
-    const bool kld_stream = getenv("SHURA_PPL_STREAM") != nullptr && n_seq == 1;
+    const bool kld_stream = (getenv("SHURA_PPL_STREAM") != nullptr && atoi(getenv("SHURA_PPL_STREAM")) != 0) && n_seq == 1;
     std::vector<uint16_t> log_probs_uint16(size_t(kld_stream ? n_batch : n_ctx - 1 - n_ctx/2) * nv);
     std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> logits;
     if (num_batches > 1) {
-        logits.reserve(size_t(n_ctx) * n_vocab);
+        if (getenv("SHURA_PPL_STREAM") == nullptr || atoi(getenv("SHURA_PPL_STREAM")) == 0) { // SHURA: not needed when streaming
+            logits.reserve(size_t(n_ctx) * n_vocab);
+        }
     }
 
     LOG_INF("%s: computing over %d chunks, n_ctx=%u, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
