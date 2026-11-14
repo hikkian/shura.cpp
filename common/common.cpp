@@ -2517,3 +2517,82 @@ void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
 }
+
+// ---- SHURA (HEAPBUG1): backtrace of all threads on SIGABRT ----
+#if defined(__linux__)
+#include <execinfo.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void common_abort_write(const char * s) {
+    size_t n = 0;
+    while (s[n] != '\0') { n++; }
+    if (write(2, s, n) < 0) { /* nothing to do */ }
+}
+
+// async-signal-safe enough for a crash path: no malloc, fork + exec of gdb attached to this process, then waitpid
+static void common_abort_print_backtraces() {
+    const char * no_bt = getenv("GGML_NO_BACKTRACE");
+    if (no_bt != nullptr && *no_bt != '\0') {
+        return;
+    }
+    int lock[2] = { -1, -1 };
+    if (pipe(lock) != 0) {
+        lock[0] = lock[1] = -1;
+    }
+    char attach[32];
+    const pid_t parent = getpid();
+    snprintf(attach, sizeof(attach), "attach %d", (int) parent);
+    const pid_t child = fork();
+    if (child < 0) {
+        void * trace[64];
+        const int n = backtrace(trace, 64);
+        backtrace_symbols_fd(trace, n, 2);
+        return;
+    }
+    if (child == 0) {
+        if (lock[1] >= 0) { close(lock[1]); }
+        if (lock[0] >= 0) { char c; (void) !read(lock[0], &c, 1); close(lock[0]); }
+        execlp("gdb", "gdb", "--batch", "-q",
+               "-ex", "set pagination off",
+               "-ex", attach,
+               "-ex", "thread apply all bt 30",
+               "-ex", "detach", "-ex", "quit", (char *) nullptr);
+        // no gdb: the aborting thread only
+        void * trace[64];
+        const int n = backtrace(trace, 64);
+        backtrace_symbols_fd(trace, n, 2);
+        _exit(0);
+    }
+    prctl(PR_SET_PTRACER, child);
+    if (lock[1] >= 0) { close(lock[1]); }
+    if (lock[0] >= 0) { close(lock[0]); }
+    int status = 0;
+    waitpid(child, &status, 0);
+}
+
+static void common_abort_backtrace_handler(int sig) {
+    common_abort_write("\nfatal: SIGABRT (glibc heap check, failed assertion or uncaught exception); backtraces of all threads follow, the aborting thread is the one in abort()/raise():\n");
+    common_abort_print_backtraces();
+    common_abort_write("fatal: end of backtraces; re-raising SIGABRT\n");
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void common_install_abort_backtrace() {
+    const char * off = getenv("SHURA_NO_ABORT_BACKTRACE");
+    if (off != nullptr && *off != '\0' && strcmp(off, "0") != 0) {
+        return;
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = common_abort_backtrace_handler;
+    sa.sa_flags = SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGABRT, &sa, nullptr);
+}
+#else
+void common_install_abort_backtrace() {}
+#endif

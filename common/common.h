@@ -8,6 +8,11 @@
 #include "ggml.h"
 #include "llama.h"
 
+// SHURA (HEAPBUG1): on SIGABRT (glibc heap checks, a failed assert, std::terminate) print the backtrace of every thread to stderr
+// (gdb attached from a forked child; backtrace_symbols as the fallback), then re-raise with the default action. Off with
+// SHURA_NO_ABORT_BACKTRACE=1.
+void common_install_abort_backtrace();
+
 #include <array>
 #include <list>
 #include <set>
@@ -611,6 +616,7 @@ struct common_params {
 
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
+    int32_t host_pinned_max_mib = 0;  // SHURA: pinned host buffers beyond this (after warm-up) fall back to pageable memory; 0 = no limit
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

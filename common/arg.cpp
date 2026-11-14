@@ -1674,6 +1674,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--slot-save-checkpoints"}, "N",
+        "ignored, kept for scripts of the shura stack: upstream always appends the context checkpoints to saved slots",
+        [](common_params &, int) {}
+    ).set_env("LLAMA_ARG_SLOT_SAVE_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--host-pinned-max-mib"}, "N",
+        "limit for pinned host buffers created after the warm-up; beyond it buffers use pageable memory (0 = no limit)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--host-pinned-max-mib must be >= 0");
+            }
+            params.host_pinned_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_HOST_PINNED_MAX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {

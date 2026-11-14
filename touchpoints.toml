@@ -1,0 +1,61 @@
+# Hook points of shura.cpp 1.0 in upstream llama.cpp v1.0.0 files (see docs/SHURA.md). After an update, `scripts/shura-touchpoints.py`
+# checks that every `probe` string is still present in its file; a missing one means upstream moved the code and the hook has to be
+# re-placed. feature = which part of the fork depends on it. Each REBASE1 step adds its own hooks here.
+
+# ---- step 1: small parts ----
+
+[[hook]]
+feature = "abort-backtrace"
+file = "common/common.cpp"
+probe = "common_install_abort_backtrace"
+
+[[hook]]
+feature = "abort-backtrace"
+file = "tools/server/server.cpp"
+probe = "common_install_abort_backtrace(); // SHURA (HEAPBUG1)"
+note = "inside server_install_signal_handlers()"
+
+[[hook]]
+feature = "op-failure-diagnostic"
+file = "ggml/src/ggml-cuda/ggml-cuda.cu"
+probe = "PFAULT1 op=%s"
+note = "after cudaGetLastError() in ggml_cuda_compute_forward"
+
+[[hook]]
+feature = "slot-save-checkpoints-noop"
+file = "common/arg.cpp"
+probe = '{"--slot-save-checkpoints"}'
+
+[[hook]]
+feature = "pinned-limit"
+file = "ggml/src/ggml-cuda/ggml-cuda.cu"
+probe = "g_host_pinned_max_bytes"
+note = "ggml_backend_cuda_host_buffer_type_alloc_buffer: over the limit after the pools were frozen -> pageable fallback"
+
+[[hook]]
+feature = "pinned-limit"
+file = "ggml/src/ggml-cuda/ggml-cuda.cu"
+probe = '"ggml_backend_cuda_host_set_limit"'
+note = "ggml_backend_cuda_reg_get_proc_address; also host_stats, pool_freeze, pool_stats"
+
+[[hook]]
+feature = "pinned-limit"
+file = "common/arg.cpp"
+probe = '{"--host-pinned-max-mib"}'
+
+[[hook]]
+feature = "pinned-limit"
+file = "tools/server/server.cpp"
+probe = "params.host_pinned_max_mib > 0"
+note = "after load_model: set the limit and freeze the pools (until the VRAM governor does it after its own warm-up)"
+
+[[hook]]
+feature = "pool-accounting"
+file = "ggml/src/ggml-cuda/ggml-cuda.cu"
+probe = "ggml_cuda_pool_note_growth(\"legacy\""
+note = "ggml_cuda_pool_leg::alloc; the vmm pool has the same call"
+
+[[hook]]
+feature = "alloc-log"
+file = "ggml/src/ggml-cuda/ggml-cuda.cu"
+probe = "GGML_CUDA_LOG_ALLOCS"

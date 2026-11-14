@@ -191,6 +191,19 @@ static int ggml_cuda_op_offload_min_batch() {
     return min_batch;
 }
 
+// SHURA (VRAMLOGIC3): GGML_CUDA_LOG_ALLOCS=1 logs every device allocation and release of the buffers and the legacy pool with its
+// size and a timestamp, to find what briefly takes VRAM around an expert-cache resize. Off by default: one getenv at the first call.
+static bool ggml_cuda_log_allocs() {
+    static const bool on = getenv("GGML_CUDA_LOG_ALLOCS") != nullptr;
+    return on;
+}
+
+static void ggml_cuda_log_alloc(const char * what, const void * ptr, size_t size) {
+    if (ggml_cuda_log_allocs()) {
+        GGML_LOG_INFO("cuda %s: %.1f MiB %p t=%.3f s\n", what, size / 1048576.0, ptr, ggml_time_us() / 1e6);
+    }
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -446,6 +459,41 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// SHURA (VRAMLOGIC1): pool growth accounting. After warm-up the server freezes the pools: any later growth is counted and
+// logged (vram_pool_overflow) instead of happening silently; the allocation itself still succeeds.
+static std::atomic<bool>     g_pool_frozen{false};
+static std::atomic<uint64_t> g_pool_overflows{0};
+static std::atomic<uint64_t> g_pool_bytes{0};
+
+static void ggml_cuda_pool_note_growth(const char * kind, int device, size_t bytes) {
+    g_pool_bytes += bytes;
+    if (g_pool_frozen.load()) {
+        ++g_pool_overflows;
+        GGML_LOG_WARN("vram_pool_overflow: %s pool[%d] grew by %.2f MiB after warm-up (pool total %.2f MiB)\n",
+                kind, device, bytes/1024.0/1024.0, g_pool_bytes.load()/1024.0/1024.0);
+    }
+}
+
+// SHURA (RAMGUARD1f): pinned host memory limit. 0 = unlimited; applies after the pools were frozen (after warm-up): pinned buffers
+// asked for later fall back to pageable memory instead of growing without bound (pinned pages cannot be swapped or reclaimed).
+static std::atomic<uint64_t> g_host_pinned_bytes{0};
+static std::atomic<uint64_t> g_host_pinned_denied{0};
+static std::atomic<uint64_t> g_host_pinned_max_bytes{0};
+
+static void ggml_backend_cuda_host_set_limit(uint64_t max_bytes) { g_host_pinned_max_bytes.store(max_bytes); }
+
+static void ggml_backend_cuda_host_stats(uint64_t * pinned_bytes, uint64_t * denied) {
+    if (pinned_bytes) { *pinned_bytes = g_host_pinned_bytes.load(); }
+    if (denied)       { *denied       = g_host_pinned_denied.load(); }
+}
+
+static void ggml_backend_cuda_pool_freeze(bool frozen) { g_pool_frozen.store(frozen); }
+
+static void ggml_backend_cuda_pool_stats(uint64_t * overflows, uint64_t * pool_bytes) {
+    if (overflows)  { *overflows  = g_pool_overflows.load(); }
+    if (pool_bytes) { *pool_bytes = g_pool_bytes.load(); }
+}
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
@@ -475,7 +523,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
+                ggml_cuda_log_alloc("pool release", b.ptr, b.size);
                 CUDA_CHECK(cudaFree(b.ptr));
+                g_pool_bytes -= b.size;
                 pool_size -= b.size;
                 b.ptr  = nullptr;
                 b.size = 0;
@@ -554,7 +604,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             }
         }
         CUDA_CHECK(err);
+        ggml_cuda_log_alloc("pool alloc", ptr, look_ahead_size);
         *actual_size = look_ahead_size;
+        ggml_cuda_pool_note_growth("legacy", device, look_ahead_size);
         pool_size += look_ahead_size;
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
@@ -574,7 +626,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
+        ggml_cuda_log_alloc("pool release (full)", ptr, size);
         CUDA_CHECK(cudaFree(ptr));
+        g_pool_bytes -= size;
         pool_size -= size;
         invalidate_cuda_graphs();
     }
@@ -708,6 +762,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             }
 
             // add to the pool
+            ggml_cuda_pool_note_growth("vmm", device, reserve_size);
             pool_size += reserve_size;
 
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
@@ -958,6 +1013,7 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    ggml_cuda_log_alloc("buffer release", ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -1209,6 +1265,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         return nullptr;
     }
 
+    ggml_cuda_log_alloc("buffer alloc", dev_ptr, size);
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
@@ -1684,6 +1741,7 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    g_host_pinned_bytes -= ggml_backend_buffer_get_size(buffer);
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -1706,7 +1764,16 @@ static void * ggml_cuda_host_malloc(size_t size) {
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * ptr = ggml_cuda_host_malloc(size);
+    void * ptr = nullptr;
+    const uint64_t max_pinned = g_host_pinned_max_bytes.load();
+    if (max_pinned > 0 && g_pool_frozen.load() && g_host_pinned_bytes.load() + size > max_pinned) {
+        ++g_host_pinned_denied;   // SHURA (RAMGUARD1f): over the limit after warm-up: pageable memory below
+    } else {
+        ptr = ggml_cuda_host_malloc(size);
+        if (ptr != nullptr) {
+            g_host_pinned_bytes += size;
+        }
+    }
 
     if (ptr == nullptr) {
         // fallback to cpu buffer
@@ -3062,6 +3129,16 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
+        { // SHURA (PFAULT1): the op, tensor name, shapes and buffer of the failed op
+            const ggml_tensor * s0 = dst->src[0]; const ggml_tensor * s1 = dst->src[1]; const ggml_tensor * s2 = dst->src[2];
+            GGML_LOG_ERROR("PFAULT1 op=%s name=%s op_params0=%d dst[%lld,%lld,%lld] src0=%s[%lld,%lld,%lld] data=%p buf=%s src1[%lld,%lld,%lld] ids[%lld,%lld]\n",
+                ggml_op_name(dst->op), dst->name, (int) dst->op_params[0],
+                (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2],
+                s0 ? ggml_type_name(s0->type) : "-", s0 ? (long long) s0->ne[0] : 0, s0 ? (long long) s0->ne[1] : 0, s0 ? (long long) s0->ne[2] : 0,
+                s0 ? s0->data : nullptr, s0 && s0->buffer ? ggml_backend_buffer_name(s0->buffer) : "-",
+                s1 ? (long long) s1->ne[0] : 0, s1 ? (long long) s1->ne[1] : 0, s1 ? (long long) s1->ne[2] : 0,
+                s2 ? (long long) s2->ne[0] : 0, s2 ? (long long) s2->ne[1] : 0);
+        }
         CUDA_CHECK(err);
     }
 
@@ -6869,6 +6946,19 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    // SHURA: pinned host memory limit and pool freeze/accounting (used by the server after warm-up and by the VRAM governor)
+    if (strcmp(name, "ggml_backend_cuda_host_set_limit") == 0) {
+        return (void *)ggml_backend_cuda_host_set_limit;
+    }
+    if (strcmp(name, "ggml_backend_cuda_host_stats") == 0) {
+        return (void *)ggml_backend_cuda_host_stats;
+    }
+    if (strcmp(name, "ggml_backend_cuda_pool_freeze") == 0) {
+        return (void *)ggml_backend_cuda_pool_freeze;
+    }
+    if (strcmp(name, "ggml_backend_cuda_pool_stats") == 0) {
+        return (void *)ggml_backend_cuda_pool_stats;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

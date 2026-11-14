@@ -333,6 +333,7 @@ static bool server_setup_features(
 
 static void server_install_signal_handlers() {
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+    common_install_abort_backtrace(); // SHURA (HEAPBUG1): a glibc abort prints every thread's stack
     struct sigaction sigint_action;
     sigint_action.sa_handler = signal_handler;
     sigemptyset (&sigint_action.sa_mask);
@@ -703,6 +704,27 @@ static int server_run_instance(common_params & params, server_role & role, commo
     }
 
     routes.update_meta(ctx_server);
+    if (params.host_pinned_max_mib > 0) {
+        // SHURA (RAMGUARD1f): the load and its warm-up are done: freeze the GPU pools (later growth is logged) and cap pinned host
+        // buffers created from now on; beyond the cap they use pageable memory
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto set_limit = (void (*)(uint64_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_set_limit");
+            auto freeze    = (void (*)(bool))     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_pool_freeze");
+            if (set_limit && freeze) {
+                set_limit((uint64_t) params.host_pinned_max_mib * 1024 * 1024);
+                freeze(true);
+                SRV_INF("pinned host memory limit %d MiB after warm-up; GPU pools frozen\n", params.host_pinned_max_mib);
+            } else {
+                SRV_WRN("%s", "--host-pinned-max-mib: this GPU backend has no pinned-memory limit; ignored\n");
+            }
+            break;
+        }
+    }
     ctx_http.is_ready.store(true);
 
     SRV_INF("%s", "model loaded\n");
