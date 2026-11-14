@@ -213,6 +213,10 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    // SHURA: the expert cache, nullptr if there is none
+    llama_moe_cache *       get_moe_cache()       { return moe_cache.get(); }
+    const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); }
+
     //
     // training
     //

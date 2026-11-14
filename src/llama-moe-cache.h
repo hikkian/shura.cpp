@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <vector>
@@ -14,7 +15,8 @@ class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // cpu_share is the share of the misses computed on the CPU instead of uploaded
-    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share);
+    // SHURA: resizable: the cache may be empty (size 0, or too small for one token) instead of failing, and its layout may change
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool resizable = false);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -39,6 +41,28 @@ public:
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+
+    // ---- SHURA: observability and run-time settings; safe to call from another thread (atomic snapshot) ----
+    struct info {
+        size_t   size        = 0;     // bytes of the device banks now
+        size_t   host_bytes  = 0;     // bytes of the host experts the cache can serve
+        int32_t  n_slots     = 0;     // slots of all groups
+        int32_t  n_groups    = 0;     // groups of layers that can be cached
+        int32_t  n_groups_on = 0;     // groups with slots now
+        bool     empty       = true;
+        bool     cpu_part    = false; // created with cpu_share > 0: the share can change at run time
+        float    cpu_share   = 0.0f;
+        uint64_t generation  = 0;     // bumps at every layout change
+        uint64_t hits_small = 0, misses_small = 0, cpu_small = 0, bytes_small = 0; // ubatches of up to 8 tokens
+        uint64_t hits_large = 0, misses_large = 0, cpu_large = 0, bytes_large = 0;
+        uint64_t copy_hits  = 0, copy_bytes   = 0;                                // large batches: experts copied from the cache
+    };
+    info     get_info() const;
+    size_t   device_size() const; // bytes of the device banks now
+    bool     empty() const;
+    uint64_t generation() const;
+    // false if the cache was created without a CPU part (cpu_share == 0)
+    bool     set_cpu_share(float share);
 
 private:
     struct impl;

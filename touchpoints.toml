@@ -59,3 +59,56 @@ note = "ggml_cuda_pool_leg::alloc; the vmm pool has the same call"
 feature = "alloc-log"
 file = "ggml/src/ggml-cuda/ggml-cuda.cu"
 probe = "GGML_CUDA_LOG_ALLOCS"
+
+# ---- step 2: expert cache, the part without threads (design §3.3 A, B, E, Ж) ----
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-moe-cache.cpp"
+probe = "void resize_slots(int32_t n)"
+note = "moe_cache_lru: slots rebuilt, CRF/last use/clocks kept; init() calls it"
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-moe-cache.cpp"
+probe = "std::vector<int32_t> layout(size_t size) const"
+note = "the slot computation of upstream's constructor, as a function; device split fixed at creation"
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-moe-cache.cpp"
+probe = "void apply_layout(const std::vector<int32_t> & n_slots)"
+note = "banks, views, bindings and the snapshot; host slot maps exist for all candidate groups"
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-moe-cache.h"
+probe = "bool resizable = false"
+note = "constructor argument; empty state instead of the 'too small' exception"
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-context.cpp"
+probe = "cparams.moe_cache_size > 0 || cparams.moe_cache_resizable"
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-context.cpp"
+probe = "ret[buft].moe_cache += size"
+note = "memory breakdown: the cache is a part of `context`, also reported on its own"
+
+[[hook]]
+feature = "moe-cache"
+file = "src/llama-ext.h"
+probe = "size_t moe_cache = 0;"
+
+[[hook]]
+feature = "moe-cache"
+file = "include/llama.h"
+probe = "llama_moe_cache_get_info"
+note = "also llama_moe_cache_set_cpu_share; moe_cache_resizable in llama_context_params"
+
+[[hook]]
+feature = "moe-cache"
+file = "common/arg.cpp"
+probe = '{"--moe-cache-live-resize"}'

@@ -2762,6 +2762,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-cache-live-resize"},
+        "the MoE cache may start empty (--moe-cache-mib 0 or too small for one token) and its size may change at run time (shura)",
+        [](common_params & params) { params.moe_cache_resizable = true; }
+    ).set_env("LLAMA_ARG_MOE_CACHE_LIVE_RESIZE"));
+    add_opt(common_arg(
         {"--moe-cache-cpu-share"}, "F",
         string_format("share of the MoE cache misses that the CPU computes from the host experts instead of uploading them to the GPU once the cache is full, from 0 to 1 (default: %.2f)", (double) params.moe_cache_cpu_share),
         [](common_params & params, const std::string & value) {

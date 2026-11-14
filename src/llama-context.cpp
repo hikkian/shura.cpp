@@ -378,6 +378,7 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+    cparams.moe_cache_resizable = params.moe_cache_resizable;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -578,7 +579,7 @@ llama_context::llama_context(
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
-            cparams.moe_cache_size == 0; // not supported by the MoE cache
+            cparams.moe_cache_size == 0 && !cparams.moe_cache_resizable; // not supported by the MoE cache
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -606,8 +607,9 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+        if (cparams.moe_cache_size > 0 || cparams.moe_cache_resizable) {
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size,
+                    cparams.moe_cache_cpu_share, cparams.moe_cache_resizable);
         }
 
         sched_reserve();
@@ -4148,7 +4150,8 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     }
     if (moe_cache) {
         for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
-            ret[buft].context += size;
+            ret[buft].context   += size;
+            ret[buft].moe_cache += size; // SHURA: so that a reader can tell the cache from the KV cache
         }
     }
     if (model.no_alloc()) {
@@ -4441,6 +4444,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
+        /*.moe_cache_resizable         =*/ false,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -5178,6 +5182,33 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+// SHURA: the expert cache from other threads
+bool llama_moe_cache_get_info(const struct llama_context * ctx, struct llama_moe_cache_info * out) {
+    const llama_moe_cache * mc = ctx ? ctx->get_moe_cache() : nullptr;
+    if (mc == nullptr || out == nullptr) {
+        return false;
+    }
+    const llama_moe_cache::info i = mc->get_info();
+    out->size         = i.size;
+    out->host_bytes   = i.host_bytes;
+    out->n_slots      = i.n_slots;
+    out->n_groups     = i.n_groups;
+    out->n_groups_on  = i.n_groups_on;
+    out->empty        = i.empty;
+    out->cpu_part     = i.cpu_part;
+    out->cpu_share    = i.cpu_share;
+    out->generation   = i.generation;
+    out->hits_small   = i.hits_small;   out->misses_small = i.misses_small; out->cpu_small = i.cpu_small; out->bytes_small = i.bytes_small;
+    out->hits_large   = i.hits_large;   out->misses_large = i.misses_large; out->cpu_large = i.cpu_large; out->bytes_large = i.bytes_large;
+    out->copy_hits    = i.copy_hits;    out->copy_bytes   = i.copy_bytes;
+    return true;
+}
+
+bool llama_moe_cache_set_cpu_share(struct llama_context * ctx, float share) {
+    llama_moe_cache * mc = ctx ? ctx->get_moe_cache() : nullptr;
+    return mc != nullptr && mc->set_cpu_share(share);
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

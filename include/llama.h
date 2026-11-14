@@ -398,6 +398,7 @@ extern "C" {
 
         size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
+        bool   moe_cache_resizable; // SHURA: the expert cache exists also at size 0 (empty) and its size can change at run time
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -1729,6 +1730,31 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    //
+    // SHURA: expert cache (llama_moe_cache) - observability and run-time settings, safe to call from another thread
+    //
+
+    struct llama_moe_cache_info {
+        size_t   size;          // bytes of the device banks now (0 when empty)
+        size_t   host_bytes;    // bytes of the host experts the cache can serve
+        int32_t  n_slots;       // slots of all groups of layers
+        int32_t  n_groups;      // groups of layers that can be cached
+        int32_t  n_groups_on;   // groups with slots now
+        bool     empty;
+        bool     cpu_part;      // created with moe_cache_cpu_share > 0, so the share can change at run time
+        float    cpu_share;
+        uint64_t generation;    // bumps at every layout change of the cache
+        uint64_t hits_small, misses_small, cpu_small, bytes_small; // ubatches of up to 8 tokens
+        uint64_t hits_large, misses_large, cpu_large, bytes_large; // larger ubatches that use the cache (up to 32 tokens)
+        uint64_t copy_hits, copy_bytes;                            // large batches: experts copied from the cache
+    };
+
+    // false if the context has no expert cache
+    LLAMA_API bool llama_moe_cache_get_info(const struct llama_context * ctx, struct llama_moe_cache_info * info);
+
+    // share of the misses computed on the CPU once the cache is full; false if the cache was created without a CPU part
+    LLAMA_API bool llama_moe_cache_set_cpu_share(struct llama_context * ctx, float share);
 
 #ifdef __cplusplus
 }

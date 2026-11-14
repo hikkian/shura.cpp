@@ -616,6 +616,7 @@ struct common_params {
 
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
+    bool   moe_cache_resizable = false; // SHURA: --moe-cache-live-resize
     int32_t host_pinned_max_mib = 0;  // SHURA: pinned host buffers beyond this (after warm-up) fall back to pageable memory; 0 = no limit
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
