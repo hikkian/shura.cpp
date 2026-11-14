@@ -274,3 +274,9 @@ probe = "think_brake_margin"
 feature = "think3b"
 file = "tools/server/server-common.cpp"
 probe = "reasoning_budget"
+
+[[hook]]
+feature = "governor"
+file = "src/llama-context.cpp"
+probe = "SHURA (VRAMLOGIC3): stop between ubatches as well"
+note = "llama_context::decode ubatch loop: the abort callback is also checked before every ubatch but the first"

@@ -114,6 +114,7 @@ int main(int argc, char ** argv) {
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 999;
     mp.tensor_buft_overrides = ov;
+    mp.load_mode = LLAMA_LOAD_MODE_NONE; // the invalidate check writes into the host experts: no read-only mapping
     llama_model * model = llama_model_load_from_file(argv[1], mp);
     if (!model) {
         fprintf(stderr, "could not load %s\n", argv[1]);
@@ -140,8 +141,11 @@ int main(int argc, char ** argv) {
     CHECK(i0.empty);
     CHECK(i0.n_groups > 0);
 
-    const size_t big   = i0.host_bytes / 2;
-    const size_t small = i0.host_bytes / 6;
+    // all experts, and the smallest cache that serves one token (each group gets n_expert_used slots)
+    const size_t big   = llama_moe_cache_size_for_tokens(ctx, -1);
+    const size_t small = llama_moe_cache_size_for_tokens(ctx, 1);
+    fprintf(stderr, "     sizes: small %.2f MiB, big %.2f MiB\n", small / 1048576.0, big / 1048576.0);
+    CHECK(small > 0 && big > small);
     const int n_prompt = 24, n_gen = 12;
 
     // 3. empty from the start: the host experts

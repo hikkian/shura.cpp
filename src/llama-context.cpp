@@ -2386,6 +2386,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
     }
 
+    bool first_ubatch = true;   // SHURA (VRAMLOGIC3): the abort check between ubatches skips the first one
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2407,7 +2408,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const llm_graph_result * res = nullptr;
+        if (!first_ubatch && abort_callback != nullptr && abort_callback(abort_callback_data)) {
+            // SHURA (VRAMLOGIC3): stop between ubatches as well. A backend that does not check the callback inside a graph would
+            // otherwise run the whole batch first; this ubatch was never applied, so the rollback below only drops what is not there.
+            status = GGML_STATUS_ABORTED;
+        } else {
+            res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        }
+        first_ubatch = false;
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
