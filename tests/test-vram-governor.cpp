@@ -13,7 +13,7 @@ struct sim {
     int32_t desk_mib = 0;       // everything on the card that is not the cache
     int32_t total_mib = 12282;
     bool busy = false, ready = true, big = false;
-    int32_t free_mib() const { return total_mib - desk_mib - g.chunks * g.chunk_mib; }
+    int32_t free_mib() const { return total_mib - desk_mib - vram_size_mib(g, g.chunks); }   // REBASE1: real chunk sizes
     vram_action tick(double dt = 0.2) {
         t += dt;
         vram_inputs in; in.now_s = t; in.free_mib = free_mib(); in.ready = ready; in.busy = busy; in.big_prefill = big;
@@ -357,6 +357,25 @@ int main() {
         s.desk_mib += 300;                                      // a burst: free ~1748 < 2048
         vram_action a = s.tick();
         CHECK(a.kind == vram_action_kind::SET_CHUNKS && !a.urgent && s.free_mib() >= 2048 && s.g.chunks < quiet);
+    }
+    // 20. REBASE1: the first chunk costs more (the smallest useful cache, first_chunk_mib): growth from empty waits for room for it,
+    //     a small shortfall at several chunks drops only what is needed, a shortfall at one chunk empties the cache
+    //     (buffer 0: the target is the reserve, 1536; growth needs room above reserve + hysteresis 256)
+    {
+        sim s = make(10000);                                    // free 2282 with an empty cache: room 2282-1536-256 = 490
+        s.g.first_chunk_mib = 600;
+        s.tick();
+        CHECK(s.g.chunks == 0);                                 // 490 < 600: no growth (the old core would have asked for 9 chunks)
+        s.desk_mib -= 200;                                      // room 690
+        for (int i = 0; i < 200 && s.g.chunks == 0; i++) { s.tick(); }
+        CHECK(s.g.chunks == 2);                                 // 600 + 52 <= 690 < 600 + 104
+        CHECK(s.free_mib() == 1830);
+        s.desk_mib += 320;                                      // free 1510: short by 26, one chunk of 52 is enough
+        s.tick();
+        CHECK(s.g.chunks == 1 && s.free_mib() == 1562);
+        s.desk_mib += 60;                                       // free 1502 at one chunk: the first chunk goes
+        s.tick();
+        CHECK(s.g.chunks == 0 && s.free_mib() == 2102);
     }
     printf("test-vram-governor: all passed\n");
     return 0;

@@ -365,6 +365,8 @@ private:
     uint64_t moe_gen_reserved = 0; // the cache generation the scheduler was last reserved for (decoding thread, under the lock)
     size_t   moe_size_before  = 0; // the size before the last resize: the rollback target if the lazy reserve fails
     bool     moe_reserve_after_resize(); // under the lock
+    mutable std::mutex compute_snap_mu; // SHURA: compute buffer sizes after the last reserve, for memory_breakdown()
+    std::map<ggml_backend_buffer_type_t, size_t> compute_snap;
     void     moe_sync_backends();        // ggml_backend_synchronize of every backend, without touching the scheduler state
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])

@@ -64,6 +64,9 @@ public:
     static bool abort_callback(void * data) {
         if (data == nullptr) { return false; }
         const auto * v = static_cast<server_vram *>(data);
+        // REBASE1: a recurrent state (hybrid models such as qwen35moe) cannot be rolled back over an interrupted ubatch or slice
+        // (llama_memory_recurrent keeps snapshots of the last ubatch only), so such a model is never interrupted
+        if (!v->interrupts_ok_.load(std::memory_order_relaxed)) { return false; }
         return v->abort_wanted_.load(std::memory_order_relaxed) ||
                (v->pause_pending_.load(std::memory_order_relaxed) && v->prefill_in_flight_.load(std::memory_order_relaxed));
     }
@@ -72,6 +75,7 @@ public:
     bool pause_pending() const { return pause_pending_.load(); }
     void set_prefill_in_flight(bool on) { prefill_in_flight_.store(on, std::memory_order_relaxed); }
     void note_pause_cut() { ++pause_cuts_; }
+    void set_interrupts_ok(bool ok) { interrupts_ok_.store(ok); }
 
 private:
     void loop();
@@ -138,6 +142,7 @@ private:
     std::atomic<uint64_t> pool_overflow_{0};
     std::function<void(const std::string &, const std::string &)> pause_cb_;
     std::atomic<bool> pause_requested_{false};
+    std::atomic<bool> interrupts_ok_{true};        // REBASE1: false for recurrent/hybrid memory
     std::atomic<bool> abort_wanted_{false};        // VRAMLOGIC2: set while an urgent trim waits for the cache lock
     std::atomic<bool> pause_pending_{false};       // VRAMLOGIC3: a pause task is posted and has not run yet
     std::atomic<bool> prefill_in_flight_{false};   // VRAMLOGIC3: the running llama_process is a prompt-only slice

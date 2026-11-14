@@ -254,6 +254,7 @@ void server_vram::refresh_geometry(vram_cache_geometry & g) {
     llama_moe_cache_get_info(ctx_, &info);
     g.chunk_slots = info.n_slots;   // REBASE1: informational (the slots of all groups now)
     g.chunk_mib   = (int32_t) ((chunk_bytes_ + (1024 * 1024 - 1)) / (1024 * 1024));
+    g.first_chunk_mib = (int32_t) ((min_bytes_ + (1024 * 1024 - 1)) / (1024 * 1024));
     g.chunks      = chunks_of_bytes(info.size);
     g.max_chunks  = chunks_of_bytes_max();
     cache_bytes_  = info.size;
@@ -333,6 +334,7 @@ void server_vram::wait_released(size_t released_bytes) {
     // the old bank is freed; the card may count it a little later (the driver's delayed release). Wait until free VRAM rose by
     // most of it, so that the new bank is never allocated on top of the old one. A desk that takes VRAM at the same moment can
     // keep the rise short: the wait is bounded and the resize goes on.
+    abort_wanted_.store(false, std::memory_order_relaxed);   // the lock is ours now: the retry must not be cut again
     const int32_t baseline = release_baseline_free_.load();
     if (baseline < 0 || released_bytes == 0) { return; }
     const int32_t want = (int32_t) (released_bytes / (1024 * 1024) * 8 / 10);

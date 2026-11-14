@@ -609,7 +609,7 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0 || cparams.moe_cache_resizable) {
+        if (cparams.moe_cache_size > 0 || (cparams.moe_cache_resizable && model.hparams.n_expert > 0)) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size,
                     cparams.moe_cache_cpu_share, cparams.moe_cache_resizable);
         }
@@ -963,6 +963,16 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 
     moe_gen_reserved = moe_gen; // SHURA: the compute buffers fit this layout of the expert cache
+
+    if (!model.no_alloc()) {    // SHURA: compute buffer sizes for memory_breakdown() from other threads (the reserve reallocates them)
+        std::map<ggml_backend_buffer_type_t, size_t> snap;
+        for (const auto & backend_ptr : backends) {
+            ggml_backend_t backend = backend_ptr.get();
+            snap[ggml_backend_sched_get_buffer_type(sched.get(), backend)] += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        }
+        std::lock_guard<std::mutex> lock(compute_snap_mu);
+        compute_snap = std::move(snap);
+    }
 }
 
 void llama_context::synchronize() {
@@ -1046,6 +1056,12 @@ llama_memory_t llama_context::get_memory() const {
 bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
+    }
+
+    // SHURA: the update may reserve graphs that read the expert cache bindings: not while a resize changes them
+    std::unique_lock<std::recursive_mutex> moe_lock(moe_mu, std::defer_lock);
+    if (moe_cache && cparams.moe_cache_resizable) {
+        moe_lock.lock();
     }
 
     {
@@ -4188,10 +4204,10 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].compute += backend_buf_exp_size[i];
         }
     } else {
-        for (const auto & backend_ptr : backends) {
-            ggml_backend_t             backend = backend_ptr.get();
-            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        // SHURA: the snapshot of the last reserve: this may run on another thread while the decoding thread reserves again
+        std::lock_guard<std::mutex> lock(compute_snap_mu);
+        for (const auto & [buft, size] : compute_snap) {
+            ret[buft].compute += size;
         }
     }
     return ret;

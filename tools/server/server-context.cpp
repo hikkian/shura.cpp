@@ -1115,6 +1115,15 @@ public:
         vram->set_big_prefill_callback([this]() { return big_prefill_flag.load() != 0; });
         // VRAMLOGIC2: an urgent trim may stop the running ubatch at its next graph node (see decode(): the slice is retried)
         llama_set_abort_callback(ctx_tgt, server_vram::abort_callback, vram.get());
+        {
+            const llama_model * m = llama_get_model(ctx_tgt);
+            if (llama_model_is_recurrent(m) || llama_model_is_hybrid(m)) {
+                // REBASE1 review: the recurrent state cannot be rolled back over an interrupted slice; an urgent trim and a pause
+                // wait for the running ubatch instead (a decode ubatch is short; a prefill ubatch is a few seconds at most)
+                vram->set_interrupts_ok(false);
+                SRV_INF("%s", "vram governor: recurrent/hybrid memory: ubatches are not interrupted for trims or pauses\n");
+            }
+        }
         vram->set_pause_callback([this](const std::string & reason, const std::string & checkpoint) {
             server_task task(SERVER_TASK_TYPE_VRAM_PAUSE);
             task.id = queue_tasks.get_new_id();

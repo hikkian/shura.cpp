@@ -5283,7 +5283,6 @@ static bool ggml_cuda_graph_wants_abort_checks(const ggml_backend_cuda_context *
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
     const bool abort_checks = ggml_cuda_graph_wants_abort_checks(cuda_ctx, cgraph, use_cuda_graph);   // SHURA (VRAMLOGIC3)
-    int last_abort_check = 0;
     int n_abort_marks = 0;
 
     // flag used to determine whether it is an integrated_gpu
@@ -5390,9 +5389,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (abort_checks && !is_concurrent_event_active && i - last_abort_check >= ggml_cuda_abort_check_nodes()) {
-                    // SHURA (VRAMLOGIC3): see ggml_cuda_abort_check_nodes
-                    last_abort_check = i;
+                if (abort_checks && !is_concurrent_event_active && ++cuda_ctx->abort_node_acc >= ggml_cuda_abort_check_nodes()) {
+                    // SHURA (VRAMLOGIC3): see ggml_cuda_abort_check_nodes; the count runs across splits (a cached-expert graph has
+                    // short splits per layer)
+                    cuda_ctx->abort_node_acc = 0;
                     if (n_abort_marks > 0) {
                         CUDA_CHECK(cudaEventSynchronize(cuda_ctx->abort_marks[(n_abort_marks - 1) % 2]));
                     }

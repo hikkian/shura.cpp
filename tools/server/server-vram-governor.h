@@ -74,12 +74,23 @@ struct vram_inputs {
     bool    big_prefill = false; // a large new prompt is being processed (prefill_yield policy)
 };
 
+struct vram_cache_geometry;
+static inline int32_t vram_size_mib(const vram_cache_geometry & g, int32_t chunks);
+
 struct vram_cache_geometry {
     int32_t chunks      = 0;  // current number of chunks
     int32_t chunk_slots = 4;
     int32_t chunk_mib   = 52;
+    int32_t first_chunk_mib = 0; // REBASE1: the first chunk can cost more (the smallest useful cache); 0 = chunk_mib
     int32_t max_chunks  = 0;  // hard limit from the model (n_expert / chunk_slots)
 };
+
+// REBASE1: MiB of a cache of `chunks` chunks (chunk 1 costs first_chunk_mib)
+static inline int32_t vram_size_mib(const vram_cache_geometry & g, int32_t chunks) {
+    if (chunks <= 0) { return 0; }
+    const int32_t first = g.first_chunk_mib > 0 ? g.first_chunk_mib : g.chunk_mib;
+    return first + (chunks - 1) * g.chunk_mib;
+}
 
 enum class vram_action_kind { NONE, SET_CHUNKS, PAUSE };
 
@@ -188,6 +199,7 @@ public:
         have_prev_free_ = true;
         last_free_mib_ = in.free_mib;
         last_chunk_mib_ = g.chunk_mib;
+        last_geom_ = g;
         track_below(in);
 
         if (state == vram_state::PAUSING || state == vram_state::PAUSED) {
@@ -229,8 +241,11 @@ public:
         if (in.free_mib < target_mib) {
             calm_since_ = in.now_s;
             const int32_t need = target_mib - in.free_mib;
-            const int32_t drop = (need + g.chunk_mib - 1) / std::max(1, g.chunk_mib);
-            const int32_t target = std::max(floor_chunks, g.chunks - drop);
+            // REBASE1: the fewest chunks dropped that free `need` MiB (by the real sizes; chunk 1 may cost more)
+            int32_t target = g.chunks;
+            while (target > floor_chunks && vram_size_mib(g, g.chunks) - vram_size_mib(g, target) < need) {
+                target--;
+            }
             if (target < g.chunks) {
                 low_polls_ = 0;
                 set_chunks(act, target, "short_" + std::to_string(need) + "mib", vram_state::TRIM, g, in);
@@ -268,10 +283,13 @@ public:
 
         // 3. grow into the room above target + hysteresis, only when idle and calm
         const int32_t room = in.free_mib - target_mib - policy.hysteresis_mib;
-        if ((!in.busy || refill_now_) && room >= g.chunk_mib && g.chunks < cap &&
+        if ((!in.busy || refill_now_) && g.chunks < cap && room >= vram_size_mib(g, g.chunks + 1) - vram_size_mib(g, g.chunks) &&
                 in.now_s - calm_since_ >= policy.grow_seconds) {
             refill_now_ = false;
-            const int32_t add = std::min(cap - g.chunks, room / std::max(1, g.chunk_mib));
+            int32_t add = 0;   // REBASE1: the most chunks that fit the room, by the real sizes
+            while (g.chunks + add < cap && vram_size_mib(g, g.chunks + add + 1) - vram_size_mib(g, g.chunks) <= room) {
+                add++;
+            }
             if (add > 0) {
                 return set_chunks(act, g.chunks + add, "room_" + std::to_string(room) + "mib", vram_state::GROW, g, in);
             }
@@ -306,11 +324,11 @@ public:
             ev.state = vram_state_name(state);
             ev.chunks_before = before;
             ev.chunks_after = after;
-            ev.mib = (after - before) * last_chunk_mib_;
+            ev.mib = vram_size_mib(last_geom_, after) - vram_size_mib(last_geom_, before);
             ev.free_mib = last_free_mib_;
             if (ev.kind == "trim") {
                 ++journal.totals.yields;
-                journal.totals.yielded_mib += uint64_t(before - after) * uint64_t(std::max(0, last_chunk_mib_));
+                journal.totals.yielded_mib += uint64_t(std::max(0, vram_size_mib(last_geom_, before) - vram_size_mib(last_geom_, after)));
             }
             journal.add(std::move(ev), now_s);
         }
@@ -380,6 +398,7 @@ private:
     double  below_since_ = 0;
     int32_t last_free_mib_  = 0;
     int32_t last_chunk_mib_ = 0;
+    vram_cache_geometry last_geom_;
     int32_t prev_free_mib_  = 0;   // VRAMLOGIC2: the previous poll's free VRAM (for the falling-fast rule)
     bool    have_prev_free_ = false;
     bool    falling_        = false;
