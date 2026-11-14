@@ -280,3 +280,11 @@ feature = "governor"
 file = "src/llama-context.cpp"
 probe = "SHURA (VRAMLOGIC3): stop between ubatches as well"
 note = "llama_context::decode ubatch loop: the abort callback is also checked before every ubatch but the first"
+
+# ---- second pass (after A/B), prefill arm 1: overlap of the expert upload with compute ----
+
+[[hook]]
+feature = "sched-prefetch"
+file = "ggml/src/ggml-backend.cpp"
+probe = "GGML_SCHED_PREFETCH_EXPERTS"
+note = "sched fields, prefetch init/disable, the host-weight copy loop of ggml_backend_sched_compute_splits (full-tensor upload through a second backend instance for large-batch MUL_MAT_ID), sched_free, sched_synchronize"
