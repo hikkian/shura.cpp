@@ -301,7 +301,7 @@ note = "the KL-divergence base file and the KL divergence batch by batch (memory
 feature = "gqa-vec"
 file = "ggml/src/ggml-cuda/fattn-vec.cuh"
 probe = "GGML_HIP_FA_GQA_VEC"
-note = "flash_attn_ext_vec gets ncols2 (GQA-packed columns); the dispatch in ggml_cuda_flash_attn_ext_vec_case for K q8_0 with V q8_0 or q4_0, head 256, GQA 4 or 8, <= 2 tokens; opt-in by the env"
+note = "flash_attn_ext_vec gets ncols2 (GQA-packed columns); the dispatch in ggml_cuda_flash_attn_ext_vec_case for K q8_0 with V q8_0 or q4_0, head 256, GQA 4 or 8, <= 3 tokens (the MTP verify batch); opt-in by the env"
 
 [[hook]]
 feature = "gqa-vec"

@@ -13067,7 +13067,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     // GQA 4 with the packed path
-    for (int64_t nb_q : { 1, 2 }) {
+    for (int64_t nb_q : { 1, 2, 3 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 4096, nb_q, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 4096, nb_q, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     }
@@ -13075,7 +13075,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 4096, 1, true, true, 8, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     // Peaky data (sharp softmax, late new maxima), tight NMSE: catches errors that uniform data hides
     for (int64_t kv_len : { 256, 512, 768, 4096, 16384 }) {
-        for (int64_t nb_q : { 1, 2 }) {
+        for (int64_t nb_q : { 1, 2, 3 }) {
             test_cases.emplace_back(new test_flash_attn_ext_peaky(256, 256, 2, {8, 1}, kv_len, nb_q, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
             test_cases.emplace_back(new test_flash_attn_ext_peaky(256, 256, 2, {8, 1}, kv_len, nb_q, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         }
@@ -13084,7 +13084,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type_pair tkv : { ggml_type_pair{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, ggml_type_pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
                                 ggml_type_pair{GGML_TYPE_Q4_0, GGML_TYPE_Q4_0} }) {
         for (int64_t kv_len : { 512, 4096, 65536 }) {
-            for (int64_t nb_q : { 1, 2 }) {
+            for (int64_t nb_q : { 1, 2, 3 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv_len, nb_q, true, false, 0, 0, GGML_PREC_F32, tkv.first, tkv.second));
             }
         }

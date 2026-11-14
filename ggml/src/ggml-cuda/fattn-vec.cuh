@@ -650,7 +650,8 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         const int gqa_ratio = Q->ne[2] / K->ne[2];
         float max_bias_v;
         memcpy(&max_bias_v, (const float *) dst->op_params + 1, sizeof(float));
-        if (gqa_vec_enabled && Q->ne[1] <= 2 && logit_softcap == 0.0f && max_bias_v == 0.0f && (gqa_ratio == 8 || gqa_ratio == 4)) {
+        // REBASE1: up to 3 tokens, the MTP verify batch (draft n_max 2 + 1) of the long profile; the shura branch stopped at 2
+        if (gqa_vec_enabled && Q->ne[1] <= 3 && logit_softcap == 0.0f && max_bias_v == 0.0f && (gqa_ratio == 8 || gqa_ratio == 4)) {
             constexpr bool use_logit_softcap = false;
             if (gqa_ratio == 8) {
                 ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 8, type_K, type_V, use_logit_softcap>(ctx, dst);
