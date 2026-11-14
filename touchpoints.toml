@@ -112,3 +112,29 @@ note = "also llama_moe_cache_set_cpu_share; moe_cache_resizable in llama_context
 feature = "moe-cache"
 file = "common/arg.cpp"
 probe = '{"--moe-cache-live-resize"}'
+
+# ---- step 3: CUDA/HIP hooks for the governor (abort check; the pool freeze/stats and allocation log came in step 1) ----
+
+[[hook]]
+feature = "governor"
+file = "ggml/src/ggml-cuda/common.cuh"
+probe = "cudaEvent_t abort_marks[2]"
+note = "ggml_backend_cuda_context: abort callback, aborted flag, two marks"
+
+[[hook]]
+feature = "governor"
+file = "ggml/src/ggml-cuda/ggml-cuda.cu"
+probe = "ggml_cuda_graph_wants_abort_checks"
+note = "checked in the node loop of ggml_cuda_graph_evaluate_and_capture; graph_compute returns GGML_STATUS_ABORTED"
+
+[[hook]]
+feature = "governor"
+file = "ggml/src/ggml-cuda/ggml-cuda.cu"
+probe = '"ggml_backend_set_abort_callback"'
+note = "proc address; llama_context::set_abort_callback already passes the callback to every backend that has it"
+
+[[hook]]
+feature = "governor"
+file = "tests/CMakeLists.txt"
+probe = "test-vram-abort.cpp"
+note = "built, not run by ctest: needs a model (test-llama-archs -a llama -o DIR)"

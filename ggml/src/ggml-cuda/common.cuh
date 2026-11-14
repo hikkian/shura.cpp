@@ -1354,6 +1354,14 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // SHURA (VRAMLOGIC3): ggml_backend_set_abort_callback for this backend. A large-batch graph evaluated node by node
+    // (prefill; no CUDA graph) checks it every few nodes, so a caller can stop a long ubatch (llama_decode then rolls the
+    // ubatch back and returns 2). Upstream checks the callback only on the CPU backend.
+    ggml_abort_callback abort_callback = nullptr;
+    void * abort_callback_data = nullptr;
+    bool aborted = false;
+    cudaEvent_t abort_marks[2] = {nullptr, nullptr};   // the host waits on the mark one check back: the GPU queue never drains
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

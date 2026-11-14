@@ -970,6 +970,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    for (cudaEvent_t & mark : abort_marks) {   // SHURA (VRAMLOGIC3)
+        if (mark != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(mark));
+            mark = nullptr;
+        }
+    }
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -5246,8 +5252,39 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+static int64_t get_op_batch_size(const ggml_tensor * op);
+
+// SHURA (VRAMLOGIC3): how often a node-by-node large-batch graph checks the abort callback (0 = never). The host launches far
+// ahead of the GPU, so a check is meaningful only if that lead is bounded: at each check the host records a mark on its stream
+// and waits for the mark of the previous check, so the GPU always keeps one interval of work queued (a full stream sync here
+// drained the queue and cost 7-8 % of a prefill on the card) while the host is at most two intervals ahead. On a stop the stream
+// is synchronized, so nothing queued reads memory the caller frees after it. 64 nodes is ~1/25 of a prefill ubatch.
+static int ggml_cuda_abort_check_nodes() {
+    static const int n = [] {
+        const char * env = getenv("GGML_CUDA_ABORT_CHECK_NODES");
+        return env != nullptr ? std::max(0, atoi(env)) : 64;
+    }();
+    return n;
+}
+
+static bool ggml_cuda_graph_wants_abort_checks(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, bool use_cuda_graph) {
+    if (cuda_ctx->abort_callback == nullptr || use_cuda_graph || ggml_cuda_abort_check_nodes() == 0) {
+        return false;
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && get_op_batch_size(node) >= 32) {
+            return true;   // a prefill-sized batch: decode steps are too short to need it and must not pay the waits
+        }
+    }
+    return false;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    const bool abort_checks = ggml_cuda_graph_wants_abort_checks(cuda_ctx, cgraph, use_cuda_graph);   // SHURA (VRAMLOGIC3)
+    int last_abort_check = 0;
+    int n_abort_marks = 0;
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -5353,6 +5390,30 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (abort_checks && !is_concurrent_event_active && i - last_abort_check >= ggml_cuda_abort_check_nodes()) {
+                    // SHURA (VRAMLOGIC3): see ggml_cuda_abort_check_nodes
+                    last_abort_check = i;
+                    if (n_abort_marks > 0) {
+                        CUDA_CHECK(cudaEventSynchronize(cuda_ctx->abort_marks[(n_abort_marks - 1) % 2]));
+                    }
+                    cudaEvent_t & mark = cuda_ctx->abort_marks[n_abort_marks % 2];
+                    if (mark == nullptr) {
+#if defined(GGML_USE_HIP)
+                        CUDA_CHECK(cudaEventCreateWithFlags(&mark, hipEventDisableTiming | hipEventBlockingSync));   // wait asleep, not spinning
+#elif defined(GGML_USE_MUSA)
+                        CUDA_CHECK(cudaEventCreateWithFlags(&mark, cudaEventDisableTiming));
+#else
+                        CUDA_CHECK(cudaEventCreateWithFlags(&mark, cudaEventDisableTiming | cudaEventBlockingSync));
+#endif
+                    }
+                    CUDA_CHECK(cudaEventRecord(mark, cuda_ctx->stream()));
+                    n_abort_marks++;
+                    if (cuda_ctx->abort_callback(cuda_ctx->abort_callback_data)) {
+                        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                        cuda_ctx->aborted = true;   // nothing is queued past this node: the caller may free memory at once
+                        break;
+                    }
+                }
 #ifdef USE_CUDA_GRAPH
                 // fused nodes are skipped together, so a cut never splits a fusion
                 // a concurrent region must join before its capture can end
@@ -5552,9 +5613,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    cuda_ctx->aborted = false;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
-    return GGML_STATUS_SUCCESS;
+    return cuda_ctx->aborted ? GGML_STATUS_ABORTED : GGML_STATUS_SUCCESS;
+}
+
+// SHURA (VRAMLOGIC3): the abort callback of this backend (see ggml_backend_cuda_context::abort_callback)
+static void ggml_backend_cuda_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->abort_callback      = abort_callback;
+    cuda_ctx->abort_callback_data = abort_callback_data;
 }
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -6946,6 +7015,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {   // SHURA (VRAMLOGIC3)
+        return (void *)ggml_backend_cuda_set_abort_callback;
     }
     // SHURA: pinned host memory limit and pool freeze/accounting (used by the server after warm-up and by the VRAM governor)
     if (strcmp(name, "ggml_backend_cuda_host_set_limit") == 0) {
