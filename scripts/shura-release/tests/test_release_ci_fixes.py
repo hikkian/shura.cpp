@@ -38,7 +38,8 @@ class ReleaseCiFixes(unittest.TestCase):
         line = next(l for l in text.splitlines() if "pkgs+=" in l and "vulkan" in l)
         self.assertNotIn("glslc", line)
         self.assertIn("spirv-headers", line)
-        self.assertIn("libvulkan-dev", line)
+        self.assertIn("libvulkan1", line)
+        self.assertNotIn("libvulkan-dev", line)
         common = next(l for l in text.splitlines() if l.startswith("common=("))
         self.assertIn("python3-tomli", common)
 
@@ -47,6 +48,20 @@ class ReleaseCiFixes(unittest.TestCase):
         self.assertIn("vulkan-sdk.env", text)
         self.assertIn("VULKAN_SDK_SHA256", text)
         self.assertLess(text.index("vulkan-sdk.env"), text.index('"$here/build.sh"'))
+
+    def test_ci_build_unpacks_headers_and_loader(self):
+        text = CI.read_text(encoding="utf-8")
+        self.assertIn("/x86_64/include/*", text)
+        self.assertIn("lib/VulkanLoader/lib/libvulkan.so*", text)
+        self.assertIn('VULKAN_SDK="$SRC/vulkan-sdk"; export VULKAN_SDK', text)
+
+    def test_container_jobs_safe_directory(self):
+        text = WF.read_text(encoding="utf-8")
+        want = 'git config --global --add safe.directory "$GITHUB_WORKSPACE"'
+        for job in ("build-hip", "build-cuda"):
+            block = job_block(text, job)
+            self.assertIn(want, block, job)
+            self.assertLess(block.index(want), block.index("git init"), job)
 
     def test_container_jobs_use_bash(self):
         text = WF.read_text(encoding="utf-8")

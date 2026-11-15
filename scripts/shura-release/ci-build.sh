@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 $SUDO apt-get update -qq
 common=(build-essential cmake ninja-build git python3 python3-venv ca-certificates curl python3-tomli)
 pkgs=("${common[@]}")
-[ "$fam" = vulkan ] && pkgs+=(libvulkan-dev spirv-headers)
+[ "$fam" = vulkan ] && pkgs+=(libvulkan1 spirv-headers)
 [ "$fam" = hip ] && pkgs+=(rocblas-dev hipblas-dev)      # the same packages as the fork's shura.yml hip job
 $SUDO apt-get install -y --no-install-recommends "${pkgs[@]}"
 dpkg-query -W -f='${Package}=${Version}\n' "${pkgs[@]}" > "$OUT_DIR/apt-versions.txt" || true
@@ -43,9 +43,13 @@ if [ "$fam" = vulkan ]; then
   [ "$(stat -c %s "$SRC/vulkan-sdk.tar.xz")" = "$VULKAN_SDK_BYTES" ] || { echo "Vulkan SDK archive size does not match the pin" >&2; exit 1; }
   [ "$(sha256sum "$SRC/vulkan-sdk.tar.xz" | cut -d' ' -f1)" = "$VULKAN_SDK_SHA256" ] || { echo "Vulkan SDK archive checksum does not match the pin" >&2; exit 1; }
   mkdir -p "$SRC/vulkan-sdk"
-  tar -xJf "$SRC/vulkan-sdk.tar.xz" -C "$SRC/vulkan-sdk" --strip-components=3 "${VULKAN_SDK_VERSION}/x86_64/bin/glslc"
+  tar -xJf "$SRC/vulkan-sdk.tar.xz" -C "$SRC/vulkan-sdk" --strip-components=2 --wildcards "${VULKAN_SDK_VERSION}/x86_64/include/*" "${VULKAN_SDK_VERSION}/x86_64/bin/glslc"
+  tar -xJf "$SRC/vulkan-sdk.tar.xz" -C "$SRC/vulkan-sdk" --strip-components=4 --wildcards "${VULKAN_SDK_VERSION}/x86_64/lib/VulkanLoader/lib/libvulkan.so*"
   rm -f "$SRC/vulkan-sdk.tar.xz"
-  PATH="$SRC/vulkan-sdk:$PATH"; export PATH
+  VULKAN_SDK="$SRC/vulkan-sdk"; export VULKAN_SDK
+  PATH="$VULKAN_SDK/bin:$PATH"; export PATH
+  test -f "$VULKAN_SDK/include/vulkan/vulkan.h" || { echo "Vulkan SDK headers are missing after unpacking" >&2; exit 1; }
+  test -e "$VULKAN_SDK/lib/libvulkan.so" || { echo "libvulkan.so is missing after unpacking the Vulkan SDK" >&2; exit 1; }
   glslc --version >/dev/null || { echo "glslc from the Vulkan SDK does not run" >&2; exit 1; }
 fi
 

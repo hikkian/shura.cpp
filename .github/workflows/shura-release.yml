@@ -126,6 +126,7 @@ jobs:
           TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git init -q .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}"
           auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
@@ -187,6 +188,7 @@ jobs:
           TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git init -q .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}"
           auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
