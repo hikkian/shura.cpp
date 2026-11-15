@@ -111,6 +111,9 @@ jobs:
     container:
       # the only place of the image pin (the container key cannot read env); scripts/shura-release/check-pins.sh checks this line in the guard job
       image: nvidia/cuda:12.8.1-devel-ubuntu22.04@sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install git
         run: |
@@ -169,6 +172,9 @@ jobs:
     container:
       # ROCm 7.2.1 build image (the same image as the fork's shura.yml hip job); the digest is checked by scripts/shura-release/check-pins.sh
       image: rocm/dev-ubuntu-22.04:7.2.1@sha256:42851dac319afce41cf993e25f95005b7f2cd0a0f6abd32ad8f25cd876ec56df
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install git
         run: |

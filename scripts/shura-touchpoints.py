@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Check that every hook point in touchpoints.toml is still in the tree (run after a rebase onto a new upstream)."""
-import pathlib, sys, tomllib
+import pathlib, sys
+try:
+    import tomllib
+except ModuleNotFoundError:   # Python 3.10 (ubuntu-22.04): the tomli package has the same API
+    import tomli as tomllib
 
 root = pathlib.Path(__file__).resolve().parent.parent
 hooks = tomllib.loads((root / "touchpoints.toml").read_text())["hook"]

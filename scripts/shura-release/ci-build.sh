@@ -12,9 +12,9 @@ SUDO=""; [ "$(id -u)" = 0 ] || SUDO="sudo"
 
 export DEBIAN_FRONTEND=noninteractive
 $SUDO apt-get update -qq
-common=(build-essential cmake ninja-build git python3 python3-venv ca-certificates curl)
+common=(build-essential cmake ninja-build git python3 python3-venv ca-certificates curl python3-tomli)
 pkgs=("${common[@]}")
-[ "$fam" = vulkan ] && pkgs+=(libvulkan-dev glslc spirv-headers)
+[ "$fam" = vulkan ] && pkgs+=(libvulkan-dev spirv-headers)
 [ "$fam" = hip ] && pkgs+=(rocblas-dev hipblas-dev)      # the same packages as the fork's shura.yml hip job
 $SUDO apt-get install -y --no-install-recommends "${pkgs[@]}"
 dpkg-query -W -f='${Package}=${Version}\n' "${pkgs[@]}" > "$OUT_DIR/apt-versions.txt" || true
@@ -33,6 +33,20 @@ fi
 if [ "$fam" = cuda ]; then
   major="$(nvcc --version | sed -n 's/.*release \([0-9]*\)\..*/\1/p')"
   for l in libcudart libcublas libcublasLt; do extra_libs+=(--extra-lib "/usr/local/cuda/lib64/$l.so.$major"); done   # the link name: package.py ships the real file under it
+fi
+
+if [ "$fam" = vulkan ]; then
+  # glslc is not an apt package on Ubuntu 22.04: take it from the LunarG Vulkan SDK archive pinned by size and SHA-256 (vulkan-sdk.env)
+  # shellcheck disable=SC1091
+  . "$here/vulkan-sdk.env"
+  curl -fsSL --proto '=https' --tlsv1.2 -A "shura-release-ci/1.0" -o "$SRC/vulkan-sdk.tar.xz" "$VULKAN_SDK_URL"
+  [ "$(stat -c %s "$SRC/vulkan-sdk.tar.xz")" = "$VULKAN_SDK_BYTES" ] || { echo "Vulkan SDK archive size does not match the pin" >&2; exit 1; }
+  [ "$(sha256sum "$SRC/vulkan-sdk.tar.xz" | cut -d' ' -f1)" = "$VULKAN_SDK_SHA256" ] || { echo "Vulkan SDK archive checksum does not match the pin" >&2; exit 1; }
+  mkdir -p "$SRC/vulkan-sdk"
+  tar -xJf "$SRC/vulkan-sdk.tar.xz" -C "$SRC/vulkan-sdk" --strip-components=3 "${VULKAN_SDK_VERSION}/x86_64/bin/glslc"
+  rm -f "$SRC/vulkan-sdk.tar.xz"
+  PATH="$SRC/vulkan-sdk:$PATH"; export PATH
+  glslc --version >/dev/null || { echo "glslc from the Vulkan SDK does not run" >&2; exit 1; }
 fi
 
 BUILD_DIR="$SRC/build-$fam" OUT="$OUT_DIR" "$here/build.sh" "$fam"
@@ -59,6 +73,17 @@ for p in pkgs:
 bw["apt_packages"] = apt
 json.dump(bw, open(path, "w"), indent=2)
 PY
+
+if [ "$fam" = vulkan ]; then
+  # the pinned Vulkan SDK archive glslc came from (vulkan-sdk.env), recorded next to the apt packages
+  python3 -B - "$OUT_DIR/built_with.json" "$VULKAN_SDK_VERSION" "$VULKAN_SDK_URL" "$VULKAN_SDK_SHA256" "$VULKAN_SDK_BYTES" <<'PY'
+import json, sys
+path, version, url, sha256, size = sys.argv[1:6]
+bw = json.load(open(path))
+bw["vulkan_sdk"] = {"version": version, "url": url, "sha256": sha256, "bytes": int(size)}
+json.dump(bw, open(path, "w"), indent=2)
+PY
+fi
 
 if [ "$fam" = hip ]; then
   # the ROCm runtime major is read from the build, not assumed: the soname libggml-hip.so needs
