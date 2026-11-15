@@ -13180,6 +13180,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1},  4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // SHURA (PERF262): the WMMA prefill path reading q5_0 K/V directly (head 256, 2 KV heads with GQA 8 as Tiel), KV lengths that are
+    // not a multiple of the tile (the out-of-bounds rows), batches that pick the MMA kernel
+    for (int kv : { 512, 4113 }) {
+        for (int nb : { 32, 77, 768 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0));
+        }
+    }
+
     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
@@ -13907,6 +13915,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // SHURA (PERF262): Tiel's prefill attention at depth: head 256, 2 KV heads with GQA 8, a 768/1024-token ubatch, the KV types of the
+    // profiles (q5_0 for 262k, q8_0/q4_0 for 32k, f16 as the reference)
+    for (int kv : { 32768, 100096, 200192 }) {   // multiples of 256, as the server pads n_kv (else the tile kernel is chosen)
+        for (int nb : { 768, 1024 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    }
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 512, 576, }) {
