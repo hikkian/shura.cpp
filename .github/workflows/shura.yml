@@ -92,6 +92,9 @@ jobs:
 
       - name: Build (compile only, sm_86)
         run: |
+          # no GPU driver in this container: link executables against the driver stub (libcuda.so.1 is resolved at run time on a real machine)
+          ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
           cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+                -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
                 -DLLAMA_CURL=OFF -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q8_0-q4_0;q4_0-q4_0;q4_0-q8_0;q5_0-q5_0;q5_0-q4_0;f16-f16;bf16-bf16"
           cmake --build build --target llama-server test-moe-cache-resize
