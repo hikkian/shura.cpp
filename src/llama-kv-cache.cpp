@@ -6,9 +6,13 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <thread>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -217,6 +221,28 @@ llama_kv_cache::llama_kv_cache(
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
+            // SHURA (PERF262): a long context on virtual memory: mapped as it grows (contiguous cell rows: no transposed V, one stream)
+            static const bool vmm_wanted = []() { const char * e = getenv("SHURA_KV_VMM"); return e && e[0] == '1'; }();
+            if (vmm_wanted && (v_trans || n_stream != 1) && kv_size >= 65536 && !other) {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    LLAMA_LOG_WARN("%s: SHURA_KV_VMM needs flash attention (no transposed V) and one KV stream: KV stays in ordinary memory\n", __func__);
+                }
+            }
+            if (vmm_wanted && !v_trans && n_stream == 1 && kv_size >= 65536 && !other) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto vmm_buft = (ggml_backend_buffer_type_t (*)(ggml_backend_dev_t))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_vmm_buffer_type");
+                ggml_backend_buffer_type_t b = vmm_buft ? vmm_buft(dev) : nullptr;
+                if (b) {
+                    buft = b;
+                    vmm_set_prefix  = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_vmm_buffer_set_prefix");
+                    vmm_mapped_size = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_vmm_buffer_mapped_size");
+                    vmm_rebase      = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_vmm_buffer_rebase");
+                }
+            }
+
             dev_name = ggml_backend_dev_name(dev);
         }
 
@@ -278,6 +304,11 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "kv cache");
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+    }
+
+    // SHURA (PERF262): map the first step of a virtual-memory KV before the first clear/graph
+    if (vmm_set_prefix && !ctxs_bufs.no_alloc && !vmm_ensure(1)) {
+        throw std::runtime_error("failed to map the first part of the KV cache on virtual memory");
     }
 
     {
@@ -390,7 +421,12 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
                 continue;
             }
 
-            const auto buft = ggml_backend_buffer_get_type(cache->buffer);
+            auto buft = ggml_backend_buffer_get_type(cache->buffer);
+            if (vmm_set_prefix) {   // SHURA (PERF262): the rotation matrices go to ordinary device memory, not the virtual-memory KV
+                if (auto * dev = ggml_backend_buft_get_device(buft)) {
+                    buft = ggml_backend_dev_buffer_type(dev);
+                }
+            }
             auto & ctx = ctx_map[buft];
             if (!ctx) {
                 ggml_init_params params = { 2*layers.size()*ggml_tensor_overhead(), nullptr, true };
@@ -743,6 +779,16 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     auto ret = ctxs_bufs.memory_breakdown();
 
+    // SHURA (PERF262): a virtual-memory KV counts what is mapped, not the reserved addresses (the governor sizes the cache from this)
+    if (vmm_mapped_size) {
+        auto mapped = (size_t (*)(ggml_backend_buffer_t)) vmm_mapped_size;
+        for (const auto & [_, buf] : ctxs_bufs) {
+            const size_t size = ggml_backend_buffer_get_size(buf.get());
+            auto & r = ret[ggml_backend_buffer_get_type(buf.get())];
+            r = r - std::min(r, size) + std::min(size, mapped(buf.get()));
+        }
+    }
+
     for (const auto & [buft, size] : attn_rot_bufs.memory_breakdown()) {
         ret[buft] += size;
     }
@@ -860,6 +906,25 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         return {};
     }
 
+    // SHURA (PERF262): map every cell the whole batch will write before any ubatch is applied, so that a failure (no device
+    // memory) leaves the memory as it was for all of them (a hybrid model cannot roll its recurrent state back over ubatches)
+    if (vmm_set_prefix) {
+        uint32_t need = 0;
+        for (const auto & sinfo : res) {
+            for (const auto & idxs : sinfo.idxs) {
+                for (const auto i : idxs) {
+                    need = std::max<uint32_t>(need, i + 1);
+                }
+            }
+        }
+        for (const auto & cells : v_cells) {
+            need = std::max(need, cells.used_max_p1());
+        }
+        if (!vmm_ensure(need)) {
+            return {};
+        }
+    }
+
     return res;
 }
 
@@ -915,6 +980,13 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 std::any_of(layers.begin(), layers.end(), [&](const auto & layer) {
                     return hparams.has_rope(layer.il);
                 })) {
+            // SHURA (PERF262): the shift ropes every cell of K: on virtual memory map all of it first (context shift is rare)
+            if (vmm_set_prefix && vmm_cells < get_size()) {
+                LLAMA_LOG_WARN("%s: K-shift on a virtual-memory KV: mapping all %u cells\n", __func__, get_size());
+                if (!const_cast<llama_kv_cache *>(this)->vmm_ensure(get_size())) {
+                    return updated;
+                }
+            }
             ggml_backend_sched_reset(sched);
 
             auto * res = lctx->get_gf_res_reserve();
@@ -1323,6 +1395,164 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     }
 
     return result;
+}
+
+static std::atomic<uint64_t> g_kv_vmm_generation{0};
+static std::atomic<bool>     g_kv_vmm_grow_failed{false};
+static bool               (* g_kv_vmm_reclaim)(size_t, void *) = nullptr;
+static void *                g_kv_vmm_reclaim_data = nullptr;
+
+void llama_kv_vmm_set_reclaim(bool (*fn)(size_t bytes, void * data), void * data) {
+    if (fn == nullptr && data != g_kv_vmm_reclaim_data) {
+        return;   // a context unregisters only its own callback (another context may have registered after it)
+    }
+    g_kv_vmm_reclaim      = fn;
+    g_kv_vmm_reclaim_data = data;
+}
+
+bool llama_kv_vmm_grow_failed(void) {
+    return g_kv_vmm_grow_failed.load();
+}
+
+bool llama_kv_vmm_take_grow_failure(void) {
+    return g_kv_vmm_grow_failed.exchange(false);
+}
+
+uint64_t llama_kv_vmm_generation() {
+    return g_kv_vmm_generation.load();
+}
+
+void llama_kv_cache::vmm_shrink_if_empty() {
+    constexpr uint32_t step = 8192;
+    if (!vmm_rebase || vmm_cells <= 2*step) {
+        return;
+    }
+    for (const auto & cells : v_cells) {
+        if (cells.get_used() > 0) {
+            return;
+        }
+    }
+    auto rebase = (void * (*)(ggml_backend_buffer_t)) vmm_rebase;
+    const uint32_t was = vmm_cells;
+    bool moved = false;
+    for (auto & [ctx, buf] : ctxs_bufs) {
+        char * old_base = (char *) ggml_backend_buffer_get_base(buf.get());
+        char * new_base = (char *) rebase(buf.get());
+        if (new_base == nullptr) {
+            continue;   // not a VMM buffer, or no new address range: keep the old one
+        }
+        moved = true;
+        const ptrdiff_t delta = new_base - old_base;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (t->buffer == buf.get() && t->view_src == nullptr && t->data != nullptr) {
+                t->data = (char *) t->data + delta;
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (t->view_src != nullptr && t->view_src->buffer == buf.get()) {
+                t->data = (char *) t->view_src->data + t->view_offs;
+            }
+        }
+    }
+    if (!moved) {
+        return;
+    }
+    g_kv_vmm_generation++;
+    vmm_cells = 0;
+    LLAMA_LOG_INFO("%s: empty KV moved to fresh addresses, %u mapped cells given back\n", __func__, was);
+}
+
+uint32_t llama_kv_cache::vmm_used_max_p1() const {
+    uint32_t n = 0;
+    for (const auto & cells : v_cells) {
+        n = std::max(n, cells.used_max_p1());
+    }
+    return n;
+}
+
+bool llama_kv_cache::vmm_ensure(uint32_t n_cells) {
+    if (!vmm_set_prefix) {
+        return true;
+    }
+    constexpr uint32_t step = 8192;   // cells mapped at a time (q5_0, Tiel: ~56 MiB for K+V of all layers)
+    const uint32_t want = std::min(get_size(), GGML_PAD(std::max<uint32_t>(n_cells, 1), step));
+    const bool grow   = want > vmm_cells;
+    // grow only by default: re-mapping addresses that kernels used before lost the writes in a HIP test on gfx1101/ROCm 10.1
+    // (reports/perf262/vmm/vmm_test.hip; growing with work in between is clean: vmm_grow.hip). The memory comes back at a restart.
+    static const bool shrink_ok = []() { const char * e = getenv("SHURA_KV_VMM_SHRINK"); return e && e[0] == '1'; }();
+    const bool shrink = shrink_ok && !grow && vmm_cells > want + 2*step;   // hysteresis: a conversation that shrinks a little keeps it
+    if (!grow && !shrink) {
+        return true;
+    }
+    auto set_prefix = (bool (*)(ggml_backend_buffer_t, ggml_tensor **, const size_t *, int, bool)) vmm_set_prefix;
+    bool ok = true;
+    size_t step_bytes = 0;   // what the growth asks for, to know how much to reclaim
+    // test hook (stand only): SHURA_KV_VMM_TEST_FAIL=<cells>:<n> makes the next n mapping attempts that reach <cells> fail, as if
+    // the desktop held the card (n=1: the expert cache gives memory back and the retry passes; n=2: the request pauses)
+    static uint32_t test_fail_at = 0;
+    static int      test_fail_n  = []() {
+        const char * e = getenv("SHURA_KV_VMM_TEST_FAIL");
+        int n = 0;
+        if (e && sscanf(e, "%u:%d", &test_fail_at, &n) != 2) {
+            n = 0;
+        }
+        return n;
+    }();
+    for (int attempt = 0; attempt < 4; ++attempt) {
+    if (attempt > 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25*attempt));   // the driver gives a freed bank back late
+    }
+    ok = true;
+    step_bytes = 0;
+    const bool test_fail = grow && test_fail_n > 0 && test_fail_at > 0 && want >= test_fail_at;
+    if (test_fail) {
+        --test_fail_n;
+        ok = false;
+        LLAMA_LOG_WARN("%s: SHURA_KV_VMM_TEST_FAIL: mapping %u cells fails on purpose\n", __func__, want);
+    }
+    for (const auto & [_, buf] : ctxs_bufs) {
+        std::vector<ggml_tensor *> ts;
+        std::vector<size_t> bytes;
+        for (const auto & layer : layers) {
+            for (ggml_tensor * t : { layer.k, layer.v }) {
+                if (t && t->buffer == buf.get()) {
+                    ts.push_back(t);
+                    bytes.push_back(size_t(want) * t->nb[1]);
+                }
+            }
+        }
+        if (!ts.empty()) {
+            ok = (!test_fail && set_prefix(buf.get(), ts.data(), bytes.data(), (int) ts.size(), shrink)) && ok;
+            for (size_t i = 0; i < ts.size(); ++i) {
+                step_bytes += size_t(want > vmm_cells ? want - vmm_cells : 0) * ts[i]->nb[1];
+            }
+        }
+    }
+    // the card had no memory for the step (the desktop took it): shrink the expert cache by the step at once and try once more
+    if (ok || !grow) {
+        break;
+    }
+    if (attempt == 0) {
+        if (g_kv_vmm_reclaim == nullptr || !g_kv_vmm_reclaim(step_bytes + (size_t(32) << 20), g_kv_vmm_reclaim_data)) {
+            break;
+        }
+        LLAMA_LOG_WARN("%s: no memory for %u KV cells: the expert cache gave back %.0f MiB, retrying\n", __func__, want,
+                step_bytes/1048576.0);
+    }
+    }
+    if (!ok) {
+        g_kv_vmm_grow_failed.store(true);
+        LLAMA_LOG_ERROR("%s: no device memory to map %u KV cells (mapped: %u)\n", __func__, want, vmm_cells);
+        return false;
+    }
+    size_t mapped = 0;
+    auto mapped_size = (size_t (*)(ggml_backend_buffer_t)) vmm_mapped_size;
+    for (const auto & [_, buf] : ctxs_bufs) {
+        mapped += mapped_size ? mapped_size(buf.get()) : 0;
+    }
+    LLAMA_LOG_INFO("%s: KV mapped for %u of %u cells (%.1f MiB)\n", __func__, want, get_size(), mapped/1024.0/1024.0);
+    vmm_cells = want;
+    return true;
 }
 
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
@@ -2362,6 +2592,7 @@ const slot_info_vec_t *   sinfos_in) {
 
         bool res = true;
         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && vmm_ensure(v_cells[strm].used_max_p1());   // SHURA (PERF262): the restored cells are mapped before their data is read
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -3032,8 +3263,25 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
+    kv->vmm_shrink_if_empty();   // SHURA (PERF262): a new conversation in an emptied cache gives the old mapping back
+    {
+        // SHURA (PERF262): map the cells this ubatch writes before anything changes, so that a failure (no device memory) leaves
+        // the memory exactly as it was, like a ubatch that was never applied (the hybrid context skips its recurrent part then)
+        uint32_t need = kv->vmm_used_max_p1();
+        for (const auto & idxs : sinfos[i_cur].idxs) {
+            for (const auto i : idxs) {
+                need = std::max<uint32_t>(need, i + 1);
+            }
+        }
+        if (!kv->vmm_ensure(need)) {
+            return false;
+        }
+    }
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv      = kv->get_n_kv(sinfos[i_cur]);
+    if (!kv->vmm_ensure(n_kv)) {   // SHURA (PERF262): the cells this graph reads are mapped (already, cells in use are mapped)
+        return false;
+    }
     n_kv_rows = kv->get_n_kv_rows(ubatches[i_cur]);
 
     return true;

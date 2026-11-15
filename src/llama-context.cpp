@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-kv-cache.h"   // SHURA (PERF262): llama_kv_vmm_generation
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -632,9 +633,26 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    if (moe_cache && cparams.moe_cache_resizable) {
+        // SHURA (PERF262): a virtual-memory KV that cannot map its next step takes the memory from this cache (same thread, under
+        // the recursive micro-batch lock). Registered last: a constructor that throws must not leave a dangling pointer behind.
+        llama_kv_vmm_set_reclaim([](size_t bytes, void * data) -> bool {
+            auto * lctx = (llama_context *) data;
+            llama_moe_cache_info info = {};
+            if (!llama_moe_cache_get_info(lctx, &info) || info.size == 0) {
+                return false;
+            }
+            const size_t target = info.size > bytes ? info.size - bytes : 0;
+            return llama_moe_cache_resize(lctx, target) < info.size;
+        }, this);
+    }
 }
 
 llama_context::~llama_context() {
+    if (moe_cache && cparams.moe_cache_resizable) {
+        llama_kv_vmm_set_reclaim(nullptr, this);   // SHURA (PERF262): only if it is still ours
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1863,6 +1881,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    // SHURA (PERF262): the KV may have shrunk the expert cache inside apply() to map its next step
+    if (moe_cache && cparams.moe_cache_resizable && moe_cache->generation() != moe_gen_reserved && !moe_reserve_after_resize()) {
+        LLAMA_LOG_ERROR("%s: no compute buffers for any size of the MoE cache\n", __func__);
+        ret = GGML_STATUS_ALLOC_FAILED;
+        return nullptr;
+    }
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -2295,6 +2319,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    (void) llama_kv_vmm_take_grow_failure();   // SHURA (PERF262): only a failure of this batch counts
+
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
         if (!mctx) {
@@ -2313,6 +2339,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
                 {
+                    if (llama_kv_vmm_grow_failed()) {
+                        // SHURA (PERF262): the virtual-memory KV had no device memory for this batch (nothing was applied);
+                        // a smaller batch would not help, the server pauses instead (kv_grow_no_memory)
+                        LLAMA_LOG_WARN("%s: no device memory to grow the KV for a batch of size %d\n", __func__, balloc->get_n_tokens());
+                        return -3;
+                    }
                     if (!did_optimize) {
                         did_optimize = true;
 
@@ -3152,6 +3184,7 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
     };
     res_params.moe_cache_gen = moe_cache ? moe_cache->generation() : 0; // SHURA
+    res_params.kv_vmm_gen    = llama_kv_vmm_generation();                  // SHURA (PERF262)
     return res_params;
 }
 
@@ -3612,7 +3645,10 @@ public:
                 if (!mbuf_cur.buf || mbuf_cur.total_size != mbuf.total_size) {
                     mbuf_cur = std::move(mbuf);
 
-                    mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
+                    // SHURA (PERF262): the snapshot goes to the device's ordinary memory (a virtual-memory KV buft maps nothing up front)
+                    auto * snap_dev  = ggml_backend_buft_get_device(buft);
+                    auto * snap_buft = snap_dev ? ggml_backend_dev_buffer_type(snap_dev) : buft;
+                    mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), snap_buft));
 
                     LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
                 } else {

@@ -194,6 +194,16 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // SHURA (PERF262): KV on GPU virtual memory (SHURA_KV_VMM=1, HIP): the addresses of the full context are reserved, physical memory
+    // is mapped for the first n_cells cells (in steps) and given back when the conversation shrinks. Returns false when the card has
+    // no memory for the next step.
+    uint32_t vmm_used_max_p1() const;
+    bool vmm_ensure(uint32_t n_cells);
+
+    // SHURA (PERF262): an empty KV that holds far more mapped memory than it needs moves to a fresh address range and maps only the
+    // first step again: after a long conversation the next one gets its memory back (to the expert cache) without a server restart
+    void vmm_shrink_if_empty();
+
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each
     // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
@@ -319,6 +329,12 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
 
+    // SHURA (PERF262): see vmm_ensure()
+    uint32_t vmm_cells       = 0;
+    void *   vmm_set_prefix  = nullptr;   // ggml_backend_cuda_vmm_buffer_set_prefix
+    void *   vmm_mapped_size = nullptr;   // ggml_backend_cuda_vmm_buffer_mapped_size
+    void *   vmm_rebase      = nullptr;   // ggml_backend_cuda_vmm_buffer_rebase
+
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
@@ -373,6 +389,12 @@ private:
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
 };
+
+// SHURA (PERF262): bumped when a virtual-memory KV moves (its tensor and view pointers change): built graphs must not be reused
+uint64_t llama_kv_vmm_generation();
+bool llama_kv_vmm_grow_failed(void);   // peek (the server takes it with llama_kv_vmm_take_grow_failure)
+// SHURA (PERF262): who can give device memory back when the KV cannot map its next step (the expert cache of the context)
+void llama_kv_vmm_set_reclaim(bool (*fn)(size_t bytes, void * data), void * data);
 
 class llama_kv_cache_context : public llama_memory_context_i {
 public:

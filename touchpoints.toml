@@ -327,3 +327,41 @@ feature = "wmma-null-rows"
 file = "ggml/src/ggml-cuda/fattn-mma-f16.cuh"
 probe = "if (!use_sparse && KV_rows_ptr == nullptr) {"
 note = "flash_attn_ext_f16 calls process_tile with a literal nullptr when there are no KV rows (three call sites); upstream's run-time pointer cost ~24 % of the D=256 prefill attention at 100k on gfx1101"
+
+# ---- PERF262: KV on GPU virtual memory (one adaptive 262k profile) ----
+
+[[hook]]
+feature = "kv-vmm"
+file = "ggml/src/ggml-cuda/ggml-cuda.cu"
+probe = "struct ggml_backend_cuda_vmm_kv_context"
+note = "HIP buffer type: an address range for the whole KV, 2 MiB granules mapped on demand (zeroed); set_prefix / rebase (fresh range, old ranges stay reserved) / mapped_size through get_proc_address"
+
+[[hook]]
+feature = "kv-vmm"
+file = "src/llama-kv-cache.cpp"
+probe = "bool llama_kv_cache::vmm_ensure(uint32_t n_cells)"
+note = "SHURA_KV_VMM=1: K/V in the VMM buffer (HIP, >= 65536 cells, one stream, V not transposed); mapping in steps of 8192 cells in prepare() for the whole batch, apply(), state_read and the K-shift; reclaim from the expert cache + retries on failure; vmm_shrink_if_empty moves an emptied KV to fresh addresses"
+
+[[hook]]
+feature = "kv-vmm"
+file = "src/llama-graph.h"
+probe = "kv_vmm_gen"
+note = "graph reuse is refused after the KV moved to fresh addresses"
+
+[[hook]]
+feature = "kv-vmm"
+file = "src/llama-memory-hybrid.cpp"
+probe = "if (!ctx_attn->apply()) {"
+note = "the recurrent part is not applied when the attention part failed (it fails only before changing anything)"
+
+[[hook]]
+feature = "kv-vmm"
+file = "src/llama-context.cpp"
+probe = "llama_kv_vmm_grow_failed()"
+note = "decode: a failed KV mapping in prepare() returns -3 at once (no smaller-batch retry); the reclaim callback is registered at the end of the constructor; MoE reserve after a resize inside apply()"
+
+[[hook]]
+feature = "kv-vmm"
+file = "tools/server/server-context.cpp"
+probe = "kv_grow_no_memory"
+note = "the server pauses (slot saved, exit 75, the gateway resumes) instead of failing the request"

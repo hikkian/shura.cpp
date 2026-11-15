@@ -840,6 +840,7 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     uint64_t moe_cache_gen = 0; // SHURA: generation of the expert cache layout the graph was built for
+    uint64_t kv_vmm_gen    = 0; // SHURA (PERF262): generation of the virtual-memory KV addresses the graph was built for
 
     bool allow_reuse(const llm_graph_params & other) const {
         // first check the ubatch
@@ -904,6 +905,9 @@ struct llm_graph_params {
         }
 
         // SHURA: a graph built for another layout of the expert cache reads banks that were freed
+        if (kv_vmm_gen != other.kv_vmm_gen) {
+            return false;
+        }
         if (moe_cache_gen != other.moe_cache_gen) {
             return false;
         }

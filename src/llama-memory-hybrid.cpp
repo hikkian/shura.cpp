@@ -258,12 +258,12 @@ bool llama_memory_hybrid_context::next() {
 bool llama_memory_hybrid_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
-    bool res = true;
-
-    res = res & ctx_attn->apply();
-    res = res & ctx_recr->apply();
-
-    return res;
+    // SHURA (PERF262): the attention part fails only before it changes anything (the virtual-memory KV had no memory for the
+    // next step); the recurrent part must not take its slot then, or the rollback of the failed ubatch would move its state back
+    if (!ctx_attn->apply()) {
+        return false;
+    }
+    return ctx_recr->apply();
 }
 
 llama_memory_status llama_memory_hybrid_context::get_status() const {
