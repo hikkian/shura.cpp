@@ -301,9 +301,29 @@ note = "the KL-divergence base file and the KL divergence batch by batch (memory
 feature = "gqa-vec"
 file = "ggml/src/ggml-cuda/fattn-vec.cuh"
 probe = "GGML_HIP_FA_GQA_VEC"
-note = "flash_attn_ext_vec gets ncols2 (GQA-packed columns); the dispatch in ggml_cuda_flash_attn_ext_vec_case for K q8_0 with V q8_0 or q4_0, head 256, GQA 4 or 8, <= 3 tokens (the MTP verify batch); opt-in by the env"
+note = "flash_attn_ext_vec gets ncols2 (GQA-packed columns); the dispatch in ggml_cuda_flash_attn_ext_vec_case for K and V q8_0, q4_0 or q5_0, head 256, GQA 4 or 8, <= 3 tokens (the MTP verify batch); opt-in by the env"
 
 [[hook]]
 feature = "gqa-vec"
 file = "tests/test-backend-ops.cpp"
 probe = "struct test_flash_attn_ext_peaky"
+
+[[hook]]
+feature = "gqa-vec"
+file = "ggml/src/ggml-cuda/fattn.cu"
+probe = "ggml_cuda_fattn_gqa_vec_applies(dst)"
+note = "the kernel choice asks the same gate as the dispatch (otherwise WMMA takes the 3-token MTP verify batch with GQA 8)"
+
+# ---- REBASE1 end: the long 262k profile with MTP ----
+
+[[hook]]
+feature = "mtp-window"
+file = "common/speculative.cpp"
+probe = "SHURA_MTP_WINDOW"
+note = "the MTP draft attends to the last N positions: trim_window() before each draft decode (process() and draft()), the draft context created for N + a batch"
+
+[[hook]]
+feature = "wmma-null-rows"
+file = "ggml/src/ggml-cuda/fattn-mma-f16.cuh"
+probe = "if (!use_sparse && KV_rows_ptr == nullptr) {"
+note = "flash_attn_ext_f16 calls process_tile with a literal nullptr when there are no KV rows (three call sites); upstream's run-time pointer cost ~24 % of the D=256 prefill attention at 100k on gfx1101"

@@ -37,7 +37,7 @@ A missing probe means upstream moved the code: find the new place, fix the hook 
 ```bash
 cmake -S . -B build-new -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS=gfx1101 \
       -DCMAKE_HIP_COMPILER=$HOME/rocm-10.1/lib/llvm/bin/clang -DCMAKE_PREFIX_PATH=$HOME/rocm-10.1 -DLLAMA_CURL=OFF \
-      -DLLAMA_BUILD_TESTS=ON -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q8_0-q4_0;q4_0-q4_0;q4_0-q8_0;f16-f16;bf16-bf16"
+      -DLLAMA_BUILD_TESTS=ON -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q8_0-q4_0;q4_0-q4_0;q4_0-q8_0;q5_0-q5_0;q5_0-q4_0;f16-f16;bf16-bf16"
 cmake --build build-new -j 3
 cd build-new && HIP_VISIBLE_DEVICES=-1 ctest            # torch-based Python tests need torch
 ```
@@ -51,7 +51,9 @@ cd build-new && HIP_VISIBLE_DEVICES=-1 ctest            # torch-based Python tes
 
 ## 5. Notes for the next update
 
-* KV: upstream's rotated `q4_0`/`q8_0` are in use; if upstream adds a better four-bit KV type, measure it with
-  `reports/rebase1/kv/kld.sh` / `kld16.sh` (`SHURA_PPL_STREAM=1`).
+* KV: upstream's rotated `q4_0`/`q8_0` (live) and `q5_0` (long profile) are in use; a new KV type is measured with
+  `reports/rebase1/kv/kldtypes.sh` (`SHURA_PPL_STREAM=1`, 16k and 32k) and needs the GQA kernel for decode speed.
+* After the rebase check that `flash_attn_ext_f16` still calls the tile function with a literal `nullptr` without KV rows
+  (touchpoint `wmma-null-rows`): `llama-bench -p 1024 -d 100000` must stay at the earlier speed.
 * No own ggml type numbers are left in the tree (TurboQuant was dropped). If one comes back, take numbers from 64 up and move them when
   upstream gets close.

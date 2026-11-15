@@ -74,7 +74,7 @@ jobs:
         run: |
           cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" -DGGML_HIP=ON -DGPU_TARGETS=gfx1101 \
-                -DGGML_HIP_NO_VMM=ON -DLLAMA_CURL=OFF -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q8_0-q4_0;q4_0-q4_0;q4_0-q8_0;f16-f16;bf16-bf16"
+                -DGGML_HIP_NO_VMM=ON -DLLAMA_CURL=OFF -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q8_0-q4_0;q4_0-q4_0;q4_0-q8_0;q5_0-q5_0;q5_0-q4_0;f16-f16;bf16-bf16"
           cmake --build build --target llama-server test-moe-cache-resize
 
   cuda:
@@ -93,5 +93,5 @@ jobs:
       - name: Build (compile only, sm_86)
         run: |
           cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
-                -DLLAMA_CURL=OFF -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q8_0-q4_0;q4_0-q4_0;q4_0-q8_0;f16-f16;bf16-bf16"
+                -DLLAMA_CURL=OFF -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q8_0-q4_0;q4_0-q4_0;q4_0-q8_0;q5_0-q5_0;q5_0-q4_0;f16-f16;bf16-bf16"
           cmake --build build --target llama-server test-moe-cache-resize

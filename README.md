@@ -22,7 +22,7 @@ llama.cpp: [docs/SHURA-UPDATE.md](docs/SHURA-UPDATE.md). Sources and licenses: [
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS=gfx1101 -DLLAMA_CURL=OFF \
-      -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q8_0-q4_0;q4_0-q4_0;q4_0-q8_0;f16-f16;bf16-bf16"
+      -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q8_0-q4_0;q4_0-q4_0;q4_0-q8_0;q5_0-q5_0;q5_0-q4_0;f16-f16;bf16-bf16"
 cmake --build build --target llama-server
 ```
 
