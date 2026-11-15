@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -1545,10 +1546,68 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    is_mem_shared = false;   // gemma4
     int32_t draft_window  = 0;       // SHURA: SHURA_MTP_WINDOW (0 = the whole context)
 
-    // SHURA: keep only the last draft_window positions of seq_id in the draft KV before a decode that starts at pos
-    void trim_window(llama_seq_id seq_id, llama_pos pos) {
-        if (draft_window > 0 && pos > draft_window) {
-            llama_memory_seq_rm(llama_get_memory(this->params.ctx_dft), seq_id, 0, pos - draft_window);
+    // SHURA: the draft KV of each sequence as (position, cells), oldest first. Counted in cells, not positions: with M-RoPE the
+    // patches of an image share pos[0], so N positions can hold far more than N cells, and the draft context is sized in cells.
+    std::vector<std::deque<std::pair<llama_pos, int32_t>>> win_cells;
+    std::vector<int64_t> win_total;
+
+    // SHURA: before a draft decode of b: forget what was rolled back (everything at or after the first incoming position of a
+    // sequence), then drop the oldest positions until the kept cells plus the incoming ones fit in draft_window
+    void window_trim(const common_batch & b) {
+        if (draft_window <= 0) {
+            return;
+        }
+        auto * mem = llama_get_memory(this->params.ctx_dft);
+        for (llama_seq_id s = 0; s < (llama_seq_id) win_cells.size(); ++s) {
+            llama_pos p_first = -1;
+            int64_t   n_in    = 0;
+            for (const auto & t : b.tokens) {
+                if (t.seq_id == s) {
+                    p_first = p_first < 0 ? t.pos[0] : std::min(p_first, t.pos[0]);
+                    n_in++;
+                }
+            }
+            if (n_in == 0) {
+                continue;
+            }
+            auto & d = win_cells[s];
+            while (!d.empty() && d.back().first >= p_first) {
+                win_total[s] -= d.back().second;
+                d.pop_back();
+            }
+            if (d.empty() && llama_memory_seq_pos_min(mem, s) >= 0 && llama_memory_seq_pos_min(mem, s) < p_first) {
+                // cells this driver did not write (a restored slot): count them as a full window, so they are dropped
+                d.emplace_back(p_first - 1, draft_window);
+                win_total[s] = draft_window;
+            }
+            llama_pos cut = -1;
+            while (!d.empty() && win_total[s] + n_in > draft_window) {
+                cut = d.front().first;
+                win_total[s] -= d.front().second;
+                d.pop_front();
+            }
+            if (cut >= 0) {
+                llama_memory_seq_rm(mem, s, 0, cut + 1);
+            }
+        }
+    }
+
+    // SHURA: after a successful draft decode of b: record its cells
+    void window_record(const common_batch & b) {
+        if (draft_window <= 0) {
+            return;
+        }
+        for (const auto & t : b.tokens) {
+            if (t.seq_id < 0 || t.seq_id >= (llama_seq_id) win_cells.size()) {
+                continue;
+            }
+            auto & d = win_cells[t.seq_id];
+            if (!d.empty() && d.back().first == t.pos[0]) {
+                d.back().second++;
+            } else {
+                d.emplace_back(t.pos[0], 1);
+            }
+            win_total[t.seq_id]++;
         }
     }
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
@@ -1632,7 +1691,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // every decode; the draft context is created with room for N + a batch). The target's verification stays full, so the
         // answer does not change, only the acceptance; on a long context each draft step no longer reads the whole KV.
         if (const char * w = getenv("SHURA_MTP_WINDOW"); w != nullptr && !is_mem_shared) {
-            draft_window = std::max(0, atoi(w));
+            draft_window = (int32_t) std::min<long>(std::max(0L, strtol(w, nullptr, 10)), (long) llama_n_ctx(ctx_dft));
+            win_cells.assign(n_seq, {});
+            win_total.assign(n_seq, 0);
         }
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
@@ -1799,10 +1860,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {   // SHURA: the draft window
-                    if (i_batch_beg[seq_id] >= 0) {
-                        trim_window(seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0]);
-                    }
+                if (head == 0) {
+                    window_trim(batch);   // SHURA: the draft window
                 }
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
                 if (rc != 0) {
@@ -1819,6 +1878,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!ok) {
                 return false;
             }
+            window_record(batch);   // SHURA: the draft window
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1924,16 +1984,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {   // SHURA: the draft window
-                if (drafting[seq_id]) {
-                    trim_window(seq_id, dparams[seq_id].pos0);
-                }
-            }
+            window_trim(batch);   // SHURA: the draft window
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
             }
+            window_record(batch);   // SHURA: the draft window
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
@@ -2870,12 +2927,14 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
-    // SHURA (REBASE1): with an MTP draft window the draft KV holds the window plus one batch (trimmed before every decode)
-    if (const char * w = getenv("SHURA_MTP_WINDOW"); w != nullptr && atoi(w) > 0 && spec_mtp && !has_draft) {
-        const uint32_t need = (uint32_t) atoi(w) + (uint32_t) std::max(params.n_batch, params.n_ubatch) + 256;
-        if (need < cparams.n_ctx) {
-            cparams.n_ctx = need;
-            LOG_INF("%s: MTP draft window %d: the draft context holds %u tokens\n", __func__, atoi(w), need);
+    // SHURA (REBASE1): with an MTP draft window each sequence keeps at most the window plus one incoming batch in the draft KV
+    // (counted in cells and trimmed before every draft decode), so the draft context is that times the number of sequences
+    if (const char * w = getenv("SHURA_MTP_WINDOW"); w != nullptr && spec_mtp && !has_draft) {
+        const int64_t win  = std::min<int64_t>(std::max(0L, strtol(w, nullptr, 10)), cparams.n_ctx);
+        const int64_t need = std::max<int64_t>(1, params.n_parallel) * (win + std::max(params.n_batch, params.n_ubatch) + 256);
+        if (win > 0 && need < (int64_t) cparams.n_ctx) {
+            cparams.n_ctx = (uint32_t) need;
+            LOG_INF("%s: MTP draft window %" PRId64 ": the draft context holds %" PRId64 " cells\n", __func__, win, need);
         }
     }
 
