@@ -326,7 +326,9 @@ static __global__ void flash_attn_ext_vec(
             KQ_max_new[j] = KQ_max[j];
         }
 
-#pragma unroll (ncols2 > 1 ? GQA_UNR : 16)
+        // the unroll counts are constexpr variables: nvcc does not expand macros inside #pragma unroll (CUDA build of shura.cpp 1.0)
+        constexpr int unroll_KQ = ncols2 > 1 ? GQA_UNR : 16;
+#pragma unroll unroll_KQ
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
 
@@ -447,7 +449,8 @@ static __global__ void flash_attn_ext_vec(
 
         ggml_cuda_syncwarp(); // Needed for KQ synchronization.
 
-#pragma unroll (ncols2 > 1 ? GQA_UNRV : 64)
+        constexpr int unroll_V = ncols2 > 1 ? GQA_UNRV : 64;
+#pragma unroll unroll_V
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
