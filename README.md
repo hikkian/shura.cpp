@@ -46,8 +46,11 @@ the cache take the memory nobody uses and hand it back within a fraction of a se
 
 **Long context on 16 GB**
 
-- **The full 262 144-token context with MTP drafting on.** One profile, measured at 100k tokens: prefill about 1050 tok/s, decode
-  about 57 tok/s; at 255k tokens: 605 and 39 tok/s with 2 GiB of VRAM still free.
+- **The full 262 144-token context with MTP drafting on.** One profile, measured at 100k tokens: prefill about 1290 tok/s, decode
+  about 59 tok/s; at 200k: 910 and 45 tok/s; at 243k: 770 and 35 tok/s, with at least 1.7 GiB of VRAM still free.
+- **KV on GPU virtual memory** (`SHURA_KV_VMM=1`, HIP). The KV cache takes VRAM as the conversation grows; what a shorter
+  conversation does not use goes to the expert cache. If the card has no memory for the next step, the expert cache gives it back,
+  and if that is not enough the server pauses and saves the slot instead of failing the request.
 - **MTP draft window** (`SHURA_MTP_WINDOW=N`). The draft head attends only to the last N positions. The target model still verifies
   every token, so what gets accepted does not depend on the window. The draft's KV at 262k shrinks from 1088 MiB to 109 MiB.
 - **GQA-vectorised decode attention** (HIP) for K and V in `q8_0`, `q4_0` and `q5_0`, including the 3-token MTP verify batch.
@@ -125,7 +128,7 @@ build/bin/llama-server -m model.gguf -c 32768 -ub 1024 -ncmoe 14 -ctk q8_0 -ctv 
   --moe-cache-live-resize --moe-cache-mib 0 --moe-cache-cpu-share 0.5 --vram-governor
 ```
 
-The full 262 144 context with MTP: the same line with `-c 262144 -ncmoe 18 -ub 768 -ctk q5_0 -ctv q5_0` and `SHURA_MTP_WINDOW=8192`
+The full 262 144 context with MTP: the same line with `-c 262144 -ncmoe 18 -ub 1024 -ctk q5_0 -ctv q5_0 --vram-buffer-mib 512` and `SHURA_MTP_WINDOW=8192 SHURA_KV_VMM=1` (KV on GPU virtual memory: it takes VRAM as the conversation grows, the rest goes to the expert cache)
 in the environment. `-ncmoe` is the number of layers whose experts stay in host memory; it depends on the model and the card.
 `GGML_HIP_FA_GQA_VEC` has an effect on HIP only.
 

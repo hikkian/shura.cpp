@@ -51,6 +51,8 @@ cd build-new && HIP_VISIBLE_DEVICES=-1 ctest            # torch-based Python tes
 
 ## 5. Notes for the next update
 
+- **KV on virtual memory (`SHURA_KV_VMM`).** The hooks are in `touchpoints.toml` (kv-vmm). After an update check: the hybrid `apply()` still short-circuits (attention first, the recurrent part only if it succeeded), `prepare()` maps the whole batch before any ubatch, and the T=0 tokens with and without VMM match (no governor, cache 0). Re-mapping addresses that kernels used lost writes on gfx1101 / ROCm 10.1; keep grow-only plus the move to a fresh range until a ROCm update is tested.
+
 * KV: upstream's rotated `q4_0`/`q8_0` (live) and `q5_0` (long profile) are in use; a new KV type is measured with
   `reports/rebase1/kv/kldtypes.sh` (`SHURA_PPL_STREAM=1`, 16k and 32k) and needs the GQA kernel for decode speed.
 * After the rebase check that `flash_attn_ext_f16` still calls the tile function with a literal `nullptr` without KV rows
