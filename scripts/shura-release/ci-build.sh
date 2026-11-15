@@ -26,6 +26,9 @@ if [ "$fam" = hip ]; then
   ROCM_PATH=/opt/rocm; export ROCM_PATH HIP_PATH="$ROCM_PATH" CMAKE_PREFIX_PATH="$ROCM_PATH"
   PATH="$ROCM_PATH/bin:$PATH"; export PATH
   export LD_LIBRARY_PATH="$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}"
+  # check the pin before the build: package installs write "7.2.1" or "7.2.1-<build>"
+  image_version="$(cat "$ROCM_PATH/.info/version")"
+  case "$image_version" in 7.2.1|7.2.1-*) ;; *) echo "ROCm in the image is '$image_version', the pin is 7.2.1" >&2; exit 1 ;; esac
 fi
 if [ "$fam" = cuda ]; then
   major="$(nvcc --version | sed -n 's/.*release \([0-9]*\)\..*/\1/p')"
@@ -61,8 +64,6 @@ if [ "$fam" = hip ]; then
   # the ROCm runtime major is read from the build, not assumed: the soname libggml-hip.so needs
   soname="$(readelf -d "$SRC/build-hip/bin/libggml-hip.so" | sed -n 's/.*NEEDED.*\[\(libamdhip64\.so\.[0-9][0-9]*\)\].*/\1/p' | head -n1)"
   [ -n "$soname" ] || { echo "libggml-hip.so has no NEEDED libamdhip64.so.N" >&2; exit 1; }
-  image_version="$(cat "$ROCM_PATH/.info/version")"
-  [ "$image_version" = "7.2.1" ] || { echo "ROCm in the image is '$image_version', the pin is 7.2.1" >&2; exit 1; }
   python3 -B - "$OUT_DIR/built_with.json" "$soname" "$image_version" <<'PY'
 import json, sys
 path, soname, image_version = sys.argv[1], sys.argv[2], sys.argv[3]
