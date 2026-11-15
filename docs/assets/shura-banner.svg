@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 240" width="880" height="240" role="img" aria-labelledby="t d">
+  <title id="t">shura.cpp</title>
+  <desc id="d">The shura.cpp wordmark above a strip of GPU memory split into three parts: the model, an expert cache that can change size, and the desktop.</desc>
+  <style>
+    .ink { fill: #1f2328; }
+    .muted { fill: #59636e; }
+    .model { fill: #0e9384; }
+    .cache { fill: #6ee7b7; }
+    .desk { fill: #f59e0b; }
+    .on-model { fill: #ffffff; }
+    .on-light { fill: #0b1f1c; }
+    .handle { stroke: #0b1f1c; }
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #e6edf3; }
+      .muted { fill: #9198a1; }
+      .model { fill: #0f9e8e; }
+      .desk { fill: #fbbf24; }
+    }
+  </style>
+  <text x="440" y="78" text-anchor="middle" class="ink mono" font-size="64" font-weight="700" letter-spacing="-1">shura.cpp</text>
+  <text x="440" y="116" text-anchor="middle" class="muted sans" font-size="19">llama.cpp 1.0 for a GPU you share with your desktop</text>
+  <g transform="translate(90 150)">
+    <rect class="model" x="0" y="0" width="476" height="44" rx="6"/>
+    <rect class="cache" x="482" y="0" width="92" height="44" rx="6"/>
+    <rect class="desk" x="580" y="0" width="120" height="44" rx="6"/>
+    <text x="238" y="28" text-anchor="middle" class="on-model sans" font-size="16" font-weight="600">model + context</text>
+    <text x="528" y="28" text-anchor="middle" class="on-light sans" font-size="15" font-weight="600">experts</text>
+    <text x="640" y="28" text-anchor="middle" class="on-light sans" font-size="15" font-weight="600">desktop</text>
+    <path class="handle" d="M566 52 h22 M566 52 l6 -5 M566 52 l6 5 M588 52 l-6 -5 M588 52 l-6 5" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="350" y="80" text-anchor="middle" class="muted sans" font-size="14">16 GB of VRAM: the expert cache grows into free memory and gives it back when the desktop asks</text>
+  </g>
+</svg>

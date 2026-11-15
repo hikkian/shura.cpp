@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 330" width="880" height="330" role="img" aria-labelledby="t d">
+  <title id="t">How shura.cpp shares the card with the desktop</title>
+  <desc id="d">Two strips of the same 16 GB of VRAM. In the first the desktop is idle and the expert cache is large. In the second the desktop needs memory: the expert cache has shrunk and the memory went back to the desktop within a fraction of a second while the request keeps running.</desc>
+  <style>
+    .ink { fill: #1f2328; }
+    .muted { fill: #59636e; }
+    .model { fill: #0e9384; }
+    .cache { fill: #6ee7b7; }
+    .desk { fill: #f59e0b; }
+    .free { fill: none; stroke: #59636e; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .on-model { fill: #ffffff; }
+    .on-light { fill: #0b1f1c; }
+    .arrow { stroke: #59636e; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #e6edf3; }
+      .muted { fill: #9198a1; }
+      .model { fill: #0f9e8e; }
+      .desk { fill: #fbbf24; }
+      .free { stroke: #9198a1; }
+      .arrow { stroke: #9198a1; }
+    }
+  </style>
+  <!-- 1 GiB = 50 px, strip starts at x = 40 -->
+  <text x="40" y="34" class="ink sans" font-size="17" font-weight="600">Desktop idle</text>
+  <text x="840" y="34" text-anchor="end" class="muted sans" font-size="14">the cache takes what is free</text>
+  <g transform="translate(40 48)">
+    <rect class="model" x="0" y="0" width="572" height="46" rx="6"/>
+    <rect class="cache" x="577" y="0" width="64" height="46" rx="6"/>
+    <rect class="free" x="647" y="1" width="76" height="44" rx="6"/>
+    <rect class="desk" x="729" y="0" width="71" height="46" rx="6"/>
+    <text x="286" y="29" text-anchor="middle" class="on-model sans" font-size="15" font-weight="600">model on the GPU + context (KV)</text>
+    <text x="609" y="29" text-anchor="middle" class="on-light sans" font-size="13" font-weight="600">experts</text>
+    <text x="685" y="29" text-anchor="middle" class="muted sans" font-size="13">free</text>
+    <text x="764" y="29" text-anchor="middle" class="on-light sans" font-size="13" font-weight="600">desktop</text>
+  </g>
+  <path class="arrow" d="M440 112 v44 M440 156 l-7 -8 M440 156 l7 -8"/>
+  <text x="456" y="131" class="ink sans" font-size="15" font-weight="600">a game, a browser tab or a video call asks for memory</text>
+  <text x="456" y="151" class="muted sans" font-size="14">1 GiB goes back to the desktop in 0.14–0.31 s</text>
+  <text x="40" y="196" class="ink sans" font-size="17" font-weight="600">Desktop needs the card</text>
+  <text x="840" y="196" text-anchor="end" class="muted sans" font-size="14">the request keeps running</text>
+  <g transform="translate(40 210)">
+    <rect class="model" x="0" y="0" width="572" height="46" rx="6"/>
+    <rect class="cache" x="577" y="0" width="26" height="46" rx="6"/>
+    <rect class="free" x="609" y="1" width="76" height="44" rx="6"/>
+    <rect class="desk" x="691" y="0" width="109" height="46" rx="6"/>
+    <text x="286" y="29" text-anchor="middle" class="on-model sans" font-size="15" font-weight="600">model on the GPU + context (KV)</text>
+    <text x="647" y="29" text-anchor="middle" class="muted sans" font-size="13">free</text>
+    <text x="745" y="29" text-anchor="middle" class="on-light sans" font-size="13" font-weight="600">desktop</text>
+  </g>
+  <text x="40" y="286" class="muted sans" font-size="14">Experts that left the cache are read from host memory. The first token after the shrink comes 0.055 s later.</text>
+  <text x="40" y="308" class="muted sans" font-size="14">When the pressure ends the cache grows back. At least 1.5 GiB always stays free. Widths are illustrative.</text>
+</svg>
