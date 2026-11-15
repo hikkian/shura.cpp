@@ -1,0 +1,237 @@
+# shura.cpp release builds (card RELBIN1). Own workflow: the upstream release.yml is not touched.
+#  - manual run (workflow_dispatch): builds the four families and keeps the archives as workflow artifacts; nothing is published.
+#  - push of a tag shura-v<version>: the same builds, then a DRAFT release (archives, SHA-256 sums, release-manifest.json).
+#    The workflow never publishes: a human presses "Publish" after reading the draft.
+# Rules: default permission is contents: read; contents: write only in the job that creates the draft; no secrets (only the automatic
+# github.token); third-party actions pinned by commit SHA; sources are fetched with plain git (no checkout action); the UI is not built
+# (no npm, no Hugging Face fetch); toolchain downloads are pinned by digest / hash (the guard job checks the CUDA image digest; ci-build.sh checks the ROCm wheel hashes).
+name: shura-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version for the archive names, e.g. 1.0.0 or 1.0.0rc1 (digits, dots, letters; no dash)"
+        required: true
+        default: "0.0.0dev"
+  push:
+    tags:
+      - "shura-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shura-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: guard (pins)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch source (plain git, read-only token)
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}"
+          auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout -q --detach FETCH_HEAD
+
+      - name: Check pins (CUDA image digest)
+        run: bash scripts/shura-release/check-pins.sh
+
+  build:
+    name: build (${{ matrix.family }})
+    runs-on: ubuntu-22.04          # glibc 2.35 is the floor (glibc_min in the manifest comes from the build host)
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        family: [hip, vulkan, cpu]
+    steps:
+      - name: Fetch source (plain git, read-only token)
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}"
+          auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          # the header goes through the environment, never through the command line
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout -q --detach FETCH_HEAD
+          git submodule status | grep -q . && { echo "submodules are not expected"; exit 1; } || true
+
+      - name: Version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#shura-v}"; else v="${INPUT_VERSION}"; fi
+          [[ "$v" =~ ^[0-9][0-9A-Za-z.+~]*$ ]] || { echo "bad version '$v'"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build, test, package, check
+        run: scripts/shura-release/ci-build.sh "${{ matrix.family }}" "${{ steps.ver.outputs.version }}"
+
+      - name: Upload archive, sum and manifest part
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: shura-release-${{ matrix.family }}
+          path: |
+            out/${{ matrix.family }}/shura-cpp-*.tar.gz
+            out/${{ matrix.family }}/shura-cpp-*.tar.gz.sha256
+            out/${{ matrix.family }}/shura-cpp-*.tar.gz.manifest.json
+            out/${{ matrix.family }}/check-report.txt
+            out/${{ matrix.family }}/built_with.json
+            out/${{ matrix.family }}/apt-versions.txt
+          if-no-files-found: error
+
+  build-cuda:
+    name: build (cuda)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    needs: [guard]
+    container:
+      # the only place of the image pin (the container key cannot read env); scripts/shura-release/check-pins.sh checks this line in the guard job
+      image: nvidia/cuda:12.8.1-devel-ubuntu22.04@sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97
+    steps:
+      - name: Install git
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - name: Fetch source (plain git, read-only token)
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}"
+          auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          # the header goes through the environment, never through the command line
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout -q --detach FETCH_HEAD
+
+      - name: Version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#shura-v}"; else v="${INPUT_VERSION}"; fi
+          [[ "$v" =~ ^[0-9][0-9A-Za-z.+~]*$ ]] || { echo "bad version '$v'"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build, test, package, check
+        shell: bash
+        run: scripts/shura-release/ci-build.sh cuda "${{ steps.ver.outputs.version }}"
+
+      - name: Upload archive, sum and manifest part
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: shura-release-cuda
+          path: |
+            out/cuda/shura-cpp-*.tar.gz
+            out/cuda/shura-cpp-*.tar.gz.sha256
+            out/cuda/shura-cpp-*.tar.gz.manifest.json
+            out/cuda/check-report.txt
+            out/cuda/built_with.json
+            out/cuda/apt-versions.txt
+          if-no-files-found: error
+
+  draft-release:
+    name: draft release
+    if: ${{ startsWith(github.ref, 'refs/tags/shura-v') }}
+    needs: [build, build-cuda]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write              # the only place with write access: it creates the DRAFT release, nothing else
+    steps:
+      - name: Fetch source (plain git, read-only use)
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}"
+          auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          # the header goes through the environment, never through the command line
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout -q --detach FETCH_HEAD
+
+      - name: Download all family artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: shura-release-*
+          path: dl
+          merge-multiple: false      # every artifact in its own folder dl/<name>
+
+      - name: Refuse duplicate file names across artifacts
+        run: |
+          set -euo pipefail
+          # only the release files: check-report.txt, built_with.json and apt-versions.txt exist once per family by design
+          dup="$(find dl -type f -name 'shura-cpp-*' | xargs -n1 basename | sort | uniq -d)"
+          [ -z "$dup" ] || { echo "duplicate file names in dl/:"; echo "$dup"; exit 1; }
+
+      - name: Manifest and sums
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp dl/*/shura-cpp-*.tar.gz dl/*/shura-cpp-*.tar.gz.sha256 release/
+          cat release/*.sha256 > release/SHA256SUMS
+          tag="${GITHUB_REF_NAME}"
+          # the url base inside the manifest is the release download path of this tag; fragments were written with the default base, rewrite it
+          for f in dl/*/*.manifest.json; do
+            python3 -B - "$f" "https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}" <<'PY'
+          import json, sys
+          p, base = sys.argv[1], sys.argv[2]
+          e = json.load(open(p))
+          for a in e["assets"]:
+              a["url"] = base + "/" + a["name"]
+          json.dump(e, open(p, "w"), indent=2)
+          PY
+          done
+          python3 -B scripts/shura-release/manifest.py merge dl/*/*.manifest.json --out release/release-manifest.json
+          python3 -B scripts/shura-release/manifest.py check release/release-manifest.json --dir release
+          (cd release && sha256sum -c SHA256SUMS)
+          # nothing else may reach the draft, and every entry must be built from this run's commit
+          python3 -B - "${GITHUB_SHA}" <<'PY'
+          import json, os, sys
+          sha = sys.argv[1]
+          m = json.load(open("release/release-manifest.json"))
+          want = {a["name"] for r in m["releases"] for a in r["assets"]} | {a["name"] + ".sha256" for r in m["releases"] for a in r["assets"]}
+          want |= {"SHA256SUMS", "release-manifest.json"}
+          extra = sorted(set(os.listdir("release")) - want)
+          assert not extra, f"files outside the manifest: {extra}"
+          for r in m["releases"]:
+              assert r["built_with"]["commit"] == sha, f"{r['id']} built from {r['built_with']['commit']}, run is {sha}"
+          print("draft contents and commit OK")
+          PY
+
+      - name: Create DRAFT release (never published here)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" release/* --repo "${GITHUB_REPOSITORY}" --draft --verify-tag \
+            --title "shura.cpp ${GITHUB_REF_NAME#shura-v} (draft)" \
+            --notes "Draft. Archives, SHA256SUMS and release-manifest.json were built by workflow run ${GITHUB_RUN_ID}. Read check-report.txt in the run artifacts, then publish by hand."

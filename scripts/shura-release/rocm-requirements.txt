@@ -1,0 +1,3 @@
+# pip --require-hashes file for the HIP build. Every line needs "--hash=sha256:..." for every file of the package (wheel list from the index).
+# Left unfilled on purpose: the workflow checks for PIN_ME and stops. Fill with: pip download/hash on a machine with network.
+rocm==7.2.4 --hash=sha256:PIN_ME
