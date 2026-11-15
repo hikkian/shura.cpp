@@ -117,6 +117,15 @@ def check(manifest, directory=None):
                     bad.append(f"{w}: bad runtime entry {k}={v!r} for {fam}")
             if fam in ("HIP", "CUDA") and not rt:
                 bad.append(f"{w}: {fam} needs at least one runtime min or max")
+            if fam == "HIP":
+                # the installer takes a range with both ends only, and the ends must be the major the build was made for
+                if "rocm_min" not in rt or "rocm_max" not in rt:
+                    bad.append(f"{w}: HIP needs both rocm_min and rocm_max (the installer refuses a range with one end)")
+                else:
+                    built_major = (r.get("built_with") or {}).get("runtime", {}).get("rocm_major")
+                    lo = vkey(rt["rocm_min"])
+                    if built_major is not None and lo is not None and lo[0] != built_major:
+                        bad.append(f"{w}: rocm_min {rt['rocm_min']} is major {lo[0]}, the build was made with major {built_major}")
         if vkey(r["glibc_min"]) is None:
             bad.append(f"{w}: bad glibc_min {r['glibc_min']!r}")
         elif vkey(r["glibc_min"]) > GLIBC_CEILING:

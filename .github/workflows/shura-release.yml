@@ -4,7 +4,7 @@
 #    The workflow never publishes: a human presses "Publish" after reading the draft.
 # Rules: default permission is contents: read; contents: write only in the job that creates the draft; no secrets (only the automatic
 # github.token); third-party actions pinned by commit SHA; sources are fetched with plain git (no checkout action); the UI is not built
-# (no npm, no Hugging Face fetch); toolchain downloads are pinned by digest / hash (the guard job checks the CUDA image digest; ci-build.sh checks the ROCm wheel hashes).
+# (no npm, no Hugging Face fetch); toolchain images are pinned by digest (the guard job checks the CUDA and ROCm image digests).
 name: shura-release
 
 on:
@@ -46,17 +46,19 @@ jobs:
           git fetch --depth=1 origin "${GITHUB_SHA}"
           git checkout -q --detach FETCH_HEAD
 
-      - name: Check pins (CUDA image digest)
+      - name: Check pins (CUDA and ROCm image digests)
         run: bash scripts/shura-release/check-pins.sh
 
   build:
     name: build (${{ matrix.family }})
     runs-on: ubuntu-22.04          # glibc 2.35 is the floor (glibc_min in the manifest comes from the build host)
     timeout-minutes: 240
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
-        family: [hip, vulkan, cpu]
+        family: [vulkan, cpu]
     steps:
       - name: Fetch source (plain git, read-only token)
         env:
@@ -104,6 +106,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 240
     needs: [guard]
+    permissions:
+      contents: read
     container:
       # the only place of the image pin (the container key cannot read env); scripts/shura-release/check-pins.sh checks this line in the guard job
       image: nvidia/cuda:12.8.1-devel-ubuntu22.04@sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97
@@ -155,10 +159,92 @@ jobs:
             out/cuda/apt-versions.txt
           if-no-files-found: error
 
+  build-hip:
+    name: build (hip)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    needs: [guard]
+    permissions:
+      contents: read
+    container:
+      # ROCm 7.2.1 build image (the same image as the fork's shura.yml hip job); the digest is checked by scripts/shura-release/check-pins.sh
+      image: rocm/dev-ubuntu-22.04:7.2.1@sha256:42851dac319afce41cf993e25f95005b7f2cd0a0f6abd32ad8f25cd876ec56df
+    steps:
+      - name: Install git
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - name: Fetch source (plain git, read-only token)
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}"
+          auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          # the header goes through the environment, never through the command line
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout -q --detach FETCH_HEAD
+
+      - name: Version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#shura-v}"; else v="${INPUT_VERSION}"; fi
+          [[ "$v" =~ ^[0-9][0-9A-Za-z.+~]*$ ]] || { echo "bad version '$v'"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build, test, package, check
+        shell: bash
+        run: scripts/shura-release/ci-build.sh hip "${{ steps.ver.outputs.version }}"
+
+      - name: Upload archive, sum and manifest part
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: shura-release-hip
+          path: |
+            out/hip/shura-cpp-*.tar.gz
+            out/hip/shura-cpp-*.tar.gz.sha256
+            out/hip/shura-cpp-*.tar.gz.manifest.json
+            out/hip/check-report.txt
+            out/hip/built_with.json
+            out/hip/apt-versions.txt
+          if-no-files-found: error
+
+
+  attest:
+    name: build provenance
+    if: ${{ startsWith(github.ref, 'refs/tags/shura-v') }}
+    needs: [build, build-hip, build-cuda]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write          # the only job with OIDC rights: it signs the archives it downloads (no secret)
+      attestations: write
+    steps:
+      - name: Download all family artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: shura-release-*
+          path: dl
+          merge-multiple: false
+
+      - name: Build provenance (GitHub-signed attestation, no secret)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "dl/shura-release-*/shura-cpp-*.tar.gz"
+
   draft-release:
     name: draft release
     if: ${{ startsWith(github.ref, 'refs/tags/shura-v') }}
-    needs: [build, build-cuda]
+    needs: [build, build-hip, build-cuda, attest]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:

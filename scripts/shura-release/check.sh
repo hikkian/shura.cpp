@@ -101,7 +101,8 @@ if [ "$fam" = cpu ]; then
     spid=$!
     up=0; for _ in $(seq 1 60); do sleep 1; if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then up=1; break; fi; kill -0 "$spid" 2>/dev/null || break; done
     if [ "$up" = 1 ]; then
-      if curl -sf "http://127.0.0.1:$PORT/completion" -d '{"prompt":"Hello","n_predict":4}' | grep -q '"content"'; then ok "self-test: tiny model answered"; else bad "self-test: no completion"; fi
+      reply="$(curl -sf "http://127.0.0.1:$PORT/completion" -d '{"prompt":"Once upon a time","n_predict":8,"temperature":0}' || true)"
+      if printf '%s' "$reply" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("content","").strip() else 1)' 2>/dev/null; then ok "self-test: tiny model answered with text"; else bad "self-test: no text in the completion"; fi
     else bad "self-test: server did not come up: $(tail -n3 "$WORK/server.log" | tr '\n' ' ' | head -c 300)"; fi
     kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
   else

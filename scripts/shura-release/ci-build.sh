@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ci-build.sh <family> <version>   - the whole job body of one family in the release workflow: deps, build, tests, package, check.
-# Runs on a clean Ubuntu 22.04 runner or in the pinned CUDA container (as root). Env: OUT_DIR (default /dev/shm/RELBIN1/out/<family> if
-# /dev/shm exists, else $PWD/out/<family>), SHURA_TINY_MODEL (optional). Uses the network only for apt and, for HIP, pip with --require-hashes.
+# Runs on a clean Ubuntu 22.04 runner, or in the pinned CUDA / ROCm container (as root). Env: OUT_DIR (default $SRC/out/<family>),
+# SHURA_TINY_MODEL (optional). Uses the network only for apt; the ROCm toolchain comes from the pinned ROCm image (/opt/rocm).
 set -euo pipefail
 fam="${1:?family}"; version="${2:?version}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,30 +10,21 @@ OUT_DIR="${OUT_DIR:-$SRC/out/$fam}"
 mkdir -p "$OUT_DIR"
 SUDO=""; [ "$(id -u)" = 0 ] || SUDO="sudo"
 
-# a value left as PIN_ME means the pin was never filled in: refuse instead of building from an unpinned source
-if grep -rn 'PIN_ME' "$here/rocm-requirements.txt" >/dev/null 2>&1 && [ "$fam" = hip ]; then
-  echo "rocm-requirements.txt still has PIN_ME: fill the wheel hashes first" >&2; exit 1
-fi
-
 export DEBIAN_FRONTEND=noninteractive
 $SUDO apt-get update -qq
 common=(build-essential cmake ninja-build git python3 python3-venv ca-certificates curl)
 pkgs=("${common[@]}")
 [ "$fam" = vulkan ] && pkgs+=(libvulkan-dev glslc spirv-headers)
+[ "$fam" = hip ] && pkgs+=(rocblas-dev hipblas-dev)      # the same packages as the fork's shura.yml hip job
 $SUDO apt-get install -y --no-install-recommends "${pkgs[@]}"
 dpkg-query -W -f='${Package}=${Version}\n' "${pkgs[@]}" > "$OUT_DIR/apt-versions.txt" || true
 
 extra_libs=()
 if [ "$fam" = hip ]; then
-  python3 -m venv "$SRC/.venv-rocm"
-  # shellcheck disable=SC1091
-  . "$SRC/.venv-rocm/bin/activate"
-  # every wheel by hash; the index is AMD's, hashes make it safe
-  python -m pip install --require-hashes -r "$here/rocm-requirements.txt" \
-    --index-url "${ROCM_INDEX_URL:-https://stable.repo.amd.com/rocm/whl-next/}"
-  ROCM_PATH="$(rocm-sdk path --root)"; export ROCM_PATH HIP_PATH="$ROCM_PATH"
-  CMAKE_PREFIX_PATH="$(rocm-sdk path --cmake)"; export CMAKE_PREFIX_PATH
-  PATH="$(rocm-sdk path --bin):$PATH"; export PATH
+  # the ROCm toolchain is the one in the pinned image (rocm/dev-ubuntu-22.04:7.2.1); no wheels are downloaded
+  [ -x /opt/rocm/bin/hipconfig ] || { echo "no /opt/rocm in this image: the hip job must run in the pinned ROCm container" >&2; exit 1; }
+  ROCM_PATH=/opt/rocm; export ROCM_PATH HIP_PATH="$ROCM_PATH" CMAKE_PREFIX_PATH="$ROCM_PATH"
+  PATH="$ROCM_PATH/bin:$PATH"; export PATH
   export LD_LIBRARY_PATH="$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}"
 fi
 if [ "$fam" = cuda ]; then
@@ -70,12 +61,14 @@ if [ "$fam" = hip ]; then
   # the ROCm runtime major is read from the build, not assumed: the soname libggml-hip.so needs
   soname="$(readelf -d "$SRC/build-hip/bin/libggml-hip.so" | sed -n 's/.*NEEDED.*\[\(libamdhip64\.so\.[0-9][0-9]*\)\].*/\1/p' | head -n1)"
   [ -n "$soname" ] || { echo "libggml-hip.so has no NEEDED libamdhip64.so.N" >&2; exit 1; }
-  python3 -B - "$OUT_DIR/built_with.json" "$soname" <<'PY'
+  image_version="$(cat "$ROCM_PATH/.info/version")"
+  [ "$image_version" = "7.2.1" ] || { echo "ROCm in the image is '$image_version', the pin is 7.2.1" >&2; exit 1; }
+  python3 -B - "$OUT_DIR/built_with.json" "$soname" "$image_version" <<'PY'
 import json, sys
-path, soname = sys.argv[1], sys.argv[2]
+path, soname, image_version = sys.argv[1], sys.argv[2], sys.argv[3]
 bw = json.load(open(path))
 rt = bw.get("runtime") if isinstance(bw.get("runtime"), dict) else {}
-rt.update({"rocm_soname": soname, "rocm_major": int(soname.rsplit(".", 1)[1])})
+rt.update({"rocm_soname": soname, "rocm_major": int(soname.rsplit(".", 1)[1]), "rocm_image_version": image_version})
 bw["runtime"] = rt
 json.dump(bw, open(path, "w"), indent=2)
 PY
@@ -88,6 +81,16 @@ fi
 
 python3 -B "$here/package.py" --family "$fam" --version "$version" --bin-dir "$SRC/build-$fam/bin" --src "$SRC" \
   --built-with "$OUT_DIR/built_with.json" --out-dir "$OUT_DIR" --cpu-isa "$cpu_isa" "${extra_libs[@]}"
+
+# the CPU job downloads the pinned tiny model (smoke-model.env) and checks it before the self-test in check.sh
+if [ "$fam" = cpu ]; then
+  # shellcheck disable=SC1091
+  . "$here/smoke-model.env"
+  mdir="$SRC/smoke-model"; mkdir -p "$mdir"
+  curl -fsSL --proto '=https' --tlsv1.2 -A "shura-release-ci/1.0" -o "$mdir/$SMOKE_MODEL_NAME" "$SMOKE_MODEL_URL"
+  echo "$SMOKE_MODEL_SHA256  $mdir/$SMOKE_MODEL_NAME" | sha256sum -c --status || { echo "smoke model checksum does not match the pin" >&2; exit 1; }
+  export SHURA_TINY_MODEL="$mdir/$SMOKE_MODEL_NAME"
+fi
 
 archive="$OUT_DIR/shura-cpp-$version-$fam-linux-x86_64.tar.gz"
 "$here/check.sh" "$fam" "$archive" "$OUT_DIR/check-report.txt" || { cat "$OUT_DIR/check-report.txt"; exit 1; }
