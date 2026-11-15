@@ -5024,6 +5024,16 @@ private:
                     err = "Compute error.";
                 }
 
+                if (ret < -1 && vram && llama_kv_vmm_take_grow_failure() && vram->request_pause("kv_grow_no_memory", "")) {
+                    // SHURA (PERF262): the virtual-memory KV could not map its next step even after the expert cache shrank (the
+                    // desktop holds the card): pause like a governor pause (the slot is saved, the gateway resumes it later) instead
+                    // of failing the request. llama_decode already removed the failed ubatch from the memory.
+                    rewind_for_pause(off);
+                    vram->note_pause_cut();
+                    pause_cut_ = true;
+                    SRV_WRN("the KV cache could not grow (no device memory): pausing, the rest of the batch from off = %d is rolled back\n", off);
+                    return false;
+                }
                 if (ret == 2 && vram && vram->pause_pending()) {
                     // VRAMLOGIC3: the governor asked for a pause while a prompt slice ran. Do not retry: roll back the rest of the
                     // batch (memory and the slots' token lists, which already hold its tokens), leave update_slots, and let the
