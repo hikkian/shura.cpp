@@ -518,6 +518,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         GGML_ASSERT(pool_size == 0);
     }
 
+
     void clear_pool() {
         ggml_cuda_set_device(device);
         for (int i = 0; i < MAX_BUFFERS; ++i) {
@@ -1312,6 +1313,264 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
     /* .get_alloc_size_n    = */ NULL,
     /* .is_host             = */ NULL,
 };
+
+#if defined(GGML_USE_HIP)
+// SHURA (PERF262): a growable KV buffer on virtual memory. The whole size is reserved as addresses only; physical memory is mapped in
+// granules when the KV cache asks for a prefix of its tensors (ggml_backend_cuda_vmm_buffer_set_prefix), so a 262k context costs only
+// what the conversation holds, and the rest of the card stays with the expert cache. Tensor addresses never move: no copy, no graph
+// rebuild. New granules are zeroed (an unused cell of V must not be NaN: softmax weight 0 times NaN is NaN).
+struct ggml_backend_cuda_vmm_kv_context : public ggml_backend_cuda_buffer_context {
+    size_t reserved = 0;
+    size_t gran     = 0;
+    std::vector<hipMemGenericAllocationHandle_t> handles;   // one per granule, null while unmapped
+    std::atomic<size_t> n_mapped{0};   // read by the VRAM governor thread through the memory breakdown
+    std::vector<void *> retired;       // address ranges left by a rebase: kept reserved (address space only) so that a later
+                                       // rebase never gets one back (re-mapping used addresses lost writes in a HIP test)
+
+    ggml_backend_cuda_vmm_kv_context(int device, void * base, size_t reserved, size_t gran) :
+        ggml_backend_cuda_buffer_context(device, base), reserved(reserved), gran(gran), handles(reserved / gran, nullptr) {}
+
+    ~ggml_backend_cuda_vmm_kv_context() {
+        ggml_cuda_set_device(device);
+        (void) hipDeviceSynchronize();
+        for (size_t p = 0; p < handles.size(); ++p) {
+            if (handles[p] != nullptr) {
+                (void) hipMemUnmap((char *) dev_ptr + p*gran, gran);
+                (void) hipMemRelease(handles[p]);
+            }
+        }
+        (void) hipMemAddressFree(dev_ptr, reserved);
+        for (void * r : retired) {
+            (void) hipMemAddressFree(r, reserved);
+        }
+        dev_ptr = nullptr;   // the base destructor must not cudaFree an address reservation
+    }
+
+    bool map(size_t p) {
+        hipMemAllocationProp prop = {};
+        prop.type          = hipMemAllocationTypePinned;
+        prop.location.type = hipMemLocationTypeDevice;
+        prop.location.id   = device;
+        hipMemGenericAllocationHandle_t h = nullptr;
+        if (hipMemCreate(&h, gran, &prop, 0) != hipSuccess) {
+            (void) hipGetLastError();
+            return false;
+        }
+        char * va = (char *) dev_ptr + p*gran;
+        hipMemAccessDesc acc = {};
+        acc.location = prop.location;
+        acc.flags    = hipMemAccessFlagsProtReadWrite;
+        if (hipMemMap(va, gran, 0, h, 0) != hipSuccess || hipMemSetAccess(va, gran, &acc, 1) != hipSuccess) {
+            (void) hipGetLastError();
+            (void) hipMemUnmap(va, gran);
+            (void) hipMemRelease(h);
+            return false;
+        }
+        if (cudaMemsetAsync(va, 0, gran, cudaStreamPerThread) != cudaSuccess) {
+            (void) cudaGetLastError();
+            (void) hipMemUnmap(va, gran);
+            (void) hipMemRelease(h);
+            return false;
+        }
+        handles[p] = h;
+        n_mapped++;
+        return true;
+    }
+
+    void unmap(size_t p) {
+        CUDA_CHECK(hipMemUnmap((char *) dev_ptr + p*gran, gran));
+        CUDA_CHECK(hipMemRelease(handles[p]));
+        handles[p] = nullptr;
+        n_mapped--;
+    }
+};
+
+static void ggml_backend_cuda_vmm_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    delete (ggml_backend_cuda_vmm_kv_context *) buffer->context;
+}
+
+static enum ggml_status ggml_backend_cuda_vmm_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(tensor);
+    return GGML_STATUS_SUCCESS;   // nothing is mapped yet; mapped granules start zeroed (the padding included)
+}
+
+static void ggml_backend_cuda_vmm_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto * ctx = (ggml_backend_cuda_vmm_kv_context *) buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    for (size_t p = 0; p < ctx->handles.size(); ++p) {
+        if (ctx->handles[p] != nullptr) {
+            CUDA_CHECK(cudaMemsetAsync((char *) ctx->dev_ptr + p*ctx->gran, value, ctx->gran, cudaStreamPerThread));
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
+static const ggml_backend_buffer_i ggml_backend_cuda_vmm_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_cuda_vmm_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cuda_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_cuda_vmm_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_cuda_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cuda_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cuda_buffer_get_tensor,
+    /* .set_tensor_2d   = */ ggml_backend_cuda_buffer_set_tensor_2d,
+    /* .get_tensor_2d   = */ ggml_backend_cuda_buffer_get_tensor_2d,
+    /* .cpy_tensor      = */ ggml_backend_cuda_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cuda_vmm_buffer_clear,
+    /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ ggml_backend_cuda_buffer_set_tensor_n,
+    /* .get_tensor_n    = */ ggml_backend_cuda_buffer_get_tensor_n,
+    /* .cpy_tensor_n    = */ ggml_backend_cuda_buffer_cpy_tensor_n,
+};
+
+static ggml_backend_buffer_t ggml_backend_cuda_vmm_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    ggml_cuda_set_device(buft_ctx->device);
+    hipMemAllocationProp prop = {};
+    prop.type          = hipMemAllocationTypePinned;
+    prop.location.type = hipMemLocationTypeDevice;
+    prop.location.id   = buft_ctx->device;
+    size_t gran = 0;
+    if (hipMemGetAllocationGranularity(&gran, &prop, hipMemAllocationGranularityRecommended) != hipSuccess || gran == 0) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    const size_t reserved = GGML_PAD(std::max<size_t>(size, 1), gran);
+    void * base = nullptr;
+    if (hipMemAddressReserve(&base, reserved, 0, nullptr, 0) != hipSuccess) {
+        (void) hipGetLastError();
+        GGML_LOG_ERROR("%s: reserving %.2f MiB of addresses on device %d failed\n", __func__, reserved/1024.0/1024.0, buft_ctx->device);
+        return nullptr;
+    }
+    auto * ctx = new ggml_backend_cuda_vmm_kv_context(buft_ctx->device, base, reserved, gran);
+    GGML_LOG_INFO("%s: KV on virtual memory: %.2f MiB of addresses, granule %zu KiB, mapped as the context grows\n",
+                  __func__, reserved/1024.0/1024.0, gran >> 10);
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_vmm_buffer_interface, ctx, size);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_vmm_buffer_type_interface = {
+    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,   // the same name: the scheduler treats it as this device's memory
+    /* .alloc_buffer        = */ ggml_backend_cuda_vmm_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ NULL,
+    /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
+    /* .get_max_size        = */ NULL,
+    /* .get_alloc_size      = */ ggml_backend_cuda_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ NULL,
+};
+
+// the VMM buffer type of a device, or nullptr when the device has no virtual memory management
+static ggml_backend_buffer_type_t ggml_backend_cuda_vmm_buffer_type_of(int device);
+static ggml_backend_buffer_type_t ggml_backend_cuda_vmm_buffer_type(ggml_backend_dev_t dev);
+static ggml_backend_buffer_type_t ggml_backend_cuda_vmm_buffer_type_of(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    static std::vector<ggml_backend_buffer_type> bufts;
+    static std::vector<std::unique_ptr<ggml_backend_cuda_buffer_type_context>> ctxs;
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+    int vmm = 0;
+    if (hipDeviceGetAttribute(&vmm, hipDeviceAttributeVirtualMemoryManagementSupported, device) != hipSuccess || !vmm) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    if (bufts.empty()) {
+        bufts.resize(ggml_backend_cuda_get_device_count());
+        ctxs.resize(ggml_backend_cuda_get_device_count());
+    }
+    if (!ctxs[device]) {
+        ctxs[device].reset(new ggml_backend_cuda_buffer_type_context{device, GGML_CUDA_NAME + std::to_string(device)});
+        bufts[device] = { ggml_backend_cuda_vmm_buffer_type_interface, ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device), ctxs[device].get() };
+    }
+    return &bufts[device];
+}
+
+// Map the granules that hold the first prefix_bytes[i] of each tensor (all in this buffer); with shrink, unmap the granules no tensor
+// prefix needs any more (the device is synchronized first: a finished graph may still be running). Returns false when the card has no
+// memory for a granule (the mapped part stays usable).
+static bool ggml_backend_cuda_vmm_buffer_set_prefix(ggml_backend_buffer_t buffer, ggml_tensor ** tensors, const size_t * prefix_bytes,
+                                                    int n, bool shrink) {
+    if (buffer == nullptr || buffer->iface.free_buffer != ggml_backend_cuda_vmm_buffer_free_buffer) {
+        return true;   // not a VMM buffer: everything is mapped
+    }
+    auto * ctx = (ggml_backend_cuda_vmm_kv_context *) buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    std::vector<uint8_t> need(ctx->handles.size(), 0);
+    for (int i = 0; i < n; ++i) {
+        const size_t off = (const char *) tensors[i]->data - (const char *) ctx->dev_ptr;
+        const size_t end = std::min(off + std::min(prefix_bytes[i], ggml_backend_buffer_get_alloc_size(buffer, tensors[i])), ctx->reserved);
+        if (end <= off) {
+            continue;
+        }
+        for (size_t p = off / ctx->gran; p <= (end - 1) / ctx->gran; ++p) {
+            need[p] = 1;
+        }
+    }
+    bool ok = true;
+    for (size_t p = 0; p < need.size(); ++p) {
+        if (need[p] && ctx->handles[p] == nullptr && !ctx->map(p)) {
+            ok = false;
+            break;
+        }
+    }
+    if (shrink) {
+        bool any = false;
+        for (size_t p = 0; p < need.size(); ++p) {
+            any = any || (!need[p] && ctx->handles[p] != nullptr);
+        }
+        if (any) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            for (size_t p = 0; p < need.size(); ++p) {
+                if (!need[p] && ctx->handles[p] != nullptr) {
+                    ctx->unmap(p);
+                }
+            }
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));   // the zeroing of new granules is done before any graph reads them
+    return ok;
+}
+
+// Move an emptied VMM buffer to a fresh address range: reserve the new range first (so it cannot be the old one), then unmap and free
+// all of the old one. Mapping new memory at addresses kernels used before lost writes in a HIP test on gfx1101 (vmm_test.hip), a fresh
+// range did not (vmm_fresh.hip). The caller moves its tensor pointers by (new - old) and maps what it needs again. Returns the new
+// base, or nullptr (then nothing changed).
+static void * ggml_backend_cuda_vmm_buffer_rebase(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || buffer->iface.free_buffer != ggml_backend_cuda_vmm_buffer_free_buffer) {
+        return nullptr;
+    }
+    auto * ctx = (ggml_backend_cuda_vmm_kv_context *) buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    void * base = nullptr;
+    if (hipMemAddressReserve(&base, ctx->reserved, 0, nullptr, 0) != hipSuccess) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (size_t p = 0; p < ctx->handles.size(); ++p) {
+        if (ctx->handles[p] != nullptr) {
+            ctx->unmap(p);
+        }
+    }
+    ctx->retired.push_back(ctx->dev_ptr);   // not freed: see `retired`
+    if (ctx->retired.size() > 256) {        // bound the address space (256 x the KV size); the oldest is the least likely reuse
+        (void) hipMemAddressFree(ctx->retired.front(), ctx->reserved);
+        ctx->retired.erase(ctx->retired.begin());
+    }
+    ctx->dev_ptr = base;
+    return base;
+}
+
+static size_t ggml_backend_cuda_vmm_buffer_mapped_size(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || buffer->iface.free_buffer != ggml_backend_cuda_vmm_buffer_free_buffer) {
+        return buffer ? ggml_backend_buffer_get_size(buffer) : 0;
+    }
+    auto * ctx = (ggml_backend_cuda_vmm_kv_context *) buffer->context;
+    return ctx->n_mapped * ctx->gran;
+}
+#endif // defined(GGML_USE_HIP)
+
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     static std::mutex mutex;
@@ -6994,6 +7253,15 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#if defined(GGML_USE_HIP)
+static ggml_backend_buffer_type_t ggml_backend_cuda_vmm_buffer_type(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->reg != ggml_backend_cuda_reg()) {
+        return nullptr;
+    }
+    return ggml_backend_cuda_vmm_buffer_type_of(((ggml_backend_cuda_device_context *) dev->context)->device);
+}
+#endif // defined(GGML_USE_HIP)
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -7029,6 +7297,20 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_pool_freeze") == 0) {
         return (void *)ggml_backend_cuda_pool_freeze;
     }
+#if defined(GGML_USE_HIP)
+    if (strcmp(name, "ggml_backend_cuda_vmm_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_cuda_vmm_buffer_set_prefix") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_set_prefix;
+    }
+    if (strcmp(name, "ggml_backend_cuda_vmm_buffer_rebase") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_rebase;
+    }
+    if (strcmp(name, "ggml_backend_cuda_vmm_buffer_mapped_size") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_mapped_size;
+    }
+#endif // defined(GGML_USE_HIP)
     if (strcmp(name, "ggml_backend_cuda_pool_stats") == 0) {
         return (void *)ggml_backend_cuda_pool_stats;
     }
