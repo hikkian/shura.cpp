@@ -70,6 +70,23 @@ class ReleaseCiFixes(unittest.TestCase):
             self.assertRegex(block, r"    defaults:\n      run:\n        shell: bash\n", job)
             self.assertLess(block.index("defaults:"), block.index("    steps:"), job)
 
+    def test_ci_build_check_work_on_disk(self):
+        text = CI.read_text(encoding="utf-8")
+        self.assertIn('WORK="$SRC/check-work"', text)
+        self.assertLess(text.index('WORK="$SRC/check-work"'), text.index('"$here/check.sh"'))
+
+    def test_ci_build_removes_build_dir_after_package(self):
+        text = CI.read_text(encoding="utf-8")
+        self.assertIn('rm -rf "$BUILD_DIR"', text)
+        i = text.index('rm -rf "$BUILD_DIR"')
+        self.assertGreater(i, text.index("package.py"))
+        self.assertLess(i, text.index('"$here/check.sh"'))
+
+    def test_ci_build_cleans_apt(self):
+        text = CI.read_text(encoding="utf-8")
+        self.assertIn("apt-get clean", text)
+        self.assertIn("rm -rf /var/lib/apt/lists/*", text)
+
     def test_touchpoints_has_tomli_fallback(self):
         text = TOUCH.read_text(encoding="utf-8")
         self.assertIn("tomllib", text)

@@ -17,6 +17,8 @@ pkgs=("${common[@]}")
 [ "$fam" = vulkan ] && pkgs+=(libvulkan1 spirv-headers)
 [ "$fam" = hip ] && pkgs+=(rocblas-dev hipblas-dev)      # the same packages as the fork's shura.yml hip job
 $SUDO apt-get install -y --no-install-recommends "${pkgs[@]}"
+$SUDO apt-get clean
+$SUDO rm -rf /var/lib/apt/lists/*
 dpkg-query -W -f='${Package}=${Version}\n' "${pkgs[@]}" > "$OUT_DIR/apt-versions.txt" || true
 
 extra_libs=()
@@ -53,7 +55,8 @@ if [ "$fam" = vulkan ]; then
   glslc --version >/dev/null || { echo "glslc from the Vulkan SDK does not run" >&2; exit 1; }
 fi
 
-BUILD_DIR="$SRC/build-$fam" OUT="$OUT_DIR" "$here/build.sh" "$fam"
+BUILD_DIR="$SRC/build-$fam"
+BUILD_DIR="$BUILD_DIR" OUT="$OUT_DIR" "$here/build.sh" "$fam"
 
 if [ "$fam" = cpu ]; then
   # our GPU-free tests are built once, in the CPU job only (the release build itself has LLAMA_BUILD_TESTS=OFF)
@@ -112,6 +115,9 @@ fi
 python3 -B "$here/package.py" --family "$fam" --version "$version" --bin-dir "$SRC/build-$fam/bin" --src "$SRC" \
   --built-with "$OUT_DIR/built_with.json" --out-dir "$OUT_DIR" --cpu-isa "$cpu_isa" "${extra_libs[@]}"
 
+# the package is ready: free the disk (the build tree is large, the runner is small); built_with and cpu_isa were read above
+rm -rf "$BUILD_DIR"
+
 # the CPU job downloads the pinned tiny model (smoke-model.env) and checks it before the self-test in check.sh
 if [ "$fam" = cpu ]; then
   # shellcheck disable=SC1091
@@ -123,5 +129,9 @@ if [ "$fam" = cpu ]; then
 fi
 
 archive="$OUT_DIR/shura-cpp-$version-$fam-linux-x86_64.tar.gz"
+# the check unpacks on the disk of the work folder (the /dev/shm of a container job is only 64 MB)
+WORK="$SRC/check-work"; export WORK
+# temporary folders are removed on any exit (the exit code stays as it was)
+trap 'rm -rf "$SRC/check-work" "$SRC/build-tests" "$SRC/smoke-model" "$SRC/vulkan-sdk"' EXIT
 "$here/check.sh" "$fam" "$archive" "$OUT_DIR/check-report.txt" || { cat "$OUT_DIR/check-report.txt"; exit 1; }
 cat "$OUT_DIR/check-report.txt"
