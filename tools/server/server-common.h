@@ -421,6 +421,7 @@ json format_response_rerank(
 
 // shared between server_slot and server_task_result_*
 struct server_slot_stats {
+    json patch; // SHURA (PATCH1): the active card set and the exposure of its replaced experts, null without cards
     uint64_t n_prompt_cached    = 0;
     uint64_t n_prompt_processed = 0;
     uint64_t n_gen              = 0;

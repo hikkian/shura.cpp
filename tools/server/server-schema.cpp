@@ -73,6 +73,28 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 
+    // SHURA (PATCH1): the card set (cards from --patch-dir, names joined by '+'); the gateway picks it once per conversation
+    add((new field_str("patch_set"))
+        ->set_desc("Expansion cards for this request: card names from --patch-dir joined by '+'; empty = the base model")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            if (data.contains("patch_set") && !data["patch_set"].is_string()) {
+                throw std::invalid_argument("patch_set must be a string");
+            }
+            const std::string v = json_value(data, "patch_set", std::string());
+            for (char c : v) {
+                if (!(isalnum((unsigned char) c) || c == '_' || c == '-' || c == '.' || c == '+')) {
+                    throw std::invalid_argument("patch_set: only letters, digits, '_', '-', '.' and '+' are allowed");
+                }
+            }
+            if (v.find("..") != std::string::npos) {
+                throw std::invalid_argument("patch_set: '..' is not allowed");
+            }
+            ctx.params.patch_set = v;
+        }));
+
+    add((new field_bool("patch_exposure", params.patch_exposure))
+        ->set_desc("Count how often the replaced experts of the active cards are selected (timings.patch.exposure); costs decode speed"));
+
     add((new field_num("t_max_predict_ms", params.t_max_predict_ms))
         ->set_hard_limits(-1, std::numeric_limits<int64_t>::max())
         ->set_desc("Set a time limit in milliseconds for the prediction phase. The timeout triggers if generation exceeds this time (measured since the first token) and a newline has been generated. Useful for FIM applications"));

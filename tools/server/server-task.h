@@ -97,6 +97,9 @@ struct task_params {
 
     std::map<int, float> lora; // mapping adapter ID -> scale
 
+    std::string patch_set; // SHURA (PATCH1): the card set of the request: card names joined by '+', "" = the base
+    bool patch_exposure = false; // SHURA (PATCH1): count how often the replaced experts are selected (costs decode speed)
+
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
 
@@ -203,6 +206,8 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        bool        has_patch_set = false;   // SHURA (PATCH1): a restore that names its card set switches to it first
+        std::string patch_set;
     };
     slot_action slot_action;
 
@@ -704,9 +709,13 @@ struct server_prompt {
     // a checkpoint does not change after it is created, so the prompt cache shares it with the slot instead of a copy
     std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 
+    // SHURA (PATCH1): the card set the state was computed with ("" = the base); a state is reused only under the same set
+    std::string patch_hash;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        // patch_hash stays: the slot keeps computing with the active set (launch_slot_with_task and the set switch set it)
     }
 
     int n_tokens() const {
@@ -717,6 +726,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            patch_hash,
         };
     }
 };
@@ -758,6 +768,9 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // SHURA (PATCH1): the active card set; load() takes only states computed with it
+    std::string active_patch_hash;
 
     size_t size() const;
 

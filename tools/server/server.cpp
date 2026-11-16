@@ -206,6 +206,9 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
             ctx_http.post("/vram/simulate",    ex_wrapper(routes.post_vram_simulate));
         }
     }
+    if (!params.patch_dir.empty()) {   // SHURA (PATCH1): the active card set; ?verify=1 (with --vram-test-hooks) checks every copy
+        ctx_http.get ("/patch",               ex_wrapper(routes.get_patch));
+    }
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));

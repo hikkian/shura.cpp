@@ -1774,6 +1774,37 @@ extern "C" {
     LLAMA_API void   llama_moe_cache_test_fail_allocs(struct llama_context * ctx, int32_t n);
     LLAMA_API bool   llama_moe_cache_self_check(struct llama_context * ctx, bool contents, char * why, size_t why_size);
 
+    // SHURA (PATCH1): expansion cards as patches (src/llama-patch.h). A card is a GGUF file with slices of the base's tensors in the
+    // base's format. Everything is checked before the first byte is written; a failed call leaves the model as it was.
+    struct llama_patch;
+    // reads and checks a card against the model; base_path is the model's file (the original bytes are read from it and hashed)
+    LLAMA_API struct llama_patch * llama_patch_load(const struct llama_model * model, const char * base_path, const char * pack_path,
+                                                    char * err, size_t err_size);
+    LLAMA_API void         llama_patch_free(struct llama_patch * patch);
+    LLAMA_API const char * llama_patch_name(const struct llama_patch * patch);
+    LLAMA_API const char * llama_patch_content_hash(const struct llama_patch * patch);
+    LLAMA_API const char * llama_patch_manifest(const struct llama_patch * patch);
+    LLAMA_API int32_t      llama_patch_n_slices(const struct llama_patch * patch);
+    // makes the given ordered set active (n = 0: the base). Only between requests: the caller guarantees that no context of the
+    // model is decoding (contexts without a resizable expert cache do not take the micro-batch lock while they decode).
+    // Takes the micro-batch lock of every context of the model, writes host and device tensors, re-reads the replaced experts in
+    // every expert cache. Slices of the previous set that the new one does not replace get the base bytes back (hash-checked).
+    // Two cards of a set may not replace the same slice. The packs must stay alive while they are active.
+    LLAMA_API bool         llama_model_patch_set(struct llama_model * model, struct llama_patch ** packs, int32_t n, char * err, size_t err_size);
+    // sha256 of the active set (the content hashes in order), "" for the base; the name: card names joined by '+'
+    LLAMA_API const char * llama_model_patch_set_hash(const struct llama_model * model);
+    LLAMA_API const char * llama_model_patch_set_name(const struct llama_model * model);
+    // tests and telemetry: every slice of the active set equals the card and every other slice any card ever touched equals the base
+    // (hashes of the bytes read back from each tensor), and (check_caches) the expert cache self check with contents in every context
+    LLAMA_API bool         llama_model_patch_verify(struct llama_model * model, bool check_caches, char * err, size_t err_size);
+    // exposure of sequence seq since its last reset: fills up to cap (block, expert, count) triples of replaced experts with count > 0,
+    // returns the number of such experts (may be > cap). Synchronizes the context.
+    LLAMA_API int32_t      llama_patch_exposure(struct llama_context * ctx, llama_seq_id seq, int32_t * il, int32_t * e, uint64_t * count, int32_t cap);
+    LLAMA_API void         llama_patch_exposure_reset(struct llama_context * ctx, llama_seq_id seq);
+    // exposure is counted only while enabled (off by default): it reads the router output of every layer with replaced experts
+    // after every ubatch, which costs decode speed (PATCH1: ~7 % on Tiel with 512 replaced experts in 40 layers)
+    LLAMA_API void         llama_patch_exposure_enable(struct llama_context * ctx, bool on);
+
 #ifdef __cplusplus
 }
 #endif

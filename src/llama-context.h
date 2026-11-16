@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-patch.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -16,6 +17,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -225,6 +227,14 @@ struct llama_context {
     bool   moe_cache_resize_pending() const;        // a resize waits for the lock (an abort callback may stop a long micro-batch)
     bool   moe_cache_invalidate(int32_t il, int32_t e);
     bool   moe_cache_self_check(bool contents, std::string & why);
+
+    // SHURA (PATCH1): cards over the weights (src/llama-patch.cpp). patch_lock takes the micro-batch lock and drains every backend
+    // queue; patch_changed (under that lock) makes every expert cache read the changed experts again. Exposure: see llama.h.
+    std::unique_lock<std::recursive_mutex> patch_lock();
+    void   patch_changed(const std::set<std::pair<int32_t, int32_t>> & changed);
+    int32_t patch_exposure(llama_seq_id seq, int32_t * il, int32_t * e, uint64_t * count, int32_t cap);
+    void   patch_exposure_reset(llama_seq_id seq);
+    void   patch_exposure_enable(bool on);
 
     //
     // training
@@ -448,6 +458,12 @@ private:
     };
 
     copy_experts_info copy_experts;
+
+    // SHURA (PATCH1): the router's top-k of layers with replaced experts, read asynchronously after each ubatch, counted at synchronize
+    llama_patch_exposure_state patch_exp;
+    bool patch_exposure_on = false;
+    void patch_exposure_queue(const llm_graph_result * res, const llama_ubatch & ubatch);
+    void patch_exposure_count();
 
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different

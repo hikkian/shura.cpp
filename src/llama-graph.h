@@ -841,6 +841,8 @@ struct llm_graph_params {
     //   having the same topology allows us to reuse the graph in some cases
     uint64_t moe_cache_gen = 0; // SHURA: generation of the expert cache layout the graph was built for
     uint64_t kv_vmm_gen    = 0; // SHURA (PERF262): generation of the virtual-memory KV addresses the graph was built for
+    uint64_t patch_gen     = 0; // SHURA (PATCH1): the active card set the graph was built for (its exposure outputs)
+    bool     patch_exposure = false; // SHURA (PATCH1): exposure is counted (only on request: it reads the router output every ubatch)
 
     bool allow_reuse(const llm_graph_params & other) const {
         // first check the ubatch
@@ -909,6 +911,9 @@ struct llm_graph_params {
             return false;
         }
         if (moe_cache_gen != other.moe_cache_gen) {
+            return false;
+        }
+        if (patch_gen != other.patch_gen || patch_exposure != other.patch_exposure) {
             return false;
         }
 
@@ -984,6 +989,8 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    struct moe_topk { int32_t il; ggml_tensor * t; int32_t n_used; };
+    std::vector<moe_topk> t_moe_topk; // SHURA (PATCH1): the router top-k (or its argsort) of layers with replaced experts
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -1093,6 +1100,8 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    uint64_t params_patch_gen = 0; // SHURA (PATCH1)
+    bool     params_patch_exposure = false; // SHURA (PATCH1)
 
     const llama_prec_policy * prec_policy;
 

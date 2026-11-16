@@ -365,3 +365,40 @@ feature = "kv-vmm"
 file = "tools/server/server-context.cpp"
 probe = "kv_grow_no_memory"
 note = "the server pauses (slot saved, exit 75, the gateway resumes) instead of failing the request"
+
+# SHURA (PATCH1): expansion cards as patches (src/llama-patch.{h,cpp}, tools/patch/, tests/test-patch.cpp)
+[[hook]]
+feature = "patch"
+file = "src/llama-model.h"
+probe = "std::shared_ptr<struct llama_patch_state> patch;"
+note = "the per-model card state (active set, registered contexts, base file offsets) and data_is_mapped (a card cannot be written into a read-only mapping)"
+
+[[hook]]
+feature = "patch"
+file = "src/llama-context.cpp"
+probe = "llama_patch_register_context(const_cast<llama_model &>(model), this);"
+note = "every context registers with its model (last in the constructor, first in the destructor); patch_lock / patch_changed (micro-batch lock, drained queues, expert cache invalidate); exposure queued after each ubatch and counted at synchronize; patch_gen in the graph parameters"
+
+[[hook]]
+feature = "patch"
+file = "src/llama-graph.cpp"
+probe = "res->t_moe_topk.push_back({ il, topk, (int32_t) n_expert_used });"
+note = "build_moe_ffn: a copy of the router top-k of layers with replaced experts is a graph output (exposure); only while a card set is active and the request asked for exposure (it turns off the fused top-k kernel and costs ~7 % decode)"
+
+[[hook]]
+feature = "patch"
+file = "src/llama-graph.h"
+probe = "patch_gen != other.patch_gen"
+note = "graph reuse is refused after the card set changed (its exposure outputs)"
+
+[[hook]]
+feature = "patch"
+file = "tools/server/server-context.cpp"
+probe = "bool patch_activate(const std::string & set, std::string & err)"
+note = "--patch-dir and the request field patch_set: the set switches only while no slot is processing; slot states of the old set go to the prompt cache under their hash; slot files are named after the set (patch_file); timings.patch carries the set, its hash and the exposure"
+
+[[hook]]
+feature = "patch"
+file = "tools/server/server-task.cpp"
+probe = "it->prompt.patch_hash != active_patch_hash"
+note = "the prompt cache keeps states per card set and restores only those of the active set"

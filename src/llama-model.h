@@ -946,6 +946,11 @@ struct llama_model {
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
+    // SHURA (PATCH1): expansion cards applied over the weights (src/llama-patch.h); null until a card or a context needs it
+    std::shared_ptr<struct llama_patch_state> patch;
+    // SHURA (PATCH1): true if p lies in a read-only mapping of the model file (a card cannot be written there)
+    bool data_is_mapped(const void * p) const;
+
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
 

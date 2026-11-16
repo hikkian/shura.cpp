@@ -647,9 +647,14 @@ llama_context::llama_context(
             return llama_moe_cache_resize(lctx, target) < info.size;
         }, this);
     }
+
+    // SHURA (PATCH1): cards change the weights of every context of the model (expert caches re-read, exposure counted). Last, like
+    // the reclaim above: a constructor that throws must not leave a dangling pointer behind.
+    llama_patch_register_context(const_cast<llama_model &>(model), this);
 }
 
 llama_context::~llama_context() {
+    llama_patch_unregister_context(const_cast<llama_model &>(model), this);   // SHURA (PATCH1)
     if (moe_cache && cparams.moe_cache_resizable) {
         llama_kv_vmm_set_reclaim(nullptr, this);   // SHURA (PERF262): only if it is still ours
     }
@@ -999,6 +1004,7 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    patch_exposure_count();   // SHURA (PATCH1)
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2447,6 +2453,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             status = GGML_STATUS_ABORTED;
         } else {
             res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+            if (res && !res->t_moe_topk.empty()) {
+                patch_exposure_queue(res, ubatch);   // SHURA (PATCH1)
+            }
         }
         first_ubatch = false;
 
@@ -3185,6 +3194,8 @@ llm_graph_params llama_context::graph_params(
     };
     res_params.moe_cache_gen = moe_cache ? moe_cache->generation() : 0; // SHURA
     res_params.kv_vmm_gen    = llama_kv_vmm_generation();                  // SHURA (PERF262)
+    res_params.patch_gen     = model.patch ? model.patch->gen : 0;         // SHURA (PATCH1)
+    res_params.patch_exposure = patch_exposure_on;
     return res_params;
 }
 
@@ -5410,4 +5421,142 @@ bool llama_moe_cache_set_cpu_share(struct llama_context * ctx, float share) {
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+//
+// SHURA (PATCH1): cards over the weights
+//
+
+std::unique_lock<std::recursive_mutex> llama_context::patch_lock() {
+    moe_waiters++;
+    std::unique_lock<std::recursive_mutex> lock(moe_mu);
+    moe_waiters--;
+    moe_sync_backends();
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    return lock;
+}
+
+void llama_context::patch_changed(const std::set<std::pair<int32_t, int32_t>> & changed) {
+    patch_exposure_count();   // the top-k read under the old set is counted against the old set's table
+    copy_experts.reset();
+    if (!moe_cache) {
+        return;
+    }
+    size_t n = 0;
+    for (const auto & [il, e] : changed) {
+        n += moe_cache->invalidate(il, e) ? 1 : 0;
+    }
+    if (n > 0) {
+        moe_sync_backends();   // the re-read slots are on the device before the next graph
+    }
+    LLAMA_LOG_DEBUG("%s: %zu of %zu changed experts were in the expert cache\n", __func__, n, changed.size());
+}
+
+void llama_context::patch_exposure_queue(const llm_graph_result * res, const llama_ubatch & ubatch) {
+    for (const auto & tk : res->t_moe_topk) {
+        const ggml_tensor * t = tk.t;
+        llama_patch_exposure_state::pending p;
+        p.il     = tk.il;
+        p.n_used = tk.n_used;
+        p.stride = (int32_t) t->ne[0];   // the argsort row (all experts) or the top-k row
+        const int64_t rows = t->ne[1];
+        p.ids.resize((size_t) ggml_nelements(t));
+        // the rows are the ubatch tokens, or only its outputs where the graph drops the others before the last layer
+        p.seq.resize((size_t) rows, ubatch.n_tokens > 0 ? ubatch.seq_id[0][0] : 0);
+        if (rows == (int64_t) ubatch.n_tokens) {
+            for (int64_t i = 0; i < rows; i++) {
+                p.seq[i] = ubatch.seq_id[i][0];
+            }
+        } else {
+            int64_t r = 0;
+            for (uint32_t i = 0; i < ubatch.n_tokens && r < rows; i++) {
+                if (ubatch.output && ubatch.output[i]) {
+                    p.seq[r++] = ubatch.seq_id[i][0];
+                }
+            }
+        }
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), const_cast<ggml_tensor *>(t));
+        if (backend) {
+            ggml_backend_tensor_get_async(backend, t, p.ids.data(), 0, ggml_nbytes(t));
+        } else {
+            ggml_backend_tensor_get(t, p.ids.data(), 0, ggml_nbytes(t));
+        }
+        patch_exp.queued.push_back(std::move(p));
+    }
+}
+
+void llama_context::patch_exposure_count() {
+    if (patch_exp.queued.empty()) {
+        return;
+    }
+    const llama_patch_state * st = model.patch.get();
+    const int32_t n_expert = st ? st->n_expert : 0;
+    if (n_expert > 0) {
+        const size_t n_cells = st->replaced.size();
+        for (const auto & p : patch_exp.queued) {
+            for (size_t r = 0; r < p.seq.size(); r++) {
+                auto & cnt = patch_exp.by_seq[p.seq[r]];
+                if (cnt.size() != n_cells) {
+                    cnt.assign(n_cells, 0);
+                }
+                for (int32_t k = 0; k < p.n_used; k++) {
+                    const int32_t e = p.ids[r * p.stride + k];
+                    const size_t  c = (size_t) p.il * n_expert + e;
+                    if (e >= 0 && e < n_expert && c < n_cells && st->replaced[c]) {
+                        cnt[c]++;
+                    }
+                }
+            }
+        }
+    }
+    patch_exp.queued.clear();
+}
+
+int32_t llama_context::patch_exposure(llama_seq_id seq, int32_t * il, int32_t * e, uint64_t * count, int32_t cap) {
+    synchronize();
+    const llama_patch_state * st = model.patch.get();
+    auto it = patch_exp.by_seq.find(seq);
+    if (!st || st->n_expert <= 0 || it == patch_exp.by_seq.end()) {
+        return 0;
+    }
+    int32_t n = 0;
+    for (size_t c = 0; c < it->second.size(); c++) {
+        if (it->second[c] == 0) {
+            continue;
+        }
+        if (n < cap) {
+            il[n] = (int32_t) (c / st->n_expert);
+            e[n]  = (int32_t) (c % st->n_expert);
+            count[n] = it->second[c];
+        }
+        n++;
+    }
+    return n;
+}
+
+void llama_context::patch_exposure_reset(llama_seq_id seq) {
+    synchronize();
+    patch_exp.by_seq.erase(seq);
+}
+
+int32_t llama_patch_exposure(llama_context * ctx, llama_seq_id seq, int32_t * il, int32_t * e, uint64_t * count, int32_t cap) {
+    return ctx ? ctx->patch_exposure(seq, il, e, count, cap) : 0;
+}
+
+void llama_patch_exposure_reset(llama_context * ctx, llama_seq_id seq) {
+    if (ctx) {
+        ctx->patch_exposure_reset(seq);
+    }
+}
+
+void llama_context::patch_exposure_enable(bool on) {
+    patch_exposure_on = on;
+}
+
+void llama_patch_exposure_enable(llama_context * ctx, bool on) {
+    if (ctx) {
+        ctx->patch_exposure_enable(on);
+    }
 }

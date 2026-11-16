@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-patch.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1430,6 +1431,7 @@ void llm_graph_result::reset() {
 
     t_sampled.clear();
     t_sampled_probs.clear();
+    t_moe_topk.clear(); // SHURA (PATCH1)
     t_sampled_logits.clear();
     t_candidates.clear();
     t_sampling_all.clear();
@@ -1590,6 +1592,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    params_patch_gen (params.patch_gen),
+    params_patch_exposure (params.patch_exposure),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -2381,6 +2385,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
     } else {
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    }
+
+    // SHURA (PATCH1): the exposure of replaced experts: the top-k of a layer with replaced experts is kept as an output and read
+    // after the ubatch (llama_context::patch_exposure_queue)
+    if (params_patch_exposure && res && model.patch && params_patch_gen > 0 && model.patch->layer_replaced(il)) {
+        // the top-k is a view of the argsort: a copy of its own keeps the ids after the graph (an output view does not keep its
+        // parent, and marking the argsort itself as an output did not keep it either: tried, the ids were overwritten)
+        ggml_tensor * topk = ggml_cont(ctx0, selected_experts);
+        ggml_build_forward_expand(gf, topk);   // nothing else reads it: it must be in the graph on its own
+        ggml_set_output(topk);
+        res->t_moe_topk.push_back({ il, topk, (int32_t) n_expert_used });
     }
 
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]

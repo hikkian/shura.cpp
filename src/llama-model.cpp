@@ -2868,6 +2868,16 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+bool llama_model::data_is_mapped(const void * p) const {
+    for (const auto & m : pimpl->mappings) {
+        const uint8_t * a = (const uint8_t *) m->addr();
+        if (a && (const uint8_t *) p >= a && (const uint8_t *) p < a + m->size()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {

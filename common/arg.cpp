@@ -3773,6 +3773,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_PATH"));
     add_opt(common_arg(
+        {"--patch-dir"}, "PATH",
+        "SHURA (PATCH1): folder of expansion cards (<name>.gguf); a request names its set in \"patch_set\" (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.patch_dir = value;
+            if (!fs_is_directory(params.patch_dir)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
+            if (params.patch_dir.back() != DIRECTORY_SEPARATOR) {
+                params.patch_dir += DIRECTORY_SEPARATOR;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {
