@@ -1780,6 +1780,7 @@ extern "C" {
     // reads and checks a card against the model; base_path is the model's file (the original bytes are read from it and hashed)
     LLAMA_API struct llama_patch * llama_patch_load(const struct llama_model * model, const char * base_path, const char * pack_path,
                                                     char * err, size_t err_size);
+    // a card may be freed before or after its model, but not while it is in the active set (that aborts with a message)
     LLAMA_API void         llama_patch_free(struct llama_patch * patch);
     LLAMA_API const char * llama_patch_name(const struct llama_patch * patch);
     LLAMA_API const char * llama_patch_content_hash(const struct llama_patch * patch);

@@ -98,6 +98,7 @@ struct task_params {
     std::map<int, float> lora; // mapping adapter ID -> scale
 
     std::string patch_set; // SHURA (PATCH1): the card set of the request: card names joined by '+', "" = the base
+    bool has_patch_set = false; // SHURA (PATCH1b): false: the field was not sent, the server's default set applies
     bool patch_exposure = false; // SHURA (PATCH1): count how often the replaced experts are selected (costs decode speed)
 
     std::vector<std::string> antiprompt;

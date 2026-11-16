@@ -90,6 +90,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                 throw std::invalid_argument("patch_set: '..' is not allowed");
             }
             ctx.params.patch_set = v;
+            ctx.params.has_patch_set = data.contains("patch_set");
         }));
 
     add((new field_bool("patch_exposure", params.patch_exposure))

@@ -229,6 +229,7 @@ static llama_patch * patch_load(llama_model & model, const std::string & base_pa
     auto p = std::make_unique<llama_patch>();
     p->path  = pack_path;
     p->model = &model;
+    p->state = model.patch;
     {
         std::string n = pack_path.substr(pack_path.find_last_of('/') + 1);
         if (n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0) {
@@ -413,8 +414,10 @@ static llama_patch * patch_load(llama_model & model, const std::string & base_pa
         h.update(line.data(), line.size());
     }
     p->content_sha256 = h.hex();
-    if (p->manifest.find(p->content_sha256) == std::string::npos) {
-        why = "the manifest does not name the card's content hash " + p->content_sha256.substr(0, 12) + " (damaged or edited card)";
+    std::string declared;
+    if (!get_str("shura.patch.content_sha256", declared) || declared != p->content_sha256) {
+        why = "the card's content hash (shura.patch.content_sha256) does not match its slices: computed " + p->content_sha256.substr(0, 12) +
+            ", declared " + (declared.empty() ? std::string("none") : declared.substr(0, 12)) + " (damaged or edited card)";
         return nullptr;
     }
     LLAMA_LOG_INFO("%s: card '%s': %zu slices, %.1f MiB, content %s\n", __func__, p->name.c_str(), p->slices.size(), total/1048576.0,
@@ -441,9 +444,11 @@ void llama_patch_free(llama_patch * patch) {
     if (!patch) {
         return;
     }
-    if (patch->model && patch->model->patch) {
-        for (const auto & a : patch->model->patch->applied) {
-            GGML_ASSERT(a.get() != patch && "a card is freed while it is active");
+    // the model may already be gone (its state is held weakly): then nothing is active any more
+    if (auto st = patch->state.lock()) {
+        std::lock_guard<std::mutex> lk(st->mu);
+        for (const auto & a : st->applied) {
+            GGML_ASSERT(a.get() != patch && "a card is freed while it is active: make another set active first");
         }
     }
     delete patch;

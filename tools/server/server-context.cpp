@@ -1051,6 +1051,12 @@ public:
     std::string patch_active_name;   // "" = the base
     std::string patch_active_hash;
     std::mutex  patch_mu;            // guards the two strings above and the switch counters for GET /patch
+    bool        patch_exposure_active = false;   // PATCH1b: the context counts exposure (changed only while no slot is processing)
+
+    // PATCH1b: the set a request runs with: its own field, or the server's default set when the field was not sent
+    std::string patch_wanted(bool has_field, const std::string & field) const {
+        return has_field ? field : params_base.patch_set_default;
+    }
     bool        patch_test_hooks = false;   // --vram-test-hooks: GET /patch?verify=1
     static constexpr size_t patch_keep = 4;
 
@@ -1545,6 +1551,26 @@ private:
 
         vocab = llama_model_get_vocab(model_tgt);
         patch_test_hooks = params_base.vram_test_hooks;   // SHURA (PATCH1)
+        // SHURA (PATCH1b): a model loaded again after sleeping holds the base: the cards of the old model are dropped and the set
+        // that was active is applied again
+        if (!patch_loaded.empty() || !patch_active_name.empty()) {
+            const std::string again = patch_active_name;
+            patch_loaded.clear();   // the old model is gone with its card state; the packs pointed at it (leaked on purpose, rare)
+            patch_lru.clear();
+            {
+                std::lock_guard<std::mutex> lk(patch_mu);
+                patch_active_name.clear();
+                patch_active_hash.clear();
+            }
+            patch_exposure_active = false;
+            if (!again.empty()) {
+                std::string err;
+                if (!patch_activate(again, err)) {
+                    SRV_ERR("card set '%s' after the model came back: %s\n", again.c_str(), err.c_str());
+                    return false;
+                }
+            }
+        }
 
         try {
             decision.init(model_tgt);
@@ -1996,6 +2022,19 @@ private:
             }
         }
 
+        // SHURA (PATCH1b): the default card set, before the first request (slots and the prompt cache exist); a bad card stops the start
+        if (!params_base.patch_set_default.empty() && patch_active_name != params_base.patch_set_default) {
+            if (params_base.patch_dir.empty()) {
+                SRV_ERR("%s", "--patch-set needs --patch-dir\n");
+                return false;
+            }
+            std::string err;
+            if (!patch_activate(params_base.patch_set_default, err)) {
+                SRV_ERR("--patch-set '%s': %s\n", params_base.patch_set_default.c_str(), err.c_str());
+                return false;
+            }
+        }
+
         return true;
     }
 
@@ -2190,7 +2229,6 @@ private:
         // SHURA (PATCH1): the slot computes with the active card set (the dispatcher switched it before the slot was chosen)
         slot.prompt.patch_hash = patch_active_hash;
         slot.stats.patch = nullptr;
-        llama_patch_exposure_enable(ctx_tgt, task.params.patch_exposure && !patch_active_hash.empty());
         if (!patch_active_hash.empty()) {
             llama_patch_exposure_reset(ctx_tgt, slot.id);
         }
@@ -3320,20 +3358,39 @@ private:
 
                     // SHURA (PATCH1): the request's card set; it changes only while no slot is processing. Only generation tasks carry it
                     // (embeddings, rerank, speech run with whatever set is active)
-                    if ((task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL) && task.params.patch_set != patch_active_name) {
+                    const bool gen_task = task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL;
+                    const std::string want_set = patch_wanted(task.params.has_patch_set, task.params.patch_set);
+                    if (gen_task && want_set != patch_active_name) {
                         bool busy = false;
                         for (const auto & sl : slots) {
                             busy = busy || sl.is_processing();
                         }
                         if (busy) {
-                            SRV_DBG("card set '%s' waits for the running slots, defer task, id_task = %d\n", task.params.patch_set.c_str(), id_task);
+                            SRV_DBG("card set '%s' waits for the running slots, defer task, id_task = %d\n", want_set.c_str(), id_task);
                             queue_tasks.defer(std::move(task));
                             break;
                         }
                         std::string err;
-                        if (!patch_activate(task.params.patch_set, err)) {
+                        if (!patch_activate(want_set, err)) {
                             send_error(task, "patch_set: " + err, ERROR_TYPE_INVALID_REQUEST);
                             break;
+                        }
+                    }
+                    // PATCH1b: exposure is one switch for the whole context: it changes only while no slot is processing
+                    if (gen_task) {
+                        const bool want_exp = task.params.patch_exposure && !patch_active_hash.empty();
+                        if (want_exp != patch_exposure_active) {
+                            bool busy = false;
+                            for (const auto & sl : slots) {
+                                busy = busy || sl.is_processing();
+                            }
+                            if (busy) {
+                                SRV_INF("exposure %s waits for the running slots, defer task, id_task = %d\n", want_exp ? "on" : "off", id_task);
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+                            llama_patch_exposure_enable(ctx_tgt, want_exp);
+                            patch_exposure_active = want_exp;
                         }
                     }
 
@@ -3701,6 +3758,24 @@ private:
                     std::string filepath = patch_file_checked(task.slot_action.filepath, patch_err);
                     if (!patch_err.empty()) {
                         send_error(task, "Unable to restore slot: " + patch_err, ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!std::filesystem::exists(filepath)) {   // PATCH1b: say why, when a file of another card set is there
+                        std::string other;
+                        const std::string dir = filepath.substr(0, filepath.find_last_of('/') + 1);
+                        const std::string stem = task.slot_action.filename;
+                        std::error_code ec;
+                        for (const auto & de : std::filesystem::directory_iterator(dir, ec)) {
+                            const std::string fn = de.path().filename().string();
+                            if (fn.size() == stem.size() + 18 && fn.compare(0, stem.size(), stem) == 0 && fn.compare(stem.size(), 2, ".p") == 0) {
+                                other = fn.substr(stem.size() + 2);
+                                break;
+                            }
+                        }
+                        send_error(task, other.empty() ? "Unable to restore slot: no file '" + filename + "'"
+                                : "Unable to restore slot: '" + stem + "' was saved with another card set (" + other + "); the active set is " +
+                                  (patch_active_name.empty() ? std::string("the base") : "'" + patch_active_name + "'") + ": send its \"patch_set\"",
+                                   ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
 
@@ -5932,7 +6007,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             if (side.value("multimodal", false) || !side.contains("tokens") || !side["tokens"].is_array()) {
                 throw std::runtime_error("this pause cannot be continued exactly (multimodal slot or no tokens)");
             }
-            if (side.value("patch_set", std::string()) != json_value(data, "patch_set", std::string())) {   // SHURA (PATCH1)
+            if (side.value("patch_set", std::string()) != ctx_server.patch_wanted(data.contains("patch_set"), json_value(data, "patch_set", std::string()))) {   // SHURA (PATCH1)
                 throw std::runtime_error("resume: the pause was taken with card set '" + side.value("patch_set", std::string()) +
                                          "'; send the same \"patch_set\"");
             }

@@ -3786,6 +3786,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--patch-set"}, "NAME[+NAME]",
+        "SHURA (PATCH1b): the card set applied after loading (needs --patch-dir); a request without \"patch_set\" runs with it, "
+        "\"patch_set\": \"\" asks for the base (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.patch_set_default = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

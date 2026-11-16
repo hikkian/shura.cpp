@@ -67,7 +67,36 @@ CPU split worker (`GGML_SCHED_ASYNC_CPU`); `tools/moe-trace` (upstream's `LLAMA_
 replace it; recording on large batches is still to do); `mtp-dump` (to be rewritten on the NextN API); the op profiler; the
 `/moe-cache/slots` endpoint of the old cache (the governor's `/moe-cache/chunks` remains under test hooks).
 
+## Expansion cards: the protocol for a client (PATCH1, PATCH1b)
+
+Start: `--patch-dir DIR` (cards `DIR/<name>.gguf`), optionally `--patch-set NAME[+NAME]` (the default set, applied before the first
+request; a card that does not load stops the start with the reason). Cards need weights in writable memory (`--load-mode dio`).
+
+- **Which set is active.** `GET /patch` → `{"set": "<names joined by +>" ("" = the base), "hash": "<sha256 of the set>" ("" = the base),
+  "switches": n, "switch_ms": {"load", "apply"}}`. Every answer carries `timings.patch` with the same `set` and `hash`.
+- **Which set a request runs with.** `"patch_set"` in a completion / chat request. Not sent: the default set (`--patch-set`, or the base
+  without it); nothing is switched. `"patch_set": ""`: the base. Another set: the server switches when no slot is processing (the
+  request waits otherwise); the states of the old set go to the prompt cache under their hash and come back when that set is active
+  again. Names: letters, digits, `_`, `-`, `.` (not first, no `..`), at most 16 cards; a bad name or card is an error 400 with the reason.
+- **Slot files.** Saved while a set is active, a slot file is named `<filename>.p<first 16 hex digits of the set hash>`; the save answer
+  returns that name in `filename`. A restore by the plain name or by the returned name works while the same set is active. A restore may
+  name the set: `{"filename": ..., "patch_set": "..."}` switches first. A file of another set is refused (400): `'<name>' was saved with
+  another card set (<16 hex>); the active set is ...: send its "patch_set"`. Without a set nothing changes (no suffix).
+- **Pause and resume (VRAM governor).** The pause file and its `.tokens.json` sidecar get the same suffix; the sidecar records `patch_set`
+  and `patch_hash`. The `resume` request must run with the same set (its `"patch_set"`, or none if that set is the default); otherwise 400
+  `resume: the pause was taken with card set '...'`.
+- **Exposure.** `"patch_exposure": true` adds `timings.patch.exposure` = `{layer: {expert: selections}}` of the replaced experts. It is
+  one switch for the context: it changes only while no slot is processing. It costs decode speed and turns off the fused top-k routing
+  kernel (the numbers change): measure quality and speed without it, exposure in a separate pass.
+- **For the gateway's session cache:** add the set `hash` to the compatibility key; send the conversation's `patch_set` with every
+  request of the conversation, with slot restores and with `resume`.
+
 ## Known limits
+
+- **Expansion cards (PATCH1b).** A set switch waits until no slot is processing; while requests of the old set keep arriving it can
+  wait long (no fairness): with a default set (`--patch-set`) normal work does not switch. Removing a card reads the base bytes from the
+  model file (~2 s for 618 MiB): sets are meant to stay ("cards always"), not to alternate per conversation. A card may be freed before or
+  after its model, never while it is active.
 
 * `PAD_REFLECT_1D` fails in `test-backend-ops` on HIP gfx1101 in upstream v1.0.0 ("invalid configuration argument"); our models
   do not use it.

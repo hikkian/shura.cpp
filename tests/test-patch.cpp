@@ -174,7 +174,7 @@ int main(int argc, char ** argv) {
 
     // (з) the loader rejects every bad card before writing anything
     const char * bad[] = { "bad_truncated", "bad_otherbase", "bad_layout", "bad_overlap", "bad_range", "bad_type", "bad_shape",
-                           "bad_tamper", "bad_notensor", "bad_mtp", "bad_nomanifest" };
+                           "bad_tamper", "bad_notensor", "bad_mtp", "bad_contentkey" };
     for (const char * b : bad) {
         std::string why;
         llama_patch * p = load(b, &why);
@@ -293,9 +293,13 @@ int main(int argc, char ** argv) {
     for (llama_patch * p : { id, donor, donor2, whole, conflict }) {
         llama_patch_free(p);
     }
+    llama_patch * late = load("id");   // PATCH1b: a card freed after its model must not touch the freed model
+    CHECK(late != nullptr);
     llama_free(ctx2);
     llama_free(ctx);
     llama_model_free(model);
+    llama_patch_free(late);
+    CHECK(true);   // reached: no use of the freed model
     llama_backend_free();
     fprintf(stderr, "%s: %d failed\n", g_fail ? "FAILED" : "PASSED", g_fail);
     return g_fail ? 1 : 0;

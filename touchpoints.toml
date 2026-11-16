@@ -402,3 +402,46 @@ feature = "patch"
 file = "tools/server/server-task.cpp"
 probe = "it->prompt.patch_hash != active_patch_hash"
 note = "the prompt cache keeps states per card set and restores only those of the active set"
+
+# SHURA (PATCH1b): the rest of the card touch points
+[[hook]]
+feature = "patch"
+file = "common/arg.cpp"
+probe = "{\"--patch-dir\"}, \"PATH\","
+note = "--patch-dir (the card folder) and --patch-set (the default set, applied before the first request)"
+
+[[hook]]
+feature = "patch"
+file = "common/common.h"
+probe = "std::string patch_set_default;"
+note = "patch_dir and patch_set_default in common_params"
+
+[[hook]]
+feature = "patch"
+file = "include/llama.h"
+probe = "LLAMA_API bool         llama_model_patch_set("
+note = "the card API: llama_patch_load/free/name/content_hash/manifest/n_slices, llama_model_patch_set/_set_hash/_set_name/_verify, exposure"
+
+[[hook]]
+feature = "patch"
+file = "tools/server/server.cpp"
+probe = "ctx_http.get (\"/patch\","
+note = "GET /patch, only with --patch-dir"
+
+[[hook]]
+feature = "patch"
+file = "tools/server/server-schema.cpp"
+probe = "add((new field_str(\"patch_set\"))"
+note = "the request fields patch_set (and whether it was sent) and patch_exposure"
+
+[[hook]]
+feature = "patch"
+file = "tools/server/server-task.h"
+probe = "bool has_patch_set = false;"
+note = "task_params.patch_set / has_patch_set / patch_exposure; server_prompt.patch_hash; slot_action.has_patch_set / patch_set; server_prompt_cache.active_patch_hash"
+
+[[hook]]
+feature = "patch"
+file = "tools/server/server-common.h"
+probe = "json patch; // SHURA (PATCH1)"
+note = "server_slot_stats.patch -> timings.patch (server-common.cpp)"

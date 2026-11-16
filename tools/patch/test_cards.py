@@ -7,7 +7,7 @@ same layout (the same generator with another seed).
 Good cards: id (base bytes, identity), donor (8 experts of the donor, all expert tensors), donor2 (8 other experts), whole (one whole
 tensor from the donor), conflict (shares one expert with donor).
 Cards the loader must reject before writing anything: bad_truncated, bad_otherbase, bad_layout, bad_overlap, bad_range, bad_type,
-bad_shape, bad_tamper, bad_notensor, bad_mtp, bad_nomanifest.
+bad_shape, bad_tamper, bad_notensor, bad_mtp, bad_contentkey (bad_nomanifest now loads: the content key is what counts).
 """
 import copy, hashlib, json, mmap, os, sys
 
@@ -85,5 +85,7 @@ x = sl(exps[0], 1, dm, td); x[0] = "blk.1.ffn_up_exps.weight.missing"
 card("bad_notensor", [x])
 x = sl(exps[0], 1, dm, td); x[0] = exps[0].replace("ffn_", "nextn.ffn_")
 card("bad_mtp", [x])
-card("bad_nomanifest", [sl(exps[0], 1, dm, td)], man_patch=lambda m: m.pop("content_sha256"))
+card("bad_nomanifest", [sl(exps[0], 1, dm, td)], man_patch=lambda m: m.pop("content_sha256"))   # still loads: the key decides
+mc.write_card(os.path.join(out, "bad_contentkey.gguf"), {"format": "shura.card/1", "name": "bad_contentkey", "base": {"layout_sha256": layout}},
+              [sl(exps[0], 1, dm, td)], content_key="0" * 64)
 print(json.dumps({"layout": layout[:12], "experts": n_exp, "tensors": exps, "out": out}))

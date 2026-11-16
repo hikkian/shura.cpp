@@ -753,6 +753,7 @@ struct common_params {
 
     std::string slot_save_path;
     std::string patch_dir; // SHURA (PATCH1): expansion cards (<name>.gguf) the requests may name in "patch_set"
+    std::string patch_set_default; // SHURA (PATCH1b): the set applied at start; a request without "patch_set" runs with it
     std::string media_path; // path to directory for loading media files
     bool media_allow_private_urls = false; // allow http(s) media URLs on local or private addresses
 

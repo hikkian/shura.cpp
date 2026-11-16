@@ -16,6 +16,7 @@ The base file is only read. Card format (all little endian, GGUF v3):
   shura.patch.manifest         str  JSON (data only): name, content_sha256, base {file, file_sha256, layout_sha256}, recipe, switch,
                                     slice budget, tests, impact, previous version, privacy class
   shura.patch.base_layout_sha256 str sha256 over "name\\ttype\\tnbytes\\n" of every base tensor in file order
+  shura.patch.content_sha256   str  content_sha256 below (the loader compares it with the slices it reads)
   shura.patch.targets          [str]  base tensor of slice i
   shura.patch.experts          [i32]  expert index of slice i (-1: the whole tensor)
   shura.patch.base_sha256      [str]  sha256 of the base bytes slice i replaces
@@ -55,13 +56,14 @@ def content_sha256(slices):
     return h.hexdigest()
 
 
-def write_card(out, man, slices, layout=None):
+def write_card(out, man, slices, layout=None, content_key=None):
     """slices: (target, expert, bytes, ggml type, ggml shape ne, sha256 of the base bytes). Tests call it with broken input."""
     tmp = out + ".tmp"
     w = GGUFWriter(tmp, arch="shura-card", use_temp_file=False)
     w.add_uint32("shura.patch.version", 1)
     w.add_string("shura.patch.manifest", json.dumps(man, ensure_ascii=False, separators=(",", ":")))
     w.add_string("shura.patch.base_layout_sha256", layout or man["base"]["layout_sha256"])
+    w.add_string("shura.patch.content_sha256", content_key if content_key is not None else content_sha256(slices))
     w.add_array("shura.patch.targets", [s[0] for s in slices])
     w.add_array("shura.patch.experts", [int(s[1]) for s in slices])
     w.add_array("shura.patch.base_sha256", [s[5] for s in slices])

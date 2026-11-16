@@ -43,7 +43,8 @@ struct llama_patch {
     std::string content_sha256;    // over the slice table and the slice bytes, in order
     std::string manifest;          // JSON text of the manifest (data only)
     std::string layout_sha256;     // the base layout the card was built for
-    const llama_model * model = nullptr;
+    const llama_model * model = nullptr;          // compared, never dereferenced after the load
+    std::weak_ptr<struct llama_patch_state> state; // the model's card state (llama_patch_free checks it, the model may be gone)
     std::vector<llama_patch_slice> slices;
     gguf_context * gguf = nullptr;
     ggml_context * ctx  = nullptr;
