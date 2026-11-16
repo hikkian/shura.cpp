@@ -501,11 +501,16 @@ struct server_slot {
 
         int n_text = 0;
 
+        // VRAMLOGIC4: after a pause the last tokens of the prompt were generated: the sampler accepts them as generated, so the
+        // grammar (JSON schema, tool calls) and the reasoning budget go on from where they were
+        const int n_gen_before = (int) std::min<int64_t>(task->resume_n_generated, (int64_t) prompt.tokens.size());
+        const int i_gen = (int) prompt.tokens.size() - n_gen_before;
+
         for (int i = 0; i < (int) prompt.tokens.size(); i++) {
             const llama_token id = prompt.tokens[i];
 
             if (id != LLAMA_TOKEN_NULL) {
-                common_sampler_accept(smpl.get(), id, false);
+                common_sampler_accept(smpl.get(), id, i >= i_gen);
                 n_text++;
             }
         }
@@ -1055,6 +1060,33 @@ public:
 
     llama_context * patch_ctx() const;   // PATCH1b: the target context, for GET /patch (defined after the class members it reads)
 
+    // VRAMLOGIC4 test hook: pause after the n-th generated token
+    std::mutex  test_pause_mu;
+    int64_t     test_pause_after = 0;
+    std::string test_pause_ckpt;
+
+    // VRAMLOGIC4: the test pause once the answer has n generated tokens (>=: with MTP several tokens come at once)
+    void test_pause_check(const server_slot & slot) {
+        if (!params_base.vram_test_hooks) {
+            return;
+        }
+        std::lock_guard<std::mutex> lk(test_pause_mu);
+        if (test_pause_after > 0 && (int64_t) slot.stats.n_gen >= test_pause_after) {
+            test_pause_after = 0;
+            post_pause_task("test", test_pause_ckpt);
+        }
+    }
+
+    // the pause task (the governor's callback and the VRAMLOGIC4 test hook): saves the slots and exits with code 75
+    void post_pause_task(const std::string & reason, const std::string & checkpoint) {
+        server_task task(SERVER_TASK_TYPE_VRAM_PAUSE);
+        task.id = queue_tasks.get_new_id();
+        task.vram_reason = reason;
+        task.slot_action.filename = checkpoint;
+        task.slot_action.filepath = params_base.slot_save_path + checkpoint;
+        queue_tasks.post(std::move(task), /*front=*/ true);
+    }
+
     // PATCH1b: the set a request runs with: its own field, or the server's default set when the field was not sent
     std::string patch_wanted(bool has_field, const std::string & field) const {
         return has_field ? field : params_base.patch_set_default;
@@ -1271,12 +1303,7 @@ public:
             }
         }
         vram->set_pause_callback([this](const std::string & reason, const std::string & checkpoint) {
-            server_task task(SERVER_TASK_TYPE_VRAM_PAUSE);
-            task.id = queue_tasks.get_new_id();
-            task.vram_reason = reason;
-            task.slot_action.filename = checkpoint;
-            task.slot_action.filepath = params_base.slot_save_path + checkpoint;
-            queue_tasks.post(std::move(task), /*front=*/ true);
+            post_pause_task(reason, checkpoint);
         });
         vram->start();
     }
@@ -2384,6 +2411,11 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        if (!slot.task->resume_held_text.empty()) {   // VRAMLOGIC4: the held tail opens the answer text (nothing of it was sent)
+            slot.generated   = common_chat_input(slot.task->resume_held_text);
+            slot.n_sent_text = 0;
+        }
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -3624,6 +3656,18 @@ private:
                                     {"prompt_done", !slot.is_processing() || slot.state == SLOT_STATE_DONE_PROMPT || slot.state == SLOT_STATE_GENERATING},
                                     {"generated_tokens", (int64_t) slot.stats.n_gen},
                                 };
+                                // VRAMLOGIC4: the token sampled last is not in the KV yet (it is decoded at the next step): with it the
+                                // resume is that one decode step, the same as without a pause (no rollback to a checkpoint)
+                                // (also during an MTP replay: the tokens were cut back to the checkpoint, the draft is dropped)
+                                if (slot.state == SLOT_STATE_GENERATING && slot.stats.n_gen > 0 && slot.sampled != LLAMA_TOKEN_NULL &&
+                                        (slot.spec_draft.empty() || slot.spec_is_replay)) {
+                                    side["pending_token"] = (int64_t) slot.sampled;
+                                    // all tokens of the answer, over every pause of it (a resumed run counts from 0 again)
+                                    side["generated_total"] = (int64_t) (slot.task ? slot.task->resume_n_generated : 0) + (int64_t) slot.stats.n_gen;
+                                    // the end of the text the client has not got: held as a possible stop-string start, or an
+                                    // incomplete UTF-8 character
+                                    side["unsent_bytes"] = (int64_t) (slot.generated.text.size() - std::min(slot.n_sent_text, slot.generated.text.size()));
+                                }
                                 if (slot.is_processing() && slot.task) {
                                     side["params"] = slot.task->params.to_json();
                                     json preserved = json::array();
@@ -5539,6 +5583,8 @@ private:
                 return;
             }
 
+            test_pause_check(slot);
+
             slot.print_timings_tg();
         });
 
@@ -5683,6 +5729,8 @@ private:
                     return;
                 }
             }
+
+            test_pause_check(slot);
 
             slot.print_timings_tg();
 
@@ -5999,6 +6047,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         std::string resume_base_text;
         std::vector<std::string> resume_tool_call_ids;
         int64_t resume_n_predict_left = -2;
+        int64_t resume_n_generated = 0;
+        int64_t resume_unsent_bytes = -1;
         if (data.contains("resume") && data["resume"].is_object()) {
             if (inputs.size() != 1) {
                 throw std::runtime_error("resume requires a single prompt");
@@ -6024,15 +6074,29 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             llama_tokens toks = side["tokens"].get<llama_tokens>();
             const int64_t n_past = side.value("n_past", (int64_t) toks.size());
             const int64_t n_gen  = side.value("generated_tokens", (int64_t) 0);
-            if ((int64_t) toks.size() != n_past || n_gen < 0 || n_gen > n_past) {
+            if ((int64_t) toks.size() != n_past || n_gen < 0 || n_gen > n_past + 1) {
                 throw std::runtime_error("resume file is inconsistent");
             }
+            // VRAMLOGIC4: the pending token (sampled, not yet decoded) goes after the saved tokens; then the generated tokens are the
+            // last n_gen of the list. An older sidecar has no pending token: the old behaviour (re-read from a checkpoint)
+            const bool has_pending = side.contains("pending_token") && side["pending_token"].is_number_integer() && n_gen > 0 &&
+                    side["pending_token"].get<int64_t>() >= 0 && side["pending_token"].get<int64_t>() < llama_vocab_n_tokens(ctx_server.vocab);
+            if (has_pending) {
+                toks.push_back((llama_token) side["pending_token"].get<int64_t>());
+            }
+            const int64_t n_all = (int64_t) toks.size();
             // text generated before the pause: the same pieces the slot appended to its generated text
             const json preserved = side.value("preserved_tokens", json::array());
             std::set<llama_token> keep;
             for (const auto & t : preserved) { if (t.is_number_integer()) { keep.insert((llama_token) t.get<int64_t>()); } }
-            for (int64_t i = n_past - n_gen; i < n_past; i++) {
+            // the generated text of the whole answer (a second pause in one answer: generated_total counts every part)
+            const int64_t n_gen_all = has_pending ? std::min<int64_t>(side.value("generated_total", n_gen), n_all) : n_gen;
+            resume_unsent_bytes = has_pending ? side.value("unsent_bytes", (int64_t) -1) : -1;
+            for (int64_t i = std::max<int64_t>(0, n_all - n_gen_all); i < n_all; i++) {
                 resume_base_text += common_token_to_piece(ctx_server.vocab, toks[i], params.special || keep.count(toks[i]) > 0);
+            }
+            if (has_pending && side.value("prompt_done", true)) {
+                resume_n_generated = n_gen_all;
             }
             if (side.value("prompt_done", true)) {
                 inputs[0] = server_tokens(toks, ctx_server.mctx != nullptr);
@@ -6073,6 +6137,28 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
                 task.resume_base_text = resume_base_text;
                 task.resume_tool_call_ids = resume_tool_call_ids;
+                task.resume_n_generated = resume_n_generated;
+                // VRAMLOGIC4: a tail of the text before the pause that is the start of a stop string was held back from the client
+                // (it might have become the stop string): it goes to the new answer text, so the stop search sees the whole stop
+                // string, and the text is sent if it was not one; the parser is seeded with what the client did get
+                if (resume_n_generated > 0 && resume_unsent_bytes >= 0) {
+                    // the exact tail the client did not get (stop-string start or an incomplete UTF-8 character)
+                    const size_t held = task.resume_base_text.size() - std::min<size_t>((size_t) resume_unsent_bytes, task.resume_base_text.size());
+                    task.resume_held_text = task.resume_base_text.substr(held);
+                    task.resume_base_text.resize(held);
+                } else if (resume_n_generated > 0) {
+                    size_t held = task.resume_base_text.size();
+                    for (const auto & word : task.params.antiprompt) {
+                        for (size_t len = std::min(word.size() - (word.empty() ? 0 : 1), task.resume_base_text.size()); len > 0; len--) {
+                            if (task.resume_base_text.compare(task.resume_base_text.size() - len, len, word, 0, len) == 0) {
+                                held = std::min(held, task.resume_base_text.size() - len);
+                                break;
+                            }
+                        }
+                    }
+                    task.resume_held_text = task.resume_base_text.substr(held);
+                    task.resume_base_text.resize(held);
+                }
             }
 
             task.id_slot = json_value(data, "id_slot", -1);
@@ -6874,6 +6960,42 @@ void server_routes::init_routes() {
         res->data = json{{"state", "PAUSING"}}.dump();
         return res;
     };
+    // SHURA (VRAMLOGIC4): tests only (--vram-test-hooks): the same pause task the governor posts, at an exact position
+    // ("after_tokens"), so the pause and resume path can be tested on the CPU and at chosen positions
+    this->post_test_pause = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("the server runs without --slot-save-path", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        std::string checkpoint = "vram-pause.bin";
+        int64_t after_tokens = 0;
+        if (!req.body.empty()) {
+            try {
+                const json body = json::parse(req.body);
+                checkpoint   = body.value("checkpoint", checkpoint);
+                after_tokens = body.value("after_tokens", (int64_t) 0);
+            } catch (const std::exception &) {
+                res->error(format_error_response("invalid JSON body", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        if (checkpoint.empty() || checkpoint.find('/') != std::string::npos || checkpoint.find("..") != std::string::npos) {
+            res->error(format_error_response("checkpoint must be a plain file name", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (after_tokens > 0) {   // pause right after the n-th generated token of the next answer (exact positions in tests)
+            std::lock_guard<std::mutex> lk(ctx_server.test_pause_mu);
+            ctx_server.test_pause_ckpt  = checkpoint;
+            ctx_server.test_pause_after = after_tokens;
+        } else {
+            ctx_server.post_pause_task("test", checkpoint);
+        }
+        res->status = 202;
+        res->data = json{{"state", "PAUSING"}}.dump();
+        return res;
+    };
+
     this->get_patch = [this](const server_http_req & req) {
         auto res = create_response();
         json out;

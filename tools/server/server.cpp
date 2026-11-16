@@ -206,6 +206,9 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
             ctx_http.post("/vram/simulate",    ex_wrapper(routes.post_vram_simulate));
         }
     }
+    if (params.vram_test_hooks) {   // SHURA (VRAMLOGIC4): the pause task at an exact position (tests; also without a governor, on the CPU)
+        ctx_http.post("/test/pause",          ex_wrapper(routes.post_test_pause));
+    }
     if (!params.patch_dir.empty()) {   // SHURA (PATCH1): the active card set; ?verify=1 (with --vram-test-hooks) checks every copy
         ctx_http.get ("/patch",               ex_wrapper(routes.get_patch));
     }

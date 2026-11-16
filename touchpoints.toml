@@ -445,3 +445,28 @@ feature = "patch"
 file = "tools/server/server-common.h"
 probe = "json patch; // SHURA (PATCH1)"
 note = "server_slot_stats.patch -> timings.patch (server-common.cpp)"
+
+# SHURA (VRAMLOGIC4): a resume continues exactly where the pause stopped
+[[hook]]
+feature = "vram-resume"
+file = "tools/server/server-context.cpp"
+probe = "side[\"pending_token\"] = (int64_t) slot.sampled;"
+note = "the pause sidecar keeps the token sampled last (not yet decoded); the resume appends it and decodes one step (no rollback to a checkpoint)"
+
+[[hook]]
+feature = "vram-resume"
+file = "tools/server/server-context.cpp"
+probe = "common_sampler_accept(smpl.get(), id, i >= i_gen);"
+note = "init_sampler: after a pause the generated tokens are accepted as generated (grammar, reasoning budget)"
+
+[[hook]]
+feature = "vram-resume"
+file = "tools/server/server-context.cpp"
+probe = "task.resume_held_text = task.resume_base_text.substr(held);"
+note = "a tail held back as a possible stop-string start opens the new answer text (stop strings across the pause)"
+
+[[hook]]
+feature = "vram-resume"
+file = "tools/server/server.cpp"
+probe = "ctx_http.post(\"/test/pause\","
+note = "POST /test/pause (only --vram-test-hooks): the pause task at once or after the n-th generated token (CPU tests)"

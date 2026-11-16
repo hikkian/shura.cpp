@@ -351,6 +351,10 @@ struct server_task {
     // the deltas beyond it reach the client. The tool call ids are the ones the client already got.
     std::string resume_base_text;
     std::vector<std::string> resume_tool_call_ids;
+    std::string resume_held_text;   // VRAMLOGIC4: the end of the text before the pause that matched the start of a stop string and
+                                    // was held back from the client: it opens the new answer text (stop search spans the pause)
+    int64_t resume_n_generated = 0; // VRAMLOGIC4: the last n tokens of the prompt were generated before the pause (the sampler
+                                    // accepts them as generated: grammar, reasoning budget)
 
     bool is_parent() const {
         return child_tasks.size() > 0;

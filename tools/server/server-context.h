@@ -128,6 +128,7 @@ struct server_routes {
     server_http_context::handler_t post_moe_cache_chunks;
     server_http_context::handler_t post_vram_simulate;
     server_http_context::handler_t get_patch;   // SHURA (PATCH1)
+    server_http_context::handler_t post_test_pause;   // SHURA (VRAMLOGIC4)
     server_http_context::handler_t post_responses_oai;
     server_http_context::handler_t post_responses_tok_oai;
     server_http_context::handler_t post_transcriptions_oai;

@@ -91,6 +91,29 @@ request; a card that does not load stops the start with the reason). Cards need 
 - **For the gateway's session cache:** add the set `hash` to the compatibility key; send the conversation's `patch_set` with every
   request of the conversation, with slot restores and with `resume`.
 
+## After a pause of the VRAM governor (VRAMLOGIC1, 3, 4)
+
+A pause saves every slot (`<checkpoint>`, `<checkpoint>.tokens.json`) and exits with code 75; the gateway restarts the server,
+restores the slot and sends the request again with `"resume": {"tokens_file": ...}`.
+
+- **Guaranteed (VRAMLOGIC4).** The sidecar keeps the token sampled last (`pending_token`: sampled, not yet decoded). The resume adds it
+  after the saved tokens and decodes it as one step, the same step as without a pause: with a deterministic profile (no governor
+  resize, CPU share 0, MTP off, T = 0) the answer with a pause equals the answer without one token for token and log-probability for
+  log-probability (Tiel, 5 positions, the test hook, `/vram/pause` and real pressure; the CPU test
+  `tools/server/tests/shura/pause_resume_cpu.py`). The same number of tokens. The tokens generated before the pause are given to the
+  sampler as generated, so a JSON schema, a required tool call, a reasoning budget and repetition penalties go on where they were
+  (`tools/server/tests/shura/pause_state_cpu.py`), also over a second pause in the same answer (`generated_total`). A stop string cut by
+  the pause stops the answer where it would have, also for a streaming client: the text the client did not get (a possible stop-string
+  start, an incomplete UTF-8 character; `unsent_bytes`) opens the new answer text. With MTP the pending token is kept as well (also
+  during a replay of a rejected draft).
+- **Not guaranteed.** With MTP, a resizing expert cache or T > 0 the answer is not bit-exact even without a pause; a pause there keeps the
+  state but the text may differ as two runs without a pause differ. A pause while the prompt is read (`prompt_done` false) reads the rest
+  of the prompt from the request again (VRAMLOGIC3). An older sidecar without `pending_token` is still read and resumed the old way (the
+  last token before the pause is generated again; JSON schemas and tool calls can break): pause files of older builds should not be
+  resumed across an update.
+- **Tests:** `POST /test/pause` (only with `--vram-test-hooks`) posts the same pause task, at once or right after the n-th generated
+  token (`{"after_tokens": n}`); it works without a governor too (the CPU tests).
+
 ## Known limits
 
 - **Expansion cards (PATCH1b).** A set switch waits until no slot is processing; while requests of the old set keep arriving it can
