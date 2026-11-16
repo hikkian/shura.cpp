@@ -180,6 +180,9 @@ int main(int argc, char ** argv) {
         llama_patch * p = load(b, &why);
         fprintf(stderr, "     %-15s -> %s\n", b, p ? "LOADED" : why.c_str());
         CHECK(p == nullptr);
+        if (std::string(b) == "bad_contentkey" || std::string(b) == "bad_tamper") {
+            CHECK(why.find("content hash") != std::string::npos);   // rejected for the content hash, not for something else
+        }
         llama_patch_free(p);
     }
     CHECK(same(decode(ctx, n_vocab, 48, 16), base));

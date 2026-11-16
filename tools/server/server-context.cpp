@@ -1053,6 +1053,8 @@ public:
     std::mutex  patch_mu;            // guards the two strings above and the switch counters for GET /patch
     bool        patch_exposure_active = false;   // PATCH1b: the context counts exposure (changed only while no slot is processing)
 
+    llama_context * patch_ctx() const;   // PATCH1b: the target context, for GET /patch (defined after the class members it reads)
+
     // PATCH1b: the set a request runs with: its own field, or the server's default set when the field was not sent
     std::string patch_wanted(bool has_field, const std::string & field) const {
         return has_field ? field : params_base.patch_set_default;
@@ -1555,7 +1557,10 @@ private:
         // that was active is applied again
         if (!patch_loaded.empty() || !patch_active_name.empty()) {
             const std::string again = patch_active_name;
-            patch_loaded.clear();   // the old model is gone with its card state; the packs pointed at it (leaked on purpose, rare)
+            for (auto & kv : patch_loaded) {
+                llama_patch_free(kv.second);   // the old model is gone: its card state is expired, freeing is safe (weak state)
+            }
+            patch_loaded.clear();
             patch_lru.clear();
             {
                 std::lock_guard<std::mutex> lk(patch_mu);
@@ -1566,8 +1571,8 @@ private:
             if (!again.empty()) {
                 std::string err;
                 if (!patch_activate(again, err)) {
-                    SRV_ERR("card set '%s' after the model came back: %s\n", again.c_str(), err.c_str());
-                    return false;
+                    // the conversations stay: the server runs with the base and says so (GET /patch shows the base)
+                    SRV_ERR("card set '%s' after the model came back: %s; running with the base\n", again.c_str(), err.c_str());
                 }
             }
         }
@@ -3377,8 +3382,8 @@ private:
                         }
                     }
                     // PATCH1b: exposure is one switch for the whole context: it changes only while no slot is processing
-                    if (gen_task) {
-                        const bool want_exp = task.params.patch_exposure && !patch_active_hash.empty();
+                    {   // every task: only generation tasks may ask for exposure, any other task runs with it off
+                        const bool want_exp = gen_task && task.params.patch_exposure && !patch_active_hash.empty();
                         if (want_exp != patch_exposure_active) {
                             bool busy = false;
                             for (const auto & sl : slots) {
@@ -3760,14 +3765,17 @@ private:
                         send_error(task, "Unable to restore slot: " + patch_err, ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (!std::filesystem::exists(filepath)) {   // PATCH1b: say why, when a file of another card set is there
+                    std::error_code fs_ec;
+                    if (!params_base.patch_dir.empty() && !std::filesystem::exists(filepath, fs_ec)) {   // PATCH1b: say why, when a file of another card set is there (no throw)
                         std::string other;
                         const std::string dir = filepath.substr(0, filepath.find_last_of('/') + 1);
                         const std::string stem = task.slot_action.filename;
                         std::error_code ec;
-                        for (const auto & de : std::filesystem::directory_iterator(dir, ec)) {
-                            const std::string fn = de.path().filename().string();
-                            if (fn.size() == stem.size() + 18 && fn.compare(0, stem.size(), stem) == 0 && fn.compare(stem.size(), 2, ".p") == 0) {
+                        std::filesystem::directory_iterator it(dir, ec), end;
+                        for (; !ec && it != end; it.increment(ec)) {
+                            const std::string fn = it->path().filename().string();
+                            if (fn.size() == stem.size() + 18 && fn.compare(0, stem.size(), stem) == 0 && fn.compare(stem.size(), 2, ".p") == 0 &&
+                                    std::all_of(fn.end() - 16, fn.end(), [](char c) { return isxdigit((unsigned char) c) && !isupper((unsigned char) c); })) {
                                 other = fn.substr(stem.size() + 2);
                                 break;
                             }
@@ -5809,6 +5817,8 @@ private:
     }
 };
 
+llama_context * server_context_impl::patch_ctx() const { return ctx_tgt; }   // SHURA (PATCH1b)
+
 //
 // server_context (public API)
 //
@@ -6871,6 +6881,12 @@ void server_routes::init_routes() {
             std::lock_guard<std::mutex> lk(ctx_server.patch_mu);
             out = {{"set", ctx_server.patch_active_name}, {"hash", ctx_server.patch_active_hash}, {"switches", ctx_server.patch_switches},
                    {"switch_ms", {{"load", ctx_server.patch_switch_ms_load}, {"apply", ctx_server.patch_switch_ms_apply}}}};
+        }
+        llama_moe_cache_info mi = {};   // PATCH1b: the expert cache counters, so a client can measure hits per run (atomic snapshot)
+        if (ctx_server.patch_ctx() && llama_moe_cache_get_info(ctx_server.patch_ctx(), &mi)) {
+            out["moe_cache"] = {{"hits_small", mi.hits_small}, {"misses_small", mi.misses_small}, {"cpu_small", mi.cpu_small},
+                                {"hits_large", mi.hits_large}, {"misses_large", mi.misses_large}, {"copy_hits", mi.copy_hits},
+                                {"size_mib", mi.size >> 20}};
         }
         if (req.get_param("verify") == "1") {
             if (!ctx_server.patch_test_hooks) {
