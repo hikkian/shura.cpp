@@ -1063,7 +1063,14 @@ public:
                 err = "empty card name";
                 return false;
             }
-            names.push_back(set.substr(i, j - i));
+            const std::string n = set.substr(i, j - i);
+            // every way in (a request, a slot restore, the default set) is checked here: the name becomes part of a path
+            const bool chars_ok = std::all_of(n.begin(), n.end(), [](char c) { return isalnum((unsigned char) c) || c == '_' || c == '-' || c == '.'; });
+            if (!chars_ok || n.find("..") != std::string::npos || n[0] == '.') {
+                err = "bad card name '" + n + "': only letters, digits, '_', '-' and '.' (not first, no '..') are allowed";
+                return false;
+            }
+            names.push_back(n);
             i = j + 1;
         }
         if (names.size() > 16) {
